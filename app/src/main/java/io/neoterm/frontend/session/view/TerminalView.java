@@ -55,6 +55,8 @@ public final class TerminalView extends View {
   int mTopRow;
 
   boolean mIsSelectingText = false, mIsDraggingLeftSelection, mInitialTextSelection;
+  /** True while the current touch gesture is dragging a selection handle. */
+  private boolean mIsDraggingHandle = false;
   int mSelX1 = -1, mSelX2 = -1, mSelY1 = -1, mSelY2 = -1;
   float mSelectionDownX, mSelectionDownY;
 
@@ -640,25 +642,47 @@ public final class TerminalView extends View {
     final int action = ev.getAction();
 
     if (mIsSelectingText) {
-      int cy = (int) (ev.getY() / mRenderer.mFontLineSpacing) + mTopRow;
-      int cx = (int) (ev.getX() / mRenderer.mFontWidth);
-
       switch (action) {
         case MotionEvent.ACTION_UP:
         case MotionEvent.ACTION_CANCEL:
           mInitialTextSelection = false;
+          mIsDraggingHandle = false;
           stopSelectionAutoScroll();
           break;
         case MotionEvent.ACTION_DOWN:
-          int distanceFromSel1 = Math.abs(cx - mSelX1) + Math.abs(cy - mSelY1);
-          int distanceFromSel2 = Math.abs(cx - mSelX2) + Math.abs(cy - mSelY2);
-          mIsDraggingLeftSelection = distanceFromSel1 <= distanceFromSel2;
+          // Only grab a handle if the touch actually lands on (near) one.
+          // Otherwise the gesture is a scroll, so we don't move the selection.
+          int hit = handleHitTest(ev.getX(), ev.getY());
+          mIsDraggingHandle = hit != 0;
+          if (hit == 1) {
+            mIsDraggingLeftSelection = true;
+          } else if (hit == 2) {
+            mIsDraggingLeftSelection = false;
+          }
           mSelectionDownX = ev.getX();
           mSelectionDownY = ev.getY();
           stopSelectionAutoScroll();
           break;
         case MotionEvent.ACTION_MOVE:
           if (mInitialTextSelection) break;
+
+          if (!mIsDraggingHandle) {
+            // Not on a handle: scroll the terminal. The selection stays anchored
+            // to its text (its rows are absolute, so changing mTopRow moves it
+            // with the content).
+            float scrollDy = ev.getY() - mSelectionDownY;
+            int scrollRows = (int) (scrollDy / mRenderer.mFontLineSpacing);
+            if (scrollRows != 0) {
+              mSelectionDownY += scrollRows * mRenderer.mFontLineSpacing;
+              int minTopRow = -mEmulator.getScreen().getActiveTranscriptRows();
+              mTopRow = Math.min(0, Math.max(minTopRow, mTopRow - scrollRows));
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && mActionMode != null)
+                mActionMode.invalidateContentRect();
+              if (!awakenScrollBars()) invalidate();
+            }
+            break;
+          }
+
           float deltaX = ev.getX() - mSelectionDownX;
           float deltaY = ev.getY() - mSelectionDownY;
           int deltaCols = (int) Math.ceil(deltaX / mRenderer.mFontWidth);
@@ -710,6 +734,54 @@ public final class TerminalView extends View {
 
     mGestureRecognizer.onTouchEvent(ev);
     return true;
+  }
+
+  /**
+   * Hit-test the two selection handles against a touch point (in view pixels).
+   * The handle's drawn bitmap rect is expanded by a finger-sized grab slop so
+   * the handles are easy to grab, but a touch away from both returns 0 so the
+   * gesture is treated as a scroll instead of moving the selection.
+   *
+   * @return 1 for the left handle, 2 for the right handle, 0 for neither.
+   */
+  private int handleHitTest(float x, float y) {
+    if (mLeftSelectionHandle == null || mRightSelectionHandle == null) return 0;
+
+    final int w = mLeftSelectionHandle.getIntrinsicWidth();
+    final int h = mLeftSelectionHandle.getIntrinsicHeight();
+    final int margin = w / 4; // See the png; matches onDraw().
+    // Grab slop: enlarge the touch target to at least ~24dp around the handle.
+    final int slop = (int) Math.max(w / 2.0f, dpToPx(24));
+
+    // Left handle hangs below-left of the selection start.
+    int lRight = Math.round(mSelX1 * mRenderer.mFontWidth) + margin;
+    int lLeft = lRight - w;
+    int lTop = (mSelY1 + 1 - mTopRow) * mRenderer.mFontLineSpacing + mRenderer.mFontLineSpacingAndAscent;
+    int lBottom = lTop + h;
+    boolean inLeft = x >= (lLeft - slop) && x <= (lRight + slop)
+      && y >= (lTop - slop) && y <= (lBottom + slop);
+
+    // Right handle hangs below-right of the selection end.
+    int rLeft = Math.round((mSelX2 + 1) * mRenderer.mFontWidth) - margin;
+    int rRight = rLeft + w;
+    int rTop = (mSelY2 + 1 - mTopRow) * mRenderer.mFontLineSpacing + mRenderer.mFontLineSpacingAndAscent;
+    int rBottom = rTop + h;
+    boolean inRight = x >= (rLeft - slop) && x <= (rRight + slop)
+      && y >= (rTop - slop) && y <= (rBottom + slop);
+
+    if (inLeft && inRight) {
+      // Both in range (selection is tiny): pick the nearer handle center.
+      double dl = Math.hypot(x - (lLeft + lRight) / 2.0, y - (lTop + lBottom) / 2.0);
+      double dr = Math.hypot(x - (rLeft + rRight) / 2.0, y - (rTop + rBottom) / 2.0);
+      return dl <= dr ? 1 : 2;
+    }
+    if (inLeft) return 1;
+    if (inRight) return 2;
+    return 0;
+  }
+
+  private float dpToPx(float dp) {
+    return dp * getResources().getDisplayMetrics().density;
   }
 
   /**
@@ -1162,6 +1234,7 @@ public final class TerminalView extends View {
       invalidate();
     } else {
       stopSelectionAutoScroll();
+      mIsDraggingHandle = false;
       mActionMode.finish();
       mSelX1 = mSelY1 = mSelX2 = mSelY2 = -1;
       invalidate();
