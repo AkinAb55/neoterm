@@ -57,6 +57,48 @@ public final class TerminalView extends View {
   boolean mIsSelectingText = false, mIsDraggingLeftSelection, mInitialTextSelection;
   int mSelX1 = -1, mSelX2 = -1, mSelY1 = -1, mSelY2 = -1;
   float mSelectionDownX, mSelectionDownY;
+
+  /**
+   * Auto-scroll while dragging a selection handle near (or past) the top/bottom
+   * edge. The number of rows scrolled per tick (signed: negative = up into the
+   * scrollback) grows with how far past the edge the finger is, so the further
+   * you drag the faster the terminal scrolls and the selection extends.
+   */
+  private int mSelectionAutoScrollRows = 0;
+  private static final long SELECTION_AUTO_SCROLL_INTERVAL_MS = 16;
+  private static final int SELECTION_AUTO_SCROLL_MAX_ROWS = 12;
+
+  private final Runnable mSelectionAutoScrollRunnable = new Runnable() {
+    @Override
+    public void run() {
+      if (!mIsSelectingText || mSelectionAutoScrollRows == 0 || mEmulator == null) {
+        return;
+      }
+      int before = mTopRow;
+      int minTopRow = -mEmulator.getScreen().getActiveTranscriptRows();
+      mTopRow = Math.min(0, Math.max(minTopRow, mTopRow + mSelectionAutoScrollRows));
+      int scrolled = mTopRow - before;
+      if (scrolled == 0) {
+        // Reached the top/bottom of the transcript: stop until the finger moves.
+        mSelectionAutoScrollRows = 0;
+        return;
+      }
+      // Keep the dragged handle pinned to the edge so the selection extends
+      // into the freshly revealed rows.
+      if (mIsDraggingLeftSelection) {
+        mSelY1 += scrolled;
+      } else {
+        mSelY2 += scrolled;
+      }
+      clampAndSwapSelection();
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && mActionMode != null) {
+        mActionMode.invalidateContentRect();
+      }
+      invalidate();
+      postDelayed(this, SELECTION_AUTO_SCROLL_INTERVAL_MS);
+    }
+  };
+
   private ActionMode mActionMode;
   private BitmapDrawable mLeftSelectionHandle, mRightSelectionHandle;
 
@@ -603,7 +645,9 @@ public final class TerminalView extends View {
 
       switch (action) {
         case MotionEvent.ACTION_UP:
+        case MotionEvent.ACTION_CANCEL:
           mInitialTextSelection = false;
+          stopSelectionAutoScroll();
           break;
         case MotionEvent.ACTION_DOWN:
           int distanceFromSel1 = Math.abs(cx - mSelX1) + Math.abs(cy - mSelY1);
@@ -611,6 +655,7 @@ public final class TerminalView extends View {
           mIsDraggingLeftSelection = distanceFromSel1 <= distanceFromSel2;
           mSelectionDownX = ev.getX();
           mSelectionDownY = ev.getY();
+          stopSelectionAutoScroll();
           break;
         case MotionEvent.ACTION_MOVE:
           if (mInitialTextSelection) break;
@@ -628,22 +673,15 @@ public final class TerminalView extends View {
             mSelY2 += deltaRows;
           }
 
-          mSelX1 = Math.min(mEmulator.mColumns, Math.max(0, mSelX1));
-          mSelX2 = Math.min(mEmulator.mColumns, Math.max(0, mSelX2));
-
-          if (mSelY1 == mSelY2 && mSelX1 > mSelX2 || mSelY1 > mSelY2) {
-            // Switch handles.
-            mIsDraggingLeftSelection = !mIsDraggingLeftSelection;
-            int tmpX1 = mSelX1, tmpY1 = mSelY1;
-            mSelX1 = mSelX2;
-            mSelY1 = mSelY2;
-            mSelX2 = tmpX1;
-            mSelY2 = tmpY1;
-          }
+          clampAndSwapSelection();
 
           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
             mActionMode.invalidateContentRect();
           invalidate();
+
+          // Drag near/past the top or bottom edge to auto-scroll the terminal
+          // while selecting; speed grows with the distance past the edge.
+          updateSelectionAutoScroll(ev.getY());
           break;
         default:
           break;
@@ -672,6 +710,63 @@ public final class TerminalView extends View {
 
     mGestureRecognizer.onTouchEvent(ev);
     return true;
+  }
+
+  /**
+   * Clamp the selection columns to the screen and, if the two handles crossed
+   * over, swap them (and which one is being dragged).
+   */
+  private void clampAndSwapSelection() {
+    mSelX1 = Math.min(mEmulator.mColumns, Math.max(0, mSelX1));
+    mSelX2 = Math.min(mEmulator.mColumns, Math.max(0, mSelX2));
+
+    if (mSelY1 == mSelY2 && mSelX1 > mSelX2 || mSelY1 > mSelY2) {
+      mIsDraggingLeftSelection = !mIsDraggingLeftSelection;
+      int tmpX1 = mSelX1, tmpY1 = mSelY1;
+      mSelX1 = mSelX2;
+      mSelY1 = mSelY2;
+      mSelX2 = tmpX1;
+      mSelY2 = tmpY1;
+    }
+  }
+
+  /**
+   * Start/adjust/stop auto-scrolling based on how close to (or far past) the
+   * top/bottom edge the dragging finger is. The rows scrolled per tick grow
+   * with the distance past the edge, so the selection accelerates the further
+   * you drag.
+   */
+  private void updateSelectionAutoScroll(float y) {
+    if (!mIsSelectingText || mEmulator == null) {
+      stopSelectionAutoScroll();
+      return;
+    }
+
+    int edge = (int) (mRenderer.mFontLineSpacing * 1.5f);
+    int rows = 0;
+    if (y < edge) {
+      // Near/above the top edge: scroll up into the scrollback.
+      float over = edge - y;
+      rows = -(1 + (int) (over / mRenderer.mFontLineSpacing));
+    } else if (y > getHeight() - edge) {
+      // Near/below the bottom edge: scroll down toward the prompt.
+      float over = y - (getHeight() - edge);
+      rows = 1 + (int) (over / mRenderer.mFontLineSpacing);
+    }
+
+    if (rows < -SELECTION_AUTO_SCROLL_MAX_ROWS) rows = -SELECTION_AUTO_SCROLL_MAX_ROWS;
+    if (rows > SELECTION_AUTO_SCROLL_MAX_ROWS) rows = SELECTION_AUTO_SCROLL_MAX_ROWS;
+
+    boolean wasRunning = mSelectionAutoScrollRows != 0;
+    mSelectionAutoScrollRows = rows;
+    if (rows != 0 && !wasRunning) {
+      postDelayed(mSelectionAutoScrollRunnable, SELECTION_AUTO_SCROLL_INTERVAL_MS);
+    }
+  }
+
+  private void stopSelectionAutoScroll() {
+    mSelectionAutoScrollRows = 0;
+    removeCallbacks(mSelectionAutoScrollRunnable);
   }
 
   public void pasteFromClipboard() {
@@ -1066,6 +1161,7 @@ public final class TerminalView extends View {
       }, ActionMode.TYPE_FLOATING);
       invalidate();
     } else {
+      stopSelectionAutoScroll();
       mActionMode.finish();
       mSelX1 = mSelY1 = mSelX2 = mSelY2 = -1;
       invalidate();
