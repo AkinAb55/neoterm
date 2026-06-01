@@ -100,6 +100,15 @@ class NeoTabDecorator(val context: NeoTermActivity) : TabSwitcherDecorator() {
           // (posted + switcher-aware; no-op while the switcher overview shows).
           terminalView.requestFocus()
           this.context.raiseKeyboard(terminalView)
+          // Force a layout + redraw once the view is laid out. When switching
+          // very fast (e.g. right after closing a session) the view may not be
+          // measured yet, so attachSession's updateSize() can't build the
+          // emulator and the terminal stays blank until the next layout pass
+          // (which is why backgrounding/foregrounding "fixes" it).
+          terminalView.post {
+            terminalView.updateSize()
+            terminalView.onScreenUpdated()
+          }
         }
       }
 

@@ -772,7 +772,11 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
         // 关闭当前窗口后，向上一个窗口切换
         if (++index >= tabSwitcher.count) index = 0
       }
-      switchToSession(tabSwitcher.getTab(index))
+      val target = tabSwitcher.getTab(index)
+      // Defer the selection so the removal's layout settles first; selecting
+      // in the same frame can leave the new terminal blank until the next
+      // layout pass. The decorator's onShowTab also forces a redraw.
+      tabSwitcher.post { switchToSession(target) }
     }
   }
 
