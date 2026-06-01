@@ -35,7 +35,7 @@
       android:configChanges="orientation|keyboardHidden|screenSize"
       android:launchMode="singleTask"
       android:theme="@style/AppTheme.NoActionBar.Dark"
-      android:windowSoftInputMode="adjustResize|stateHidden">
+      android:windowSoftInputMode="adjustResize|stateUnchanged">
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
 

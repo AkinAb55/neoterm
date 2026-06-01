@@ -237,6 +237,8 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     })
     val tab = tabSwitcher.selectedTab as NeoTab?
     tab?.onResume()
+    // Returning from recents/background: re-raise the keyboard for the terminal.
+    raiseKeyboardForSelectedTab()
   }
 
   override fun onStart() {
@@ -282,12 +284,14 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   }
 
   fun raiseKeyboard(view: View) {
-    view.post {
-      if (tabSwitcher.isSwitcherShown) return@post
+    // Delay slightly so it runs after the window has settled (e.g. when
+    // returning from recents), otherwise requestFocus/showSoftInput no-op.
+    view.postDelayed({
+      if (tabSwitcher.isSwitcherShown) return@postDelayed
       view.requestFocus()
       val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
       imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
-    }
+    }, 100)
   }
 
   private fun raiseKeyboardForSelectedTab() {
