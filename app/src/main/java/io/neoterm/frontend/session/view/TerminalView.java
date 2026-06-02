@@ -28,19 +28,11 @@ import io.neoterm.backend.*;
 import io.neoterm.component.completion.OnAutoCompleteListener;
 
 import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * View displaying and interacting with a {@link TerminalSession}.
  */
 public final class TerminalView extends View {
-
-  /** Matches http(s)/ftp and bare www. URLs in terminal text. */
-  private static final Pattern URL_PATTERN = Pattern.compile(
-    "(?:(?:https?|ftp)://|www\\.)[\\w\\-._~:/?#\\[\\]@!$&'()*+,;=%]+",
-    Pattern.CASE_INSENSITIVE);
-
-  private static final String URL_TRAILING_PUNCTUATION = ".,;:!?)]}'\"";
 
   /**
    * Log view key and IME events.
@@ -901,10 +893,12 @@ public final class TerminalView extends View {
     }
     if (tapIndex < 0) return false;
 
-    Matcher matcher = URL_PATTERN.matcher(builder);
+    Matcher matcher = TerminalUrls.PATTERN.matcher(builder);
     while (matcher.find()) {
-      if (tapIndex >= matcher.start() && tapIndex < matcher.end()) {
-        String url = trimUrl(matcher.group());
+      int end = TerminalUrls.trimmedEnd(builder, matcher.start(), matcher.end());
+      // Only react if the tap landed on the trimmed (real) URL span.
+      if (tapIndex >= matcher.start() && tapIndex < end) {
+        String url = builder.substring(matcher.start(), end);
         if (url.isEmpty()) return false;
         if (url.regionMatches(true, 0, "www.", 0, 4)) url = "http://" + url;
         openUrl(url);
@@ -912,12 +906,6 @@ public final class TerminalView extends View {
       }
     }
     return false;
-  }
-
-  private String trimUrl(String url) {
-    int end = url.length();
-    while (end > 0 && URL_TRAILING_PUNCTUATION.indexOf(url.charAt(end - 1)) >= 0) end--;
-    return url.substring(0, end);
   }
 
   private void openUrl(String url) {

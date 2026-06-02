@@ -80,6 +80,11 @@ final class TerminalRenderer {
     if (reverseVideo)
       canvas.drawColor(palette[TextStyle.COLOR_INDEX_FOREGROUND], PorterDuff.Mode.SRC);
 
+    // Columns that are part of a clickable URL get underlined so the user can
+    // see what is tappable. Computed once for the whole visible region (wrap
+    // aware), indexed by (row - topRow).
+    final boolean[][] urlMask = computeUrlMask(mEmulator, screen, topRow, endRow, columns);
+
     float heightOffset = mFontLineSpacingAndAscent;
     for (int row = topRow; row < endRow; row++) {
       heightOffset += mFontLineSpacing;
@@ -91,12 +96,15 @@ final class TerminalRenderer {
         selx2 = (row == selectionY2) ? selectionX2 : mEmulator.mColumns;
       }
 
+      final boolean[] rowUrlMask = urlMask[row - topRow];
+
       TerminalRow lineObject = screen.allocateFullLineIfNecessary(screen.externalToInternalRow(row));
       final char[] line = lineObject.mText;
       final int charsUsedInLine = lineObject.getSpaceUsed();
 
       long lastRunStyle = 0;
       boolean lastRunInsideCursor = false;
+      boolean lastRunUrl = false;
       int lastRunStartColumn = -1;
       int lastRunStartIndex = 0;
       boolean lastRunFontWidthMismatch = false;
@@ -110,6 +118,7 @@ final class TerminalRenderer {
         final int codePoint = charIsHighsurrogate ? Character.toCodePoint(charAtIndex, line[currentCharIndex + 1]) : charAtIndex;
         final int codePointWcWidth = WcWidth.width(codePoint);
         final boolean insideCursor = (column >= selx1 && column <= selx2) || (cursorX == column || (codePointWcWidth == 2 && cursorX == column + 1));
+        final boolean insideUrl = rowUrlMask != null && column < rowUrlMask.length && rowUrlMask[column];
         final long style = lineObject.getStyle(column);
 
         // Check if the measured text width for this code point is not the same as that expected by wcwidth().
@@ -120,7 +129,7 @@ final class TerminalRenderer {
           currentCharIndex, charsForCodePoint);
         final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
 
-        if (style != lastRunStyle || insideCursor != lastRunInsideCursor || fontWidthMismatch || lastRunFontWidthMismatch) {
+        if (style != lastRunStyle || insideCursor != lastRunInsideCursor || insideUrl != lastRunUrl || fontWidthMismatch || lastRunFontWidthMismatch) {
           if (column == 0) {
             // Skip first column as there is nothing to draw, just record the current style.
           } else {
@@ -129,11 +138,12 @@ final class TerminalRenderer {
             int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun,
               lastRunStartIndex, charsSinceLastRun, measuredWidthForRun,
-              cursorColor, cursorShape, lastRunStyle, reverseVideo);
+              cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl);
           }
           measuredWidthForRun = 0.f;
           lastRunStyle = style;
           lastRunInsideCursor = insideCursor;
+          lastRunUrl = insideUrl;
           lastRunStartColumn = column;
           lastRunStartIndex = currentCharIndex;
           lastRunFontWidthMismatch = fontWidthMismatch;
@@ -152,18 +162,109 @@ final class TerminalRenderer {
       final int charsSinceLastRun = currentCharIndex - lastRunStartIndex;
       int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
       drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
-        measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo);
+        measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl);
+    }
+  }
+
+  /**
+   * Build, for every visible row, a boolean mask flagging the columns that are
+   * part of a clickable URL. Rows joined by line-wrap are treated as one logical
+   * line so URLs spanning the screen width are highlighted continuously. The
+   * detection mirrors {@link TerminalUrls} so the underline matches the span the
+   * view opens on tap.
+   */
+  private boolean[][] computeUrlMask(TerminalEmulator emulator, TerminalBuffer screen,
+                                     int topRow, int endRow, int columns) {
+    final int rows = endRow - topRow;
+    final boolean[][] mask = new boolean[rows][];
+    final int minRow = -screen.getActiveTranscriptRows();
+    final int maxRow = emulator.mRows - 1;
+
+    int row = topRow;
+    while (row < endRow) {
+      int startRow = row;
+      while (startRow > minRow && screen.getLineWrap(startRow - 1)) startRow--;
+      int logicalEnd = row;
+      while (logicalEnd < maxRow && screen.getLineWrap(logicalEnd)) logicalEnd++;
+
+      StringBuilder builder = new StringBuilder((logicalEnd - startRow + 1) * columns);
+      for (int r = startRow; r <= logicalEnd; r++) {
+        appendRowColumns(builder, screen.allocateFullLineIfNecessary(screen.externalToInternalRow(r)), columns);
+      }
+
+      boolean[] flat = new boolean[builder.length()];
+      java.util.regex.Matcher matcher = TerminalUrls.PATTERN.matcher(builder);
+      while (matcher.find()) {
+        int end = TerminalUrls.trimmedEnd(builder, matcher.start(), matcher.end());
+        for (int i = matcher.start(); i < end; i++) flat[i] = true;
+      }
+
+      int visibleFrom = Math.max(startRow, topRow);
+      int visibleTo = Math.min(logicalEnd, endRow - 1);
+      for (int r = visibleFrom; r <= visibleTo; r++) {
+        boolean[] rowMask = new boolean[columns];
+        int base = (r - startRow) * columns;
+        boolean any = false;
+        for (int c = 0; c < columns; c++) {
+          if (base + c < flat.length && flat[base + c]) {
+            rowMask[c] = true;
+            any = true;
+          }
+        }
+        mask[r - topRow] = any ? rowMask : null;
+      }
+
+      row = logicalEnd + 1;
+    }
+    return mask;
+  }
+
+  /**
+   * Append exactly {@code columns} characters representing one terminal row, so
+   * that the string index of each character equals its column. Wide and astral
+   * code points (never part of a URL) are emitted as placeholders that keep the
+   * column alignment intact.
+   */
+  private void appendRowColumns(StringBuilder builder, TerminalRow lineObject, int columns) {
+    final char[] line = lineObject.mText;
+    final int charsUsed = lineObject.getSpaceUsed();
+    int charIndex = 0;
+    int column = 0;
+    while (column < columns) {
+      if (charIndex >= charsUsed) {
+        builder.append(' ');
+        column++;
+        continue;
+      }
+      final char c = line[charIndex];
+      final boolean highSurrogate = Character.isHighSurrogate(c);
+      final int codePoint = highSurrogate ? Character.toCodePoint(c, line[charIndex + 1]) : c;
+      final int width = WcWidth.width(codePoint);
+      charIndex += highSurrogate ? 2 : 1;
+      while (charIndex < charsUsed && WcWidth.width(line, charIndex) <= 0) {
+        charIndex += Character.isHighSurrogate(line[charIndex]) ? 2 : 1;
+      }
+      if (width <= 0) {
+        continue;
+      }
+      builder.append(highSurrogate ? ' ' : c);
+      column++;
+      for (int k = 1; k < width && column < columns; k++) {
+        builder.append(' ');
+        column++;
+      }
     }
   }
 
   private void drawTextRun(Canvas canvas, char[] text, int[] palette, float y, int startColumn, int runWidthColumns,
                            int startCharIndex, int runWidthChars, float mes, int cursor, int cursorStyle,
-                           long textStyle, boolean reverseVideo) {
+                           long textStyle, boolean reverseVideo, boolean forceUnderline) {
     int foreColor = TextStyle.decodeForeColor(textStyle);
     final int effect = TextStyle.decodeEffect(textStyle);
     int backColor = TextStyle.decodeBackColor(textStyle);
     final boolean bold = (effect & (TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_BLINK)) != 0;
-    final boolean underline = (effect & TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE) != 0;
+    // URLs are underlined so the user can see they are tappable.
+    final boolean underline = forceUnderline || (effect & TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE) != 0;
     final boolean italic = (effect & TextStyle.CHARACTER_ATTRIBUTE_ITALIC) != 0;
     final boolean strikeThrough = (effect & TextStyle.CHARACTER_ATTRIBUTE_STRIKETHROUGH) != 0;
     final boolean dim = (effect & TextStyle.CHARACTER_ATTRIBUTE_DIM) != 0;
