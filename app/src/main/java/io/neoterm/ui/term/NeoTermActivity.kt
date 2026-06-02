@@ -990,9 +990,11 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     val tab = tabCloseEvent.termTab
 
     // Closing the last tab exits the app. Remove the tab first so its session
-    // is cleaned up (onTabRemoved -> SessionRemover), then finish the activity.
+    // is cleaned up (onTabRemoved -> SessionRemover), stop the embedded X11
+    // server (so it doesn't linger), then finish the activity.
     if (tabSwitcher.count <= 1) {
       tabSwitcher.removeTab(tab)
+      X11Manager.stopServer(this)
       finish()
       return
     }

@@ -58,6 +58,8 @@ class NeoTermService : Service() {
       ACTION_SERVICE_STOP -> {
         for (i in mTerminalSessions.indices)
           mTerminalSessions[i].finishIfRunning()
+        // Also stop the embedded X11 server process if it's running.
+        runCatching { stopService(Intent(this, com.termux.x11.NeoX11Service::class.java)) }
         stopSelf()
       }
 
