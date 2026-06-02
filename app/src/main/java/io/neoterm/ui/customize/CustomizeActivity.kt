@@ -1,7 +1,9 @@
 package io.neoterm.ui.customize
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.view.MenuItem
 import android.view.View
 import android.widget.AdapterView
@@ -13,10 +15,7 @@ import io.neoterm.component.ComponentManager
 import io.neoterm.component.colorscheme.ColorSchemeComponent
 import io.neoterm.component.config.NeoTermPath
 import io.neoterm.component.font.FontComponent
-import io.neoterm.utils.getPathOfMediaUri
 import java.io.File
-import java.nio.file.Files
-import java.nio.file.Paths
 
 /**
  * @author kiva
@@ -118,37 +117,61 @@ class CustomizeActivity : BaseCustomizeActivity() {
 
   override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
     if (resultCode == RESULT_OK && data != null) {
-      val selected = this.getPathOfMediaUri( data.data)
-      if (selected != null && selected.isNotEmpty()) {
+      val uri = data.data
+      if (uri != null) {
         when (requestCode) {
-          REQUEST_SELECT_FONT -> installFont(selected)
-          REQUEST_SELECT_COLOR -> installColor(selected)
+          REQUEST_SELECT_FONT -> installFont(uri)
+          REQUEST_SELECT_COLOR -> installColor(uri)
         }
       }
     }
     super.onActivityResult(requestCode, resultCode, data)
   }
 
-  private fun installColor(selected: String) {
-    installFileTo(selected, NeoTermPath.COLORS_PATH)
-    // Re-scan the colors directory so the freshly imported scheme shows up.
-    ComponentManager.getComponent<ColorSchemeComponent>().reloadColorSchemes()
-    setupSpinners()
+  private fun installColor(uri: Uri) {
+    if (installFromUri(uri, NeoTermPath.COLORS_PATH)) {
+      // Re-scan the colors directory so the freshly imported scheme shows up.
+      ComponentManager.getComponent<ColorSchemeComponent>().reloadColorSchemes()
+      setupSpinners()
+    }
   }
 
-  private fun installFont(selected: String) {
-    installFileTo(selected, NeoTermPath.FONT_PATH)
-    // Re-scan the fonts directory so the freshly imported font shows up.
-    ComponentManager.getComponent<FontComponent>().reloadFonts()
-    setupSpinners()
+  private fun installFont(uri: Uri) {
+    if (installFromUri(uri, NeoTermPath.FONT_PATH)) {
+      // Re-scan the fonts directory so the freshly imported font shows up.
+      ComponentManager.getComponent<FontComponent>().reloadFonts()
+      setupSpinners()
+    }
   }
 
-  private fun installFileTo(file: String, targetDir: String) {
-    kotlin.runCatching {
-      val source = File(file)
-      Files.copy(source.toPath(), Paths.get(targetDir, source.name))
+  /**
+   * Copy the picked document straight from its content URI into [targetDir].
+   * Reading from the stream (instead of resolving the URI to a file path) works
+   * under scoped storage / the Storage Access Framework, where a real path is
+   * usually not available.
+   */
+  private fun installFromUri(uri: Uri, targetDir: String): Boolean {
+    return kotlin.runCatching {
+      val name = queryDisplayName(uri) ?: uri.lastPathSegment?.substringAfterLast('/')
+      ?: throw IllegalStateException("Cannot determine file name")
+      val dir = File(targetDir).apply { mkdirs() }
+      val target = File(dir, name)
+      contentResolver.openInputStream(uri)?.use { input ->
+        target.outputStream().use { output -> input.copyTo(output) }
+      } ?: throw java.io.IOException("Cannot open $uri")
+      true
     }.onFailure {
       Toast.makeText(this, getString(R.string.error) + ": ${it.localizedMessage}", Toast.LENGTH_LONG).show()
+    }.getOrDefault(false)
+  }
+
+  private fun queryDisplayName(uri: Uri): String? {
+    if (uri.scheme == "file") return uri.lastPathSegment
+    return contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+      if (it.moveToFirst()) {
+        val idx = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (idx >= 0) it.getString(idx) else null
+      } else null
     }
   }
 
