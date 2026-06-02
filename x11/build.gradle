@@ -114,6 +114,12 @@ tasks.register("prepareX11Sources", Copy) {
       } else {
         logger.warn("prepareX11Sources: onPause anchor not found — MainActivity not patched")
       }
+      // Rebrand the X11 notification title (upstream hardcodes "Termux:X11").
+      def title = '.setContentTitle("Termux:X11")'
+      if (f.text.contains(title)) {
+        f.text = f.text.replace(title, '.setContentTitle("NeoTerm X11")')
+        logger.lifecycle("prepareX11Sources: rebranded MainActivity notification title")
+      }
     }
   }
 }
