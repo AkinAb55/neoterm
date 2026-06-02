@@ -66,22 +66,32 @@ public class CmdEntryPoint extends ICmdEntryInterface.Stub {
 
     /**
      * NeoTerm: start the X server inside the host app's process (single-APK
-     * embedding). Must be called on the main thread. libXlorie.so is resolved
-     * from nativeLibraryDir; the broadcast is delivered to {@code appContext}'s
-     * package, where the embedded MainActivity is listening.
+     * embedding). libXlorie.so is resolved from nativeLibraryDir; the broadcast
+     * is delivered to {@code appContext}'s package, where the embedded
+     * MainActivity is listening.
+     *
+     * The server runs on its OWN thread+Looper: start() registers an
+     * AChoreographer frame callback (GL rendering at the display refresh rate)
+     * on the calling thread's looper, so running it on the host's main thread
+     * would freeze the UI. A dedicated looper keeps that work off the main thread.
      */
     @Keep
     public static void startInProcess(Context appContext, String[] args) {
         inProcess = true;
         if (appContext != null)
             ctx = appContext.getApplicationContext();
-        handler.post(() -> {
+        Thread t = new Thread(() -> {
+            Looper.prepare();
             try {
                 new CmdEntryPoint(args);
-            } catch (Throwable t) {
-                Log.e("CmdEntryPoint", "in-process X server failed to start", t);
+            } catch (Throwable e) {
+                Log.e("CmdEntryPoint", "in-process X server failed to start", e);
+                return;
             }
-        });
+            Looper.loop();
+        }, "x11-server");
+        t.setDaemon(true);
+        t.start();
     }
 
     CmdEntryPoint(String[] args) {
