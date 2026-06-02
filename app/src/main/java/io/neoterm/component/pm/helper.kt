@@ -3,8 +3,10 @@ package io.neoterm.component.pm
 import io.neoterm.App
 import io.neoterm.R
 import io.neoterm.component.ComponentManager
+import io.neoterm.component.config.NeoPreference
 import io.neoterm.component.config.NeoTermPath
 import io.neoterm.framework.NeoTermDatabase
+import io.neoterm.setup.proot.ProotManager
 import io.neoterm.utils.NLog
 import java.io.File
 import java.net.URL
@@ -12,6 +14,26 @@ import java.nio.file.Files
 import java.nio.file.Paths
 
 object SourceHelper {
+  /** Igaz, ha proot módban apt-alapú disztrón vagyunk (Ubuntu/Kali). */
+  private fun isProotApt(): Boolean =
+    NeoPreference.isProotEnabled() && ProotManager.selectedDistro().packageManager == "apt"
+
+  /** Az apt list-könyvtár: proot módban a disztró rootfs-én belül. */
+  private fun aptListsDir(): String =
+    if (NeoPreference.isProotEnabled())
+      "${ProotManager.selectedDistro().rootfsPath()}/var/lib/apt/lists"
+    else NeoTermPath.PACKAGE_LIST_DIR
+
+  /**
+   * A sources.list írásának helye. Proot módban a disztró saját
+   * sources.list-jét NEM írjuk felül, hanem egy külön drop-in fájlt használunk,
+   * hogy a disztró eredeti forrásai épek maradjanak.
+   */
+  private fun aptSourcesFile(): String =
+    if (NeoPreference.isProotEnabled())
+      "${ProotManager.selectedDistro().rootfsPath()}/etc/apt/sources.list.d/neoterm.list"
+    else NeoTermPath.SOURCE_FILE
+
   fun syncSource() {
     val sourceManager = ComponentManager.getComponent<PackageComponent>().sourceManager
     syncSource(sourceManager)
@@ -24,24 +46,30 @@ object SourceHelper {
         .joinTo(this, "\n") { "deb [trusted=yes] ${it.url} ${it.repo}\n" }
     }
     kotlin.runCatching {
-      Files.write(Paths.get(NeoTermPath.SOURCE_FILE), content.toByteArray())
+      val target = Paths.get(aptSourcesFile())
+      target.parent?.let { Files.createDirectories(it) }
+      Files.write(target, content.toByteArray())
     }
   }
 
   fun detectSourceFiles(): List<File> {
-    val sourceManager = ComponentManager.getComponent<PackageComponent>().sourceManager
     val sourceFiles = ArrayList<File>()
     try {
-      val prefixes = sourceManager.getEnabledSources()
-        .map { detectSourceFilePrefix(it) }
-        .filter { it.isNotEmpty() }
-
-      File(NeoTermPath.PACKAGE_LIST_DIR)
-        .listFiles()
-        .filterTo(sourceFiles) { file ->
-          prefixes.filter { file.name.startsWith(it) }
-            .count() > 0
+      val listFiles = File(aptListsDir()).listFiles() ?: arrayOf()
+      if (isProotApt()) {
+        // A valódi disztró apt-indexei (a `<host>_..._Packages` fájlok), amiket
+        // az `apt update` tölt le a rootfs-be — a teljes katalógus, nem csak a
+        // (Termux-örökségű) konfigurált forrásokra szűrve.
+        listFiles.filterTo(sourceFiles) { it.isFile && it.name.endsWith("Packages") }
+      } else {
+        val sourceManager = ComponentManager.getComponent<PackageComponent>().sourceManager
+        val prefixes = sourceManager.getEnabledSources()
+          .map { detectSourceFilePrefix(it) }
+          .filter { it.isNotEmpty() }
+        listFiles.filterTo(sourceFiles) { file ->
+          prefixes.any { file.name.startsWith(it) }
         }
+      }
     } catch (e: Exception) {
       sourceFiles.clear()
       NLog.e("PM", "Failed to detect source files: ${e.localizedMessage}")

@@ -13,6 +13,7 @@ import io.neoterm.frontend.session.terminal.BasicViewClient
 import io.neoterm.frontend.session.view.TerminalView
 import io.neoterm.frontend.session.view.extrakey.ExtraKeysView
 import io.neoterm.utils.Terminals
+import io.neoterm.utils.TerminalColorTheme
 
 /**
  * @author kiva
@@ -22,6 +23,18 @@ open class BaseCustomizeActivity : AppCompatActivity() {
   lateinit var terminalView: TerminalView
   lateinit var viewClient: BasicViewClient
   lateinit var sessionCallback: BasicSessionCallback
+  private var themeListenerAdded = false
+
+  override fun onResume() {
+    super.onResume()
+    // Match the terminal colors (background + foreground text); the preview
+    // TerminalView keeps its own scheme since it isn't a TextView.
+    TerminalColorTheme.apply(this, supportActionBar, window?.decorView, null)
+    if (!themeListenerAdded) {
+      themeListenerAdded = true
+      window?.decorView?.let { TerminalColorTheme.keepThemed(it, TerminalColorTheme.foreground(this)) }
+    }
+  }
   lateinit var session: TerminalSession
   lateinit var extraKeysView: ExtraKeysView
 

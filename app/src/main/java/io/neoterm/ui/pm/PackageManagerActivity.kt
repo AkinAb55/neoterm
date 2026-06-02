@@ -21,6 +21,7 @@ import io.neoterm.component.config.NeoPreference
 import io.neoterm.component.pm.*
 import io.neoterm.setup.proot.PackageAction
 import io.neoterm.utils.StringDistance
+import io.neoterm.utils.TerminalColorTheme
 import io.neoterm.utils.runPackageManager
 import java.util.*
 
@@ -64,7 +65,15 @@ class PackageManagerActivity : AppCompatActivity(), SearchView.OnQueryTextListen
 
     recyclerView.layoutManager = LinearLayoutManager(this)
     recyclerView.adapter = adapter
+    // Keep the package rows themed to the terminal foreground as they recycle.
+    TerminalColorTheme.keepThemed(recyclerView, TerminalColorTheme.foreground(this))
     refreshPackageList()
+  }
+
+  override fun onResume() {
+    super.onResume()
+    // Match the terminal colors (background + foreground text).
+    TerminalColorTheme.apply(this, supportActionBar, window?.decorView, null)
   }
 
   private fun installPackage(packageName: String?) = packageName?.let {

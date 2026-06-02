@@ -93,7 +93,7 @@ abstract class BasePreferenceActivity : PreferenceActivity() {
     TerminalColorTheme.apply(this, supportActionBar, window?.decorView, list)
     if (list != null && !themeListenerAdded) {
       themeListenerAdded = true
-      TerminalColorTheme.keepListThemed(list, TerminalColorTheme.foreground(this))
+      TerminalColorTheme.keepThemed(list, TerminalColorTheme.foreground(this))
     }
   }
 

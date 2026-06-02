@@ -72,10 +72,10 @@ object TerminalColorTheme {
     }
   }
 
-  /** Recolor a [ListView]'s rows on every layout so scrolled-in rows stay themed. */
-  fun keepListThemed(listView: ListView, foreground: Int) {
-    listView.viewTreeObserver.addOnGlobalLayoutListener {
-      recolorText(listView, foreground)
+  /** Recolor a scrolling container's rows on every layout so scrolled-in rows stay themed. */
+  fun keepThemed(view: View, foreground: Int) {
+    view.viewTreeObserver.addOnGlobalLayoutListener {
+      recolorText(view, foreground)
     }
   }
 
