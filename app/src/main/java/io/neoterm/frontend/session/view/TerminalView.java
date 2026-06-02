@@ -209,8 +209,11 @@ public final class TerminalView extends View {
 
       @Override
       public boolean onScroll(MotionEvent e, float distanceX, float distanceY) {
-        // 如果在选择文字时，不允许滑动屏幕，因为文字选择器需要滑动
-        if (mEmulator == null || mIsSelectingText) return true;
+        if (mEmulator == null) return true;
+        // While selecting, only block scrolling when actually dragging a handle
+        // (that moves the selection + edge auto-scroll). Otherwise scroll through
+        // the same path as without a selection so the dynamics match exactly.
+        if (mIsSelectingText && mIsDraggingHandle) return true;
 
         if (mEmulator.isMouseTrackingActive() && e.isFromSource(InputDevice.SOURCE_MOUSE)) {
           // If moving with mouse pointer while pressing button, report that instead of scroll.
@@ -226,6 +229,10 @@ public final class TerminalView extends View {
           // 记住当前滑动到的位置
           mScrollRemainder = distanceY - deltaRows * mRenderer.mFontLineSpacing;
           doScroll(e, deltaRows);
+          // Keep the selection toolbar anchored to the (content-anchored) selection.
+          if (mIsSelectingText && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && mActionMode != null) {
+            mActionMode.invalidateContentRect();
+          }
         }
         return true;
       }
@@ -241,13 +248,14 @@ public final class TerminalView extends View {
 
       @Override
       public boolean onFling(final MotionEvent e2, float velocityX, float velocityY) {
-        // 选择文字时，文字选择器会用到触摸操作，这里不管
-        if (mEmulator == null || mIsSelectingText) return true;
+        if (mEmulator == null) return true;
+        // Don't fling while dragging a selection handle.
+        if (mIsSelectingText && mIsDraggingHandle) return true;
 
-        // A predominantly horizontal flick pages between tabs. Vertical
-        // scrolling is unaffected (it is driven by onScroll's distanceY, which
-        // stays small during a horizontal swipe).
-        if (mClient != null
+        // A predominantly horizontal flick pages between tabs (but not while
+        // selecting text). Vertical scrolling is unaffected (it is driven by
+        // onScroll's distanceY, which stays small during a horizontal swipe).
+        if (!mIsSelectingText && mClient != null
           && Math.abs(velocityX) > Math.abs(velocityY) * 1.5f
           && Math.abs(velocityX) > dpToPx(160)) {
           mClient.onSwipe(velocityX < 0);
@@ -279,6 +287,9 @@ public final class TerminalView extends View {
             int newY = mScroller.getCurrY();
             int diff = mouseTrackingAtStartOfFling ? (newY - mLastY) : (newY - mTopRow);
             doScroll(e2, diff);
+            if (mIsSelectingText && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && mActionMode != null) {
+              mActionMode.invalidateContentRect();
+            }
             mLastY = newY;
             if (more) post(this);
           }
@@ -709,19 +720,10 @@ public final class TerminalView extends View {
           if (mInitialTextSelection) break;
 
           if (!mIsDraggingHandle) {
-            // Not on a handle: scroll the terminal. The selection stays anchored
-            // to its text (its rows are absolute, so changing mTopRow moves it
-            // with the content).
-            float scrollDy = ev.getY() - mSelectionDownY;
-            int scrollRows = (int) (scrollDy / mRenderer.mFontLineSpacing);
-            if (scrollRows != 0) {
-              mSelectionDownY += scrollRows * mRenderer.mFontLineSpacing;
-              int minTopRow = -mEmulator.getScreen().getActiveTranscriptRows();
-              mTopRow = Math.min(0, Math.max(minTopRow, mTopRow - scrollRows));
-              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && mActionMode != null)
-                mActionMode.invalidateContentRect();
-              if (!awakenScrollBars()) invalidate();
-            }
+            // Not on a handle: let the gesture recognizer scroll/fling the
+            // terminal through the same path as a normal (non-selecting) scroll,
+            // so the dynamics match. The selection stays anchored to its text
+            // (its rows are absolute, so changing mTopRow moves it with content).
             break;
           }
 
