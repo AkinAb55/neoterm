@@ -11,13 +11,16 @@ import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import androidx.appcompat.widget.Toolbar
+import androidx.core.content.ContextCompat
 import de.mrapp.android.tabswitcher.Tab
 import de.mrapp.android.tabswitcher.TabSwitcher
 import de.mrapp.android.tabswitcher.TabSwitcherDecorator
 import io.neoterm.NeoGLView
 import io.neoterm.R
+import io.neoterm.backend.TerminalColors
 import io.neoterm.component.ComponentManager
 import io.neoterm.component.colorscheme.ColorSchemeComponent
+import io.neoterm.component.colorscheme.NeoColorScheme
 import io.neoterm.component.completion.OnAutoCompleteListener
 import io.neoterm.component.config.DefaultValues
 import io.neoterm.component.config.NeoPreference
@@ -50,6 +53,15 @@ class NeoTabDecorator(val context: NeoTermActivity) : TabSwitcherDecorator() {
 
   private fun setViewLayerType(view: View?) = view?.setLayerType(View.LAYER_TYPE_NONE, null)
 
+  /** The active color scheme's background color (falls back to the default). */
+  private fun schemeBackgroundColor(scheme: NeoColorScheme): Int {
+    return try {
+      TerminalColors.parse(scheme.backgroundColor ?: "#14181c")
+    } catch (e: Exception) {
+      ContextCompat.getColor(context, R.color.terminal_background)
+    }
+  }
+
   override fun onInflateView(inflater: LayoutInflater, parent: ViewGroup?, viewType: Int): View {
     return when (viewType) {
       VIEW_TYPE_TERM -> {
@@ -60,10 +72,12 @@ class NeoTabDecorator(val context: NeoTermActivity) : TabSwitcherDecorator() {
         Terminals.setupExtraKeysView(extraKeysView)
 
         val colorSchemeManager = ComponentManager.getComponent<ColorSchemeComponent>()
-        colorSchemeManager.applyColorScheme(
-          terminalView, extraKeysView,
-          colorSchemeManager.getCurrentColorScheme()
-        )
+        val scheme = colorSchemeManager.getCurrentColorScheme()
+        colorSchemeManager.applyColorScheme(terminalView, extraKeysView, scheme)
+        // Match the container background to the terminal background so switching
+        // tabs (and the fade-in) doesn't flash a different color behind the
+        // terminal view.
+        view.setBackgroundColor(schemeBackgroundColor(scheme))
         view
       }
 

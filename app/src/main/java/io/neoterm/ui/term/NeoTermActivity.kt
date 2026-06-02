@@ -419,6 +419,9 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     if (!tabSwitcher.isSwitcherShown) {
       toolbar.setBackgroundColor(bg)
     }
+    // Match the switcher container too, so tab switches don't flash a different
+    // color behind the terminal.
+    tabSwitcher.setBackgroundColor(bg)
     window.statusBarColor = bg
     window.navigationBarColor = bg
 
@@ -834,8 +837,10 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     // tabs can use them to store status.
     tab.parameters = Bundle()
 
-    tab.setBackgroundColor(ContextCompat.getColor(this, R.color.tab_background_color))
-    tab.setTitleTextColor(ContextCompat.getColor(this, R.color.tab_title_text_color))
+    // Use the terminal background for the tab card too, so switching tabs (and
+    // the fade-in) doesn't flash a different color behind the terminal.
+    tab.setBackgroundColor(currentTerminalBackgroundColor())
+    tab.setTitleTextColor(currentTerminalForegroundColor())
     return tab
   }
 
