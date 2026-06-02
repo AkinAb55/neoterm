@@ -87,8 +87,8 @@
   <string name="pref_general_bell_desc">Bell when receiving \'\\a\'</string>
   <string name="pref_general_vibrate">Vibrate</string>
   <string name="pref_general_vibrate_desc">Vibrate when receiving \'\\a\'</string>
-  <string name="pref_general_backspace_map_to_esc">BackSpace Mapped to Esc</string>
-  <string name="pref_general_backspace_map_to_esc_desc">Send esc when backspace is pressed</string>
+  <string name="pref_general_backspace_map_to_esc">Back key sends Esc</string>
+  <string name="pref_general_backspace_map_to_esc_desc">Send Esc when the Back button is pressed (useful in vim, etc.)</string>
   <string name="pref_general_shell">Login Program</string>
   <string name="pref_general_shell_desc">Which program should we use as shell when login</string>
   <string name="pref_general_initial_command">Initial Command</string>

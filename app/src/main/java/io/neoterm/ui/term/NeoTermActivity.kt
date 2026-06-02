@@ -507,6 +507,23 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
           (tab.termData.termSession as? ShellTermSession)?.shellProfile?.enableVibrate = enabled
         }
       }
+
+      getString(R.string.key_general_volume_as_control) -> {
+        // Volume-as-special-keys is read live from the profile, so update the
+        // open sessions' profiles to make the toggle take effect immediately.
+        val enabled = NeoPreference.isSpecialVolumeKeysEnabled()
+        forEachTab<TermTab> { tab ->
+          (tab.termData.termSession as? ShellTermSession)?.shellProfile?.enableSpecialVolumeKeys = enabled
+        }
+      }
+
+      getString(R.string.key_generaL_backspace_map_to_esc) -> {
+        // Back-key-to-Esc is read live from the profile; update open sessions.
+        val enabled = NeoPreference.isBackButtonBeMappedToEscapeEnabled()
+        forEachTab<TermTab> { tab ->
+          (tab.termData.termSession as? ShellTermSession)?.shellProfile?.enableBackKeyToEscape = enabled
+        }
+      }
     }
   }
 
