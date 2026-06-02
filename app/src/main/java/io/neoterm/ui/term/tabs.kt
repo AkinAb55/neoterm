@@ -105,9 +105,16 @@ class NeoTabDecorator(val context: NeoTermActivity) : TabSwitcherDecorator() {
           // measured yet, so attachSession's updateSize() can't build the
           // emulator and the terminal stays blank until the next layout pass
           // (which is why backgrounding/foregrounding "fixes" it).
+          //
+          // A short fade-in also gives a subtle transition when opening,
+          // switching or closing tabs, and hides the first-frame layout glitch
+          // on the very first launch (the view starts invisible and fades in
+          // once it has been laid out and redrawn).
+          terminalView.alpha = 0f
           terminalView.post {
             terminalView.updateSize()
             terminalView.onScreenUpdated()
+            terminalView.animate().alpha(1f).setDuration(120).start()
           }
         }
       }
