@@ -38,7 +38,9 @@ android {
   sourceSets {
     main {
       manifest.srcFile "$projectDir/AndroidManifest.xml"
-      java.srcDirs = ["$upstream/java", "$projectDir/build/generated/java"]
+      // Java comes from a prepared tree: the submodule's sources with NeoTerm's
+      // patched overlay (see prepareX11Sources) laid on top, plus generated Prefs.
+      java.srcDirs = ["$projectDir/build/x11-java", "$projectDir/build/generated/java"]
       aidl.srcDirs = ["$upstream/aidl"]
       res.srcDirs = ["$upstream/res"]
     }
@@ -76,6 +78,19 @@ dependencies {
   // Provides the hidden-framework stubs (android.app.ActivityThread, …) that
   // CmdEntryPoint compiles against; present in the framework at runtime.
   compileOnly project(':x11-stub')
+}
+
+// Assemble the Java source tree: the submodule's sources with NeoTerm's patched
+// overlay (patched/) on top. Lets us run the X server in-process (single APK)
+// while keeping the third_party/termux-x11 submodule pristine.
+tasks.register("prepareX11Sources", Copy) {
+  def outDir = "$projectDir/build/x11-java"
+  doFirst { delete outDir }
+  into outDir
+  from("$upstream/java")
+  // Overlay wins on duplicate paths (e.g. com/termux/x11/CmdEntryPoint.java).
+  from("$projectDir/patched") { duplicatesStrategy = DuplicatesStrategy.INCLUDE }
+  duplicatesStrategy = DuplicatesStrategy.INCLUDE
 }
 
 // Port of upstream's generatePrefs codegen: turns res/xml/preferences.xml into
@@ -134,5 +149,11 @@ afterEvaluate {
       out << '}\n'
     }
   }
-  tasks.matching { it.name == 'preBuild' }.configureEach { dependsOn generatePrefs }
+  tasks.matching { it.name == 'preBuild' }.configureEach {
+    dependsOn generatePrefs
+    dependsOn prepareX11Sources
+  }
+  // Java/AIDL compilation must see the prepared (patched) tree.
+  tasks.matching { it.name == 'compileDebugJavaWithJavac' || it.name == 'compileReleaseJavaWithJavac' }
+    .configureEach { dependsOn prepareX11Sources }
 }

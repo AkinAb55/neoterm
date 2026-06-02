@@ -2,32 +2,28 @@ package io.neoterm.utils
 
 import android.content.Context
 import android.content.Intent
-import android.os.Build
-import android.system.ErrnoException
-import android.system.Os
-import java.io.File
+import android.os.Handler
+import android.os.Looper
+import com.termux.x11.CmdEntryPoint
 
 /**
  * Drives the embedded Termux:X11 native X server, which is built directly into
- * the NeoTerm APK (the :x11 module — single APK, no separate package to install).
+ * the NeoTerm APK (the :x11 module — single APK, no separate package).
  *
- * Two pieces cooperate:
- *  - [startServer] spawns `com.termux.x11.CmdEntryPoint` in a host process via
- *    app_process with NeoTerm's own APK on the classpath. That process creates
- *    the abstract X socket on display :0 and runs libXlorie.so. proot sessions
- *    already export DISPLAY=:0, so GUI apps in the distro connect to it.
- *  - [launchDisplay] opens `com.termux.x11.MainActivity` (the LorieView surface)
- *    in-process; it connects to the socket and renders.
+ * The X server runs **in NeoTerm's own process** (via [CmdEntryPoint.startInProcess]),
+ * not as a child app_process: Android 12+ kills app-spawned child processes as
+ * "phantom processes" (SIGKILL) once the app backgrounds, which killed the X
+ * server instantly. In-process, the server is protected by NeoTerm's foreground
+ * service and libXlorie.so loads normally from nativeLibraryDir.
  *
- * Because the X server and the GUI now live in the same package as NeoTerm, the
- * CmdEntryPoint broadcast is retargeted at our own package via
- * TERMUX_X11_OVERRIDE_PACKAGE.
+ * [launchDisplay] opens `com.termux.x11.MainActivity` (the LorieView surface),
+ * which lives in the same process and connects to the server over the local
+ * ACTION_START binder. proot sessions already export DISPLAY=:0.
  *
  * @author kiva
  */
 object X11Manager {
   private const val ACTIVITY = "com.termux.x11.MainActivity"
-  private const val CMD_ENTRY = "com.termux.x11.CmdEntryPoint"
 
   /** Always true now: the X server ships inside the NeoTerm APK. */
   fun isServerInstalled(context: Context): Boolean = true
@@ -45,85 +41,24 @@ object X11Manager {
   }
 
   /**
-   * Start the X server (CmdEntryPoint) as a host process bound to :0, then show
-   * the display. The server creates the abstract X socket that proot apps reach
-   * via DISPLAY=:0. Runs from NeoTerm's own base.apk; the ACTION_START broadcast
-   * is retargeted at our package so the embedded MainActivity receives it.
+   * Start the X server in-process on display :0, then open the display. The
+   * server creates the abstract X socket that proot apps reach via DISPLAY=:0,
+   * and broadcasts ACTION_START to our own package so the embedded MainActivity
+   * connects. Server bring-up must happen on the main thread.
    */
   fun startServer(context: Context) {
-    runCatching {
-      val apk = context.applicationInfo.sourceDir
-      // CmdEntryPoint runs in this separate app_process (not the GUI process),
-      // so it can't rely on the already-loaded libXlorie.so. It resolves the
-      // native lib with getResource("lib/<abi>/libXlorie.so") + System.load(),
-      // which needs the resource to be a REAL file. Our APK uses
-      // extractNativeLibs=true (proot needs nativeLibraryDir), so the lib is on
-      // disk — we expose it through a tiny classpath dir laid out as
-      // lib/<abi>/libXlorie.so and put it first on the classpath.
-      val libClasspath = buildNativeLibClasspath(context)
-      val classpath = if (libClasspath != null) "$libClasspath:$apk" else apk
-
-      // Capture the X server's stdout/stderr so failures (e.g. a libXlorie.so
-      // load error that exits the process) are diagnosable: cat this file.
-      val logFile = File(context.filesDir, "x11/server.log").apply {
-        parentFile?.mkdirs()
-      }
-
-      val builder = ProcessBuilder(
-        "/system/bin/app_process",
-        "-Djava.class.path=$classpath",
-        "/system/bin",
-        CMD_ENTRY,
-        ":0"
-      )
-      val env = builder.environment()
-      env["CLASSPATH"] = classpath
-      env["TERMUX_X11_OVERRIDE_PACKAGE"] = context.packageName
-      // app_process must not inherit a proot/distro LD_* environment.
-      env.remove("LD_LIBRARY_PATH")
-      env.remove("LD_PRELOAD")
-      builder.redirectErrorStream(true)
-      builder.redirectOutput(ProcessBuilder.Redirect.to(logFile))
-
-      NLog.e("X11Manager", "Starting X server: CLASSPATH=$classpath")
-      val proc = builder.start()
-
-      // Watch for an early exit (a healthy server blocks in Looper.loop()).
-      Thread {
-        val code = runCatching { proc.waitFor() }.getOrDefault(-1)
-        val msg = "X server process exited with code $code"
-        NLog.e("X11Manager", msg)
-        runCatching { logFile.appendText("\n[X11Manager] $msg\n") }
-      }.apply { isDaemon = true }.start()
-    }.onFailure {
-      NLog.e("X11Manager", "Failed to start X server: ${it.localizedMessage}")
-    }
+    val app = context.applicationContext
+    // Open the GUI first; MainActivity registers the ACTION_START receiver, and
+    // the server re-broadcasts every second until connected, so order is safe.
     launchDisplay(context)
-  }
-
-  /**
-   * Build a classpath entry directory `…/x11/classpath` containing
-   * `lib/<abi>/libXlorie.so` symlinked to the extracted native lib, so
-   * CmdEntryPoint's getResource() lookup resolves to a loadable file path.
-   * Returns the dir, or null if the lib can't be located.
-   */
-  private fun buildNativeLibClasspath(context: Context): String? {
-    val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: return null
-    val nativeLib = File(context.applicationInfo.nativeLibraryDir, "libXlorie.so")
-    if (!nativeLib.exists()) return null
-
-    val root = File(context.filesDir, "x11/classpath")
-    val abiDir = File(root, "lib/$abi").apply { mkdirs() }
-    val link = File(abiDir, "libXlorie.so")
-    if (link.exists()) link.delete()
-    return try {
-      Os.symlink(nativeLib.absolutePath, link.absolutePath)
-      root.absolutePath
-    } catch (e: ErrnoException) {
-      // Fall back to a plain copy if symlinks aren't permitted here.
-      runCatching { nativeLib.copyTo(link, overwrite = true) }
-        .map { root.absolutePath }
-        .getOrNull()
+    Handler(Looper.getMainLooper()).post {
+      runCatching {
+        System.loadLibrary("Xlorie")
+        CmdEntryPoint.startInProcess(app, arrayOf(":0"))
+        NLog.e("X11Manager", "In-process X server requested on :0")
+      }.onFailure {
+        NLog.e("X11Manager", "Failed to start in-process X server: ${it.localizedMessage}")
+      }
     }
   }
 }
