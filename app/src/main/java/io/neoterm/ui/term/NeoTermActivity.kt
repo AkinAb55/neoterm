@@ -571,6 +571,27 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       // session opens directly with the keyboard up.
       addNewSession(null, false)
     }
+
+    // Make sure the active terminal actually renders. On first launch the tab's
+    // view can be created before it gets a real size, so the emulator is never
+    // built and the terminal stays blank until an unrelated relayout (returning
+    // from recents). Nudge a layout pass and refresh, bounded so it can never
+    // loop or hang.
+    ensureSelectedTerminalRendered(0)
+  }
+
+  private fun ensureSelectedTerminalRendered(attempt: Int) {
+    val view = (tabSwitcher.selectedTab as? TermTab)?.termData?.termView
+    if (view != null && view.width > 0 && view.height > 0) {
+      view.updateSize()
+      view.onScreenUpdated()
+      return
+    }
+    if (attempt < 12) {
+      // What returning from recents effectively does: force a full layout pass.
+      window.decorView.requestLayout()
+      tabSwitcher.postDelayed({ ensureSelectedTerminalRendered(attempt + 1) }, 120)
+    }
   }
 
   override fun recreate() {
