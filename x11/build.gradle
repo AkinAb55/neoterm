@@ -120,6 +120,12 @@ tasks.register("prepareX11Sources", Copy) {
         f.text = f.text.replace(title, '.setContentTitle("NeoTerm X11")')
         logger.lifecycle("prepareX11Sources: rebranded MainActivity notification title")
       }
+      // Use the NeoTerm status-bar icon for MainActivity's notification too.
+      def smallIcon = '.setSmallIcon(R.drawable.ic_x11_icon)'
+      if (f.text.contains(smallIcon)) {
+        f.text = f.text.replace(smallIcon, '.setSmallIcon(R.drawable.ic_neoterm_stat)')
+        logger.lifecycle("prepareX11Sources: rebranded MainActivity notification icon")
+      }
     }
   }
 }

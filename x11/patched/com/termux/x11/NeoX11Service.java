@@ -98,7 +98,7 @@ public class NeoX11Service extends Service {
         }
         return b.setContentTitle("NeoTerm X11")
                 .setContentText("X server running on :0")
-                .setSmallIcon(android.R.drawable.ic_menu_view)
+                .setSmallIcon(R.drawable.ic_neoterm_stat)
                 .setOngoing(true)
                 .build();
     }
