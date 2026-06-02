@@ -174,6 +174,9 @@ object ProotManager {
     args.add("LANG=C.UTF-8")
     args.add("PS1=\\u@neoterm:\\w\\$ ")
     args.add("TMPDIR=/tmp")
+    // Export the login shell so GUI terminals (xterm) launched under X11 start
+    // it instead of falling back to /bin/sh (which shows the bash PS1 literally).
+    args.add("SHELL=${loginShell ?: distro.defaultShell}")
     // X11 / GUI: az Android-oldali X-szerver a :0 kijelzőn érhető el, az audio a
     // PulseAudio TCP-n. Ártalmatlan CLI-használatnál is (a nem-GUI appok nem
     // nyúlnak hozzá).
