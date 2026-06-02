@@ -2,10 +2,10 @@ package io.neoterm.utils
 
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import com.termux.x11.MainActivity
 import com.termux.x11.NeoX11Service
 import io.neoterm.component.config.NeoTermPath
+import io.neoterm.services.NeoTermService
 import io.neoterm.setup.proot.ProotManager
 import java.io.File
 
@@ -13,11 +13,13 @@ import java.io.File
  * Drives the embedded Termux:X11 native X server, built into the NeoTerm APK
  * (the :x11 module — single APK, no separate package).
  *
- * The X server runs in its OWN process via [NeoX11Service]
- * (android:process=":x11server"), mirroring how Termux:X11 runs its server in a
- * dedicated process. This keeps NeoTerm's main thread free (no UI freeze) and,
- * being an AMS-managed foreground service rather than a forked child process,
- * survives Android 12+ phantom-process killing.
+ * The X server runs in its OWN process (com.termux.x11.NeoX11Service,
+ * android:process=":x11server"), mirroring how Termux:X11 separates the server
+ * from the GUI; that keeps NeoTerm's main thread free (no UI freeze). Instead of
+ * its own foreground notification, the server process is kept alive by a
+ * BIND_IMPORTANT binding from NeoTermService, and its status is shown in
+ * NeoTermService's single notification. Start/stop is therefore routed through
+ * NeoTermService.
  *
  * [launchDisplay] opens `com.termux.x11.MainActivity` (the LorieView surface) in
  * the normal app process; it connects to the server cross-process over the
@@ -45,14 +47,9 @@ object X11Manager {
 
   /**
    * Start the X server (in its own process) on display :0, then open the
-   * display. The server creates the abstract X socket that proot apps reach via
-   * DISPLAY=:0, and broadcasts ACTION_START to our package so MainActivity
-   * connects.
-   *
-   * The native server reads its config from the environment, which is
-   * per-process, so we compute the values here (in the app, where the distro
-   * paths are known) and hand them to the service to apply in the server
-   * process:
+   * display. The native server reads its config from the environment (per
+   * process), so we compute it here and hand it to NeoTermService, which binds
+   * the server process and applies it:
    *  - TMPDIR: the server creates its socket at $TMPDIR/.X11-unix/X0; we point
    *    it at the dir proot binds to the guest's /tmp/.X11-unix (see ProotManager).
    *  - XKB_CONFIG_ROOT: keyboard config data the server requires, from the
@@ -70,14 +67,12 @@ object X11Manager {
         )
       }
 
-      val intent = Intent(context, NeoX11Service::class.java)
-        .putExtra(NeoX11Service.EXTRA_TMPDIR, tmp.absolutePath)
-        .putExtra(NeoX11Service.EXTRA_XKB, xkb.absolutePath)
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        context.startForegroundService(intent)
-      } else {
-        context.startService(intent)
-      }
+      context.startService(
+        Intent(context, NeoTermService::class.java)
+          .setAction(NeoTermService.ACTION_X11_START)
+          .putExtra(NeoX11Service.EXTRA_TMPDIR, tmp.absolutePath)
+          .putExtra(NeoX11Service.EXTRA_XKB, xkb.absolutePath)
+      )
       NLog.e("X11Manager", "Requested X server (:x11server) on :0")
     }.onFailure {
       NLog.e("X11Manager", "Failed to start X server: ${it.localizedMessage}")
@@ -86,13 +81,16 @@ object X11Manager {
   }
 
   /**
-   * Stop the X server: close the GUI window and stop the :x11server service,
-   * whose onDestroy kills that process so the native server actually exits.
+   * Stop the X server: close the GUI window and tell NeoTermService to unbind
+   * the :x11server process (its onDestroy kills the process so the native
+   * server actually exits).
    */
   fun stopServer(context: Context) {
     runCatching {
       MainActivity.getInstance()?.finishAndRemoveTask()
-      context.stopService(Intent(context, NeoX11Service::class.java))
+      context.startService(
+        Intent(context, NeoTermService::class.java).setAction(NeoTermService.ACTION_X11_STOP)
+      )
       NLog.e("X11Manager", "Requested X server stop")
     }.onFailure {
       NLog.e("X11Manager", "Failed to stop X server: ${it.localizedMessage}")

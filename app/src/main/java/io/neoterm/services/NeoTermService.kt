@@ -2,8 +2,10 @@ package io.neoterm.services
 
 import android.annotation.SuppressLint
 import android.app.*
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Binder
@@ -39,6 +41,16 @@ class NeoTermService : Service() {
   private var mWakeLock: PowerManager.WakeLock? = null
   private var mWifiLock: WifiManager.WifiLock? = null
 
+  // The embedded X server runs in its own process (com.termux.x11.NeoX11Service).
+  // We keep it alive by binding it with BIND_IMPORTANT, so it needs no
+  // notification of its own — its status is shown in this service's notification.
+  private var x11Bound = false
+  private var x11Running = false
+  private val x11Connection = object : ServiceConnection {
+    override fun onServiceConnected(name: ComponentName?, service: IBinder?) {}
+    override fun onServiceDisconnected(name: ComponentName?) {}
+  }
+
   override fun onCreate() {
     super.onCreate()
     createNotificationChannel()
@@ -58,14 +70,17 @@ class NeoTermService : Service() {
       ACTION_SERVICE_STOP -> {
         for (i in mTerminalSessions.indices)
           mTerminalSessions[i].finishIfRunning()
-        // Also stop the embedded X11 server process if it's running.
-        runCatching { stopService(Intent(this, com.termux.x11.NeoX11Service::class.java)) }
+        // onDestroy unbinds/stops the embedded X11 server process.
         stopSelf()
       }
 
       ACTION_ACQUIRE_LOCK -> acquireLock(promptBatteryOpt = true)
 
       ACTION_RELEASE_LOCK -> releaseLock()
+
+      ACTION_X11_START -> startX11Server(intent)
+
+      ACTION_X11_STOP -> stopX11Server()
     }
 
     return Service.START_NOT_STICKY
@@ -73,10 +88,39 @@ class NeoTermService : Service() {
 
   override fun onDestroy() {
     stopForeground(true)
+    stopX11Server()
 
     for (i in mTerminalSessions.indices)
       mTerminalSessions[i].finishIfRunning()
     mTerminalSessions.clear()
+  }
+
+  /**
+   * Bind the embedded X server's dedicated process with BIND_IMPORTANT so it
+   * stays alive at this (foreground) service's priority — no separate
+   * notification needed. The TMPDIR/XKB config travels in the bind intent.
+   */
+  private fun startX11Server(intent: Intent) {
+    if (!x11Bound) {
+      val bindIntent = Intent(this, com.termux.x11.NeoX11Service::class.java)
+        .putExtra(com.termux.x11.NeoX11Service.EXTRA_TMPDIR, intent.getStringExtra(com.termux.x11.NeoX11Service.EXTRA_TMPDIR))
+        .putExtra(com.termux.x11.NeoX11Service.EXTRA_XKB, intent.getStringExtra(com.termux.x11.NeoX11Service.EXTRA_XKB))
+      x11Bound = bindService(
+        bindIntent, x11Connection,
+        Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
+      )
+    }
+    x11Running = true
+    updateNotification()
+  }
+
+  private fun stopX11Server() {
+    if (x11Bound) {
+      runCatching { unbindService(x11Connection) }
+      x11Bound = false
+    }
+    x11Running = false
+    updateNotification()
   }
 
   val sessions: List<TerminalSession>
@@ -147,6 +191,8 @@ class NeoTermService : Service() {
     val sessionCount = mTerminalSessions.size
     val xSessionCount = mXSessions.size
     var contentText = getString(R.string.service_status_text, sessionCount, xSessionCount)
+
+    if (x11Running) contentText += getString(R.string.service_x11_running)
 
     val lockAcquired = mWakeLock != null
     if (lockAcquired) contentText += getString(R.string.service_lock_acquired)
@@ -253,6 +299,8 @@ class NeoTermService : Service() {
     val ACTION_SERVICE_STOP = "neoterm.action.service.stop"
     val ACTION_ACQUIRE_LOCK = "neoterm.action.service.lock.acquire"
     val ACTION_RELEASE_LOCK = "neoterm.action.service.lock.release"
+    const val ACTION_X11_START = "neoterm.action.service.x11.start"
+    const val ACTION_X11_STOP = "neoterm.action.service.x11.stop"
     private val NOTIFICATION_ID = 52019
 
     val DEFAULT_CHANNEL_ID = "neoterm_notification_channel"
