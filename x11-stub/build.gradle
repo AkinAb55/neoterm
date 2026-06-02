@@ -1,0 +1,42 @@
+// Compile-time-only stubs for hidden Android framework classes
+// (android.app.ActivityThread, IActivityManager, …) that the embedded
+// Termux:X11 CmdEntryPoint compiles against. These are provided by the platform
+// at runtime, so this module is only ever consumed as `compileOnly`. Sources
+// come from the pinned third_party/termux-x11 submodule.
+apply plugin: 'com.android.library'
+
+def upstream = "$rootDir/third_party/termux-x11/shell-loader/stub/src/main"
+
+android {
+  namespace 'com.termux.x11.stub'
+  compileSdk rootProject.ext.android.COMPILE_SDK_VERSION
+
+  defaultConfig {
+    minSdkVersion 26
+  }
+
+  buildFeatures {
+    buildConfig false
+  }
+
+  sourceSets {
+    main {
+      manifest.srcFile "$projectDir/AndroidManifest.xml"
+      java.srcDirs = ["$upstream/java"]
+    }
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_1_8
+    targetCompatibility JavaVersion.VERSION_1_8
+  }
+
+  lint {
+    abortOnError false
+    checkReleaseBuilds false
+  }
+}
+
+dependencies {
+  implementation 'androidx.annotation:annotation:1.7.1'
+}

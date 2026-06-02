@@ -257,23 +257,11 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     }
   }
 
-  /** Start the native X11 server, installing the Termux:X11 package first if needed. */
+  /**
+   * Start the native X11 server. It's built into this APK (the :x11 module), so
+   * there's nothing to install — just spawn the server and open the display.
+   */
   private fun startX11() {
-    if (!X11Manager.isServerInstalled(this)) {
-      AlertDialog.Builder(this)
-        .setTitle(R.string.x11_install_server_title)
-        .setMessage(R.string.x11_install_server_message)
-        .setPositiveButton(R.string.update_download_install) { _, _ ->
-          if (!UpdateManager.canInstall(this)) {
-            UpdateManager.requestInstallPermission(this)
-          } else {
-            X11Manager.downloadAndInstall(this)
-          }
-        }
-        .setNegativeButton(android.R.string.cancel, null)
-        .show()
-      return
-    }
     X11Manager.startServer(this)
     Toast.makeText(this, R.string.x11_started_hint, Toast.LENGTH_LONG).show()
   }

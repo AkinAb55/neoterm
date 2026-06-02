@@ -1,1 +1,3 @@
 include ':app', ':chrome-tabs', ':NeoLang', ':Xorg', ':NeoTermBridge'
+// Embedded Termux:X11 (single-APK X server + GUI) and its compile-time stubs.
+include ':x11', ':x11-stub'

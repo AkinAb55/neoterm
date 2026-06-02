@@ -1,0 +1,138 @@
+// Embedded Termux:X11 X server + GUI, built straight into the single NeoTerm
+// APK (no separate package). The Java/AIDL/native/resource sources come from the
+// pinned third_party/termux-x11 submodule; only the manifest (LAUNCHER removed)
+// and this build script are vendored in NeoTerm. Produces libXlorie.so (and the
+// Xorg native deps) for arm64-v8a plus com.termux.x11.* classes, which NeoTerm's
+// :app depends on and launches in-process.
+apply plugin: 'com.android.library'
+
+def upstream = "$rootDir/third_party/termux-x11/app/src/main"
+
+android {
+  namespace 'com.termux.x11'
+  compileSdk rootProject.ext.android.COMPILE_SDK_VERSION
+  ndkVersion rootProject.ext.android.NDK_VERSION
+
+  defaultConfig {
+    minSdkVersion 26
+    // targetSdk inherited from the consuming app; W^X (targetSdk 28) is fine here.
+
+    // BuildConfig fields the upstream sources reference (library BuildConfig
+    // has neither COMMIT nor VERSION_NAME by default).
+    buildConfigField "String", "COMMIT", "\"" +
+        (System.getenv('CURRENT_COMMIT') ?: "embedded") + "\""
+    buildConfigField "String", "VERSION_NAME", "\"embedded\""
+
+    ndk {
+      abiFilters 'arm64-v8a'
+    }
+    externalNativeBuild {
+      cmake {
+        // Restrict the heavy Xorg native build to the only ABI NeoTerm ships.
+        abiFilters 'arm64-v8a'
+        arguments "-DANDROID_STL=c++_shared"
+      }
+    }
+  }
+
+  sourceSets {
+    main {
+      manifest.srcFile "$projectDir/AndroidManifest.xml"
+      java.srcDirs = ["$upstream/java", "$projectDir/build/generated/java"]
+      aidl.srcDirs = ["$upstream/aidl"]
+      res.srcDirs = ["$upstream/res"]
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "$upstream/cpp/CMakeLists.txt"
+      version rootProject.ext.android.CMAKE_VERSION
+    }
+  }
+
+  buildFeatures {
+    aidl true
+    buildConfig true
+  }
+
+  compileOptions {
+    // Upstream uses Java 9 source features.
+    sourceCompatibility JavaVersion.VERSION_11
+    targetCompatibility JavaVersion.VERSION_11
+  }
+
+  lint {
+    abortOnError false
+    checkReleaseBuilds false
+  }
+}
+
+dependencies {
+  implementation 'androidx.annotation:annotation:1.7.1'
+  implementation 'androidx.appcompat:appcompat:1.6.1'
+  implementation 'androidx.preference:preference:1.2.1'
+  implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.6.2'
+  // Provides the hidden-framework stubs (android.app.ActivityThread, …) that
+  // CmdEntryPoint compiles against; present in the framework at runtime.
+  compileOnly project(':x11-stub')
+}
+
+// Port of upstream's generatePrefs codegen: turns res/xml/preferences.xml into
+// com.termux.x11.Prefs (referenced by LoriePreferences/MainActivity).
+afterEvaluate {
+  tasks.register("generatePrefs") {
+    def prefsXml = file("$upstream/res/xml/preferences.xml")
+    inputs.file prefsXml
+    def out = file("$projectDir/build/generated/java/com/termux/x11/Prefs.java")
+    outputs.file out
+    doLast {
+      //noinspection UnnecessaryQualifiedReference
+      def xml = groovy.xml.DOMBuilder.parse(new StringReader(prefsXml.text))
+      def preferenceNodes = xml.documentElement.getElementsByTagName("*")
+      def preferences = []
+      for (int i = 0; i < preferenceNodes.length; i++) {
+        def node = preferenceNodes.item(i)
+        if (node.nodeName == 'EditTextPreference' && node.getAttribute("app:key") != "extra_keys_config")
+          preferences << [type: 'String', key: node.getAttribute("app:key"), default: node.getAttribute("app:defaultValue")]
+        else if (node.nodeName == 'SeekBarPreference')
+          preferences << [type: 'Int', key: node.getAttribute("app:key"), default: node.getAttribute("app:defaultValue")]
+        else if (node.nodeName == 'ListPreference') {
+          def entries = node.getAttribute("app:entries")
+          def values = node.getAttribute("app:entryValues")
+          preferences << [type: 'List', key: node.getAttribute("app:key"), default: node.getAttribute("app:defaultValue"),
+                          entries: entries.substring(7, entries.length()), values: values.substring(7, values.length())]
+        } else if (node.nodeName == 'SwitchPreferenceCompat')
+          preferences << [type: 'Boolean', key: node.getAttribute("app:key"), default: node.getAttribute("app:defaultValue")]
+      }
+      out.getParentFile().exists() || out.getParentFile().mkdirs()
+      out.delete()
+      out.createNewFile()
+      out << 'package com.termux.x11;\n'
+      out << 'import java.util.HashMap;\n'
+      out << 'import android.content.Context;\n'
+      out << 'import com.termux.x11.utils.TermuxX11ExtraKeys;\n'
+      out << '\n'
+      out << 'public class Prefs extends LoriePreferences.PrefsProto {\n'
+      preferences.each {
+        if (it.type == 'Int' || it.type == 'Boolean')
+          out << "  public final ${it.type}Preference ${it.key} = new ${it.type}Preference(\"${it.key}\", ${it.default});\n"
+        else if (it.type == 'String')
+          out << "  public final StringPreference ${it.key} = new StringPreference(\"${it.key}\", \"${it.default}\");\n"
+        else if (it.type == 'List')
+          out << "  public final ${it.type}Preference ${it.key} = new ${it.type}Preference(\"${it.key}\", \"${it.default}\", R.array.${it.entries}, R.array.${it.values});\n"
+      }
+      out << '  public final StringPreference extra_keys_config = new StringPreference("extra_keys_config", TermuxX11ExtraKeys.DEFAULT_IVALUE_EXTRA_KEYS);\n'
+      out << '  public final HashMap<String, Preference> keys = new HashMap<>() {{\n'
+      preferences.each { out << '    put("' + it.key + '", ' + it.key + ');\n' }
+      out << '    put("extra_keys_config", extra_keys_config);\n'
+      out << '  }};\n'
+      out << '\n'
+      out << '  public Prefs(Context ctx) {\n'
+      out << '    super(ctx);\n'
+      out << '  }\n'
+      out << '}\n'
+    }
+  }
+  tasks.matching { it.name == 'preBuild' }.configureEach { dependsOn generatePrefs }
+}

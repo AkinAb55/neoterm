@@ -110,4 +110,7 @@ dependencies {
   implementation project(':NeoLang')
   implementation project(':NeoTermBridge')
   implementation project(':Xorg')
+  // Embedded Termux:X11 X server + GUI (single APK): provides
+  // com.termux.x11.MainActivity / CmdEntryPoint and libXlorie.so.
+  implementation project(':x11')
 }
