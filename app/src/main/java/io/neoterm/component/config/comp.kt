@@ -205,15 +205,21 @@ object NeoPreference {
   fun getLoginShellPath(): String {
     val loginProgramName = getLoginShellName()
 
-    // Some programs like ssh needs it
-    val shell = File(NeoTermPath.NEOTERM_LOGIN_SHELL_PATH)
     val loginProgramPath = findLoginProgram(loginProgramName) ?: {
       setLoginShellName(DefaultValues.loginShell)
       "${NeoTermPath.USR_PATH}/bin/${DefaultValues.loginShell}"
     }()
 
-    if (!shell.exists()) {
-      symlinkLoginShell(loginProgramPath)
+    // The legacy login-shell symlink is only used by the Termux-style native
+    // bootstrap. In proot mode the shell is launched directly via ProotManager,
+    // and loginProgramPath is a guest path (e.g. /usr/bin/zsh) that doesn't
+    // exist on the host — symlinking it would just dangle and throw EEXIST on
+    // every session. So only maintain the symlink in non-proot mode.
+    if (!isProotEnabled()) {
+      val shell = File(NeoTermPath.NEOTERM_LOGIN_SHELL_PATH)
+      if (!shell.exists()) {
+        symlinkLoginShell(loginProgramPath)
+      }
     }
 
     return loginProgramPath
@@ -226,15 +232,14 @@ object NeoPreference {
   private fun symlinkLoginShell(loginProgramPath: String) {
     File(NeoTermPath.CUSTOM_PATH).mkdirs()
     try {
-      val shellSymlink = File(NeoTermPath.NEOTERM_LOGIN_SHELL_PATH)
-      if (shellSymlink.exists()) {
-        shellSymlink.delete()
-      }
+      // Remove any existing link first. File.exists() returns false for a
+      // dangling symlink, so use Os.remove (ignoring ENOENT) which works
+      // regardless of whether the target exists.
+      runCatching { Os.remove(NeoTermPath.NEOTERM_LOGIN_SHELL_PATH) }
       Os.symlink(loginProgramPath, NeoTermPath.NEOTERM_LOGIN_SHELL_PATH)
       Os.chmod(NeoTermPath.NEOTERM_LOGIN_SHELL_PATH, 448 /* Decimal of 0700 */)
     } catch (e: ErrnoException) {
       NLog.e("Preference", "Failed to symlink login shell: ${e.localizedMessage}")
-      e.printStackTrace()
     }
   }
 
