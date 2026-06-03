@@ -189,8 +189,11 @@ object ProotManager {
     args.add("XDG_RUNTIME_DIR=/tmp")
     // Firefox's content sandbox can't work under proot (ptrace + no user
     // namespaces) and SIGSEGVs its child processes; disable it so the browser
-    // is usable. (Chromium needs --no-sandbox on the command line.)
+    // is usable. RDD is Firefox's media-decoder process — its sandbox blocks
+    // libavcodec/ffmpeg from loading under proot ("no decoder found" for AAC/
+    // H.264), so disable that too. (Chromium needs --no-sandbox on the cmdline.)
     args.add("MOZ_DISABLE_CONTENT_SANDBOX=1")
+    args.add("MOZ_DISABLE_RDD_SANDBOX=1")
     extraEnv.forEach { if (it.isNotEmpty()) args.add(it) }
 
     // A guest shell + login-kapcsoló(k), vagy egy konkrét parancs `sh -c`-vel.

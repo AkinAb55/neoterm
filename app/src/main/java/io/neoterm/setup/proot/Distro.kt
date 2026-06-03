@@ -45,9 +45,10 @@ enum class Distro(
       // X server needs (XKB_CONFIG_ROOT) or it refuses to start. The PulseAudio
       // *client* (libpulse + pactl/paplay) lets apps reach NeoTerm's Android-side
       // PulseAudio server on PULSE_SERVER=127.0.0.1:4713 — no distro server.
-      "apk" -> "xterm openbox font-dejavu xrandr xkeyboard-config pulseaudio-utils"
-      "pacman" -> "xterm openbox xorg-xrandr ttf-dejavu xkeyboard-config libpulse"
-      else -> "xterm openbox x11-xserver-utils dbus-x11 fonts-dejavu xkb-data pulseaudio-utils"
+      // ffmpeg/libavcodec-extra provide browser media codecs (AAC/H.264).
+      "apk" -> "xterm openbox font-dejavu xrandr xkeyboard-config pulseaudio-utils ffmpeg"
+      "pacman" -> "xterm openbox xorg-xrandr ttf-dejavu xkeyboard-config libpulse ffmpeg"
+      else -> "xterm openbox x11-xserver-utils dbus-x11 fonts-dejavu xkb-data pulseaudio-utils libavcodec-extra"
     }
 
   /** A disztró kibontott rootfs-ének gyökere a hoston. */
