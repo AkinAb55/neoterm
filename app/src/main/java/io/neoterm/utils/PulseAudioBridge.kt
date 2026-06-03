@@ -7,7 +7,6 @@ import android.media.AudioTrack
 import android.system.Os
 import io.neoterm.BuildConfig
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
-import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
@@ -65,20 +64,20 @@ object PulseAudioBridge {
       }
       dir.deleteRecursively()
       dir.mkdirs()
-      context.assets.open("pulseaudio-aarch64.tar.gz").use { raw ->
-        GzipCompressorInputStream(raw).use { gz ->
-          TarArchiveInputStream(gz).use { tar ->
-            var entry = tar.nextTarEntry
-            while (entry != null) {
-              val out = File(dir, entry.name)
-              if (entry.isDirectory) {
-                out.mkdirs()
-              } else {
-                out.parentFile?.mkdirs()
-                out.outputStream().use { tar.copyTo(it) }
-              }
-              entry = tar.nextTarEntry
+      // Plain tar — AGP decompresses a .gz asset and renames it, so we ship
+      // and read an uncompressed .tar.
+      context.assets.open("pulseaudio-aarch64.tar").use { raw ->
+        TarArchiveInputStream(raw).use { tar ->
+          var entry = tar.nextTarEntry
+          while (entry != null) {
+            val out = File(dir, entry.name)
+            if (entry.isDirectory) {
+              out.mkdirs()
+            } else {
+              out.parentFile?.mkdirs()
+              out.outputStream().use { tar.copyTo(it) }
             }
+            entry = tar.nextTarEntry
           }
         }
       }

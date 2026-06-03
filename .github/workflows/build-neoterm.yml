@@ -142,11 +142,12 @@ jobs:
       - name: Bundle PulseAudio into APK (assets)
         run: |
           # Android-side PulseAudio server (binary + libs + modules), extracted
-          # and run by PulseAudioBridge at runtime.
+          # and run by PulseAudioBridge at runtime. Plain .tar (AGP would
+          # decompress a .gz and rename it).
           mkdir -p app/src/main/assets
-          cp "${GITHUB_WORKSPACE}/pulseaudio-bin/pulseaudio-aarch64.tar.gz" \
-             app/src/main/assets/pulseaudio-aarch64.tar.gz
-          ls -lh app/src/main/assets/pulseaudio-aarch64.tar.gz
+          cp "${GITHUB_WORKSPACE}/pulseaudio-bin/pulseaudio-aarch64.tar" \
+             app/src/main/assets/pulseaudio-aarch64.tar
+          ls -lh app/src/main/assets/pulseaudio-aarch64.tar
 
       - name: Bump version automatically (per build)
         run: |
@@ -241,14 +242,16 @@ jobs:
       - name: Package
         run: |
           cd "${GITHUB_WORKSPACE}/out/pulseaudio"
-          tar -czf "${GITHUB_WORKSPACE}/out/pulseaudio-aarch64.tar.gz" .
-          ls -lh "${GITHUB_WORKSPACE}/out/pulseaudio-aarch64.tar.gz"
+          # Plain tar (no gzip): AGP decompresses .gz assets and renames them,
+          # so we ship an uncompressed .tar and read it directly at runtime.
+          tar -cf "${GITHUB_WORKSPACE}/out/pulseaudio-aarch64.tar" .
+          ls -lh "${GITHUB_WORKSPACE}/out/pulseaudio-aarch64.tar"
 
       - name: Upload PulseAudio
         uses: actions/upload-artifact@v4
         with:
           name: pulseaudio-aarch64
-          path: out/pulseaudio-aarch64.tar.gz
+          path: out/pulseaudio-aarch64.tar
           if-no-files-found: error
 
   # ── 4) GitHub Release: APK (X11 beágyazva) + proot + rootfs-ek ──────────
