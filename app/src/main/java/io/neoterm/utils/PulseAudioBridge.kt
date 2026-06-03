@@ -111,6 +111,10 @@ object PulseAudioBridge {
       env["XDG_RUNTIME_DIR"] = runtime.absolutePath
       env["PULSE_RUNTIME_PATH"] = runtime.absolutePath
       env["LD_LIBRARY_PATH"] = File(dir, "lib").absolutePath
+      // Skip PulseAudio's startup self-exec (it canonicalizes the compile-time
+      // PA_BINARY path /bin/pulseaudio, which doesn't exist on Android).
+      env["LD_BIND_NOW"] = "1"
+      env["PATH"] = "${File(dir, "bin").absolutePath}:/system/bin"
       pb.redirectErrorStream(true)
       pb.redirectOutput(ProcessBuilder.Redirect.to(File(dir, "pulse-stdout.log")))
       paProcess = pb.start()
