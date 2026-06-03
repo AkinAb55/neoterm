@@ -178,22 +178,18 @@ echo "── collect artifacts ──"
 mkdir -p "$OUT/bin" "$OUT/lib/pulseaudio/modules"
 cp "$WORK/pa-install/bin/pulseaudio" "$OUT/bin/" 2>/dev/null || \
   cp "$(find "$WORK/pa-install" -name pulseaudio -type f | head -n1)" "$OUT/bin/"
-# Shared libs (libpulse*, internal pulsecommon/pulsecore) + the cross-built
-# deps the binary needs (libsndfile, libltdl, libintl).
-find "$WORK/pa-install" -name '*.so*' ! -path '*/modules/*' -exec cp -a {} "$OUT/lib/" \;
+# All shared libraries that are NOT loadable modules (module-*.so) go to lib/
+# (on LD_LIBRARY_PATH): libpulse*, libpulsecommon/core, the cross-built deps
+# (libsndfile/libltdl/libintl), AND the module *helper* libs
+# (libprotocol-native, libcli, librtp, …) which PA installs in the modules dir.
+find "$WORK/pa-install" -name '*.so*' ! -name 'module-*' -exec cp -a {} "$OUT/lib/" \;
 cp -a "$PREFIX"/lib/*.so* "$OUT/lib/" 2>/dev/null || true
-# Just the modules we actually use, to keep the APK small.
+# The loadable modules we actually use.
 for m in module-native-protocol-tcp module-pipe-sink module-null-sink \
-         module-simple-protocol-tcp module-cli-protocol-unix libprotocol-native \
-         libcli; do
-  find "$WORK/pa-install" -path '*/modules/*' -name "${m}*.so" \
+         module-simple-protocol-tcp; do
+  find "$WORK/pa-install" -path '*/modules/*' -name "${m}.so" \
     -exec cp -a {} "$OUT/lib/pulseaudio/modules/" \; 2>/dev/null || true
 done
-# Fallback: if module filtering missed things, take them all.
-if [ -z "$(ls -A "$OUT/lib/pulseaudio/modules" 2>/dev/null)" ]; then
-  find "$WORK/pa-install" -path '*/modules/*' -name '*.so' \
-    -exec cp -a {} "$OUT/lib/pulseaudio/modules/" \;
-fi
 
 "$STRIP" "$OUT/bin/pulseaudio" 2>/dev/null || true
 find "$OUT/lib" -name '*.so*' -exec "$STRIP" {} \; 2>/dev/null || true

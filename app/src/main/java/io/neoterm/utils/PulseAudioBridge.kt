@@ -110,7 +110,8 @@ object PulseAudioBridge {
       env["HOME"] = runtime.absolutePath
       env["XDG_RUNTIME_DIR"] = runtime.absolutePath
       env["PULSE_RUNTIME_PATH"] = runtime.absolutePath
-      env["LD_LIBRARY_PATH"] = File(dir, "lib").absolutePath
+      env["LD_LIBRARY_PATH"] =
+        "${File(dir, "lib").absolutePath}:${File(dir, "lib/pulseaudio/modules").absolutePath}"
       // Skip PulseAudio's startup self-exec (it canonicalizes the compile-time
       // PA_BINARY path /bin/pulseaudio, which doesn't exist on Android).
       env["LD_BIND_NOW"] = "1"
