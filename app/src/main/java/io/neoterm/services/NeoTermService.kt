@@ -58,6 +58,9 @@ class NeoTermService : Service() {
     // Wake lock on by default (keep the CPU running). Don't pop the battery-
     // optimization dialog at startup — that's only prompted on a manual acquire.
     acquireLock(promptBatteryOpt = false)
+    // Start the Android-side PulseAudio with the app, so terminal apps (not just
+    // X11) can play audio via PULSE_SERVER=127.0.0.1:4713.
+    io.neoterm.utils.PulseAudioBridge.start(this)
   }
 
   override fun onBind(intent: Intent): IBinder? {
@@ -89,6 +92,7 @@ class NeoTermService : Service() {
   override fun onDestroy() {
     stopForeground(true)
     stopX11Server()
+    io.neoterm.utils.PulseAudioBridge.stop()
 
     for (i in mTerminalSessions.indices)
       mTerminalSessions[i].finishIfRunning()

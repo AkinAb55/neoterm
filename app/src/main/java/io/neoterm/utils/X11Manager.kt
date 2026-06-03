@@ -77,8 +77,8 @@ object X11Manager {
     }.onFailure {
       NLog.e("X11Manager", "Failed to start X server: ${it.localizedMessage}")
     }
-    // Bring up audio (Android-side PulseAudio + AudioTrack playback bridge).
-    PulseAudioBridge.start(context)
+    // Audio (PulseAudio) is started with the app by NeoTermService, not here, so
+    // it's available to plain terminal apps too.
     launchDisplay(context)
   }
 
@@ -88,7 +88,8 @@ object X11Manager {
    * server actually exits).
    */
   fun stopServer(context: Context) {
-    PulseAudioBridge.stop()
+    // Audio is tied to the app lifecycle (NeoTermService), not X11, so we don't
+    // stop it here.
     runCatching {
       MainActivity.getInstance()?.finishAndRemoveTask()
       context.startService(

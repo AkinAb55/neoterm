@@ -34,14 +34,18 @@ object PulseAudioBridge {
     if (running) return
     running = true
     val app = context.applicationContext
-    val dir = prepare(app)
-    if (dir == null) {
-      running = false
-      return
-    }
-    val fifo = File(dir, "runtime/fifo")
-    startPulseAudio(dir, fifo)
-    thread = Thread({ pumpLoop(fifo) }, "pulse-bridge").apply { isDaemon = true; start() }
+    // Do extraction + launch + playback all on the background thread so callers
+    // (e.g. the foreground service's onCreate) don't block.
+    thread = Thread({
+      val dir = prepare(app)
+      if (dir == null) {
+        running = false
+        return@Thread
+      }
+      val fifo = File(dir, "runtime/fifo")
+      startPulseAudio(dir, fifo)
+      pumpLoop(fifo)
+    }, "pulse-bridge").apply { isDaemon = true; start() }
   }
 
   fun stop() {
