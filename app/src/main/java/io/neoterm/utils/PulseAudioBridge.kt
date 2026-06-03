@@ -1,31 +1,27 @@
 package io.neoterm.utils
 
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
-import android.system.Os
 import io.neoterm.BuildConfig
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import java.io.File
-import java.io.FileInputStream
-import java.io.InputStream
 
 /**
  * Android-side PulseAudio: plays the distro's audio on the device speaker.
  *
  * A vanilla PulseAudio cross-built for Android (bundled in assets as
- * pulseaudio-aarch64.tar.gz) runs as the app uid — no root, no proot, so it's
- * stable — configured with:
+ * pulseaudio-aarch64.tar) runs as the app uid — no root, no proot — with:
  *   - module-native-protocol-tcp on :4713 — distro apps connect via
  *     PULSE_SERVER=127.0.0.1:4713 (set in ProotManager);
- *   - module-pipe-sink → a FIFO we read here and write to an AudioTrack.
+ *   - module-sles-sink — a properly-clocked native OpenSL ES sink (PA →
+ *     OpenSL → speaker). This replaced an earlier pipe-sink + FIFO + AudioTrack
+ *     setup, whose open-loop clock drifted and caused constant underruns.
+ *
+ * Started with the app by NeoTermService so terminal apps (not just X11) have
+ * audio.
  *
  * @author kiva
  */
 object PulseAudioBridge {
-  private const val SAMPLE_RATE = 48000
-
   @Volatile private var running = false
   private var thread: Thread? = null
   private var paProcess: Process? = null
@@ -34,26 +30,22 @@ object PulseAudioBridge {
     if (running) return
     running = true
     val app = context.applicationContext
-    // Do extraction + launch + playback all on the background thread so callers
-    // (e.g. the foreground service's onCreate) don't block.
+    // Extraction + launch off the caller's thread (e.g. the service onCreate).
     thread = Thread({
       val dir = prepare(app)
       if (dir == null) {
         running = false
         return@Thread
       }
-      val fifo = File(dir, "runtime/fifo")
-      startPulseAudio(dir, fifo)
-      pumpLoop(fifo)
+      startPulseAudio(dir)
     }, "pulse-bridge").apply { isDaemon = true; start() }
   }
 
   fun stop() {
     running = false
-    thread?.interrupt()
-    thread = null
     runCatching { paProcess?.destroy() }
     paProcess = null
+    thread = null
   }
 
   /** Extract the bundled PulseAudio once per app version; returns its dir. */
@@ -94,12 +86,10 @@ object PulseAudioBridge {
     }.getOrNull()
   }
 
-  private fun startPulseAudio(dir: File, fifo: File) {
+  /** Run the bundled pulseaudio with the OpenSL ES sink + TCP protocol. */
+  private fun startPulseAudio(dir: File) {
     runCatching {
       val runtime = File(dir, "runtime").apply { mkdirs() }
-      if (fifo.exists()) fifo.delete()
-      runCatching { Os.mkfifo(fifo.absolutePath, 432 /* 0660 */) }
-
       val bin = File(dir, "bin/pulseaudio").absolutePath
       val modules = File(dir, "lib/pulseaudio/modules").absolutePath
       val log = File(dir, "pulse.log").absolutePath
@@ -108,7 +98,7 @@ object PulseAudioBridge {
         "--dl-search-path=$modules",
         "--log-target=newfile:$log", "--log-level=notice",
         "-L", "module-native-protocol-tcp port=4713 auth-ip-acl=127.0.0.1 auth-anonymous=1",
-        "-L", "module-pipe-sink file=${fifo.absolutePath} sink_name=neoterm rate=$SAMPLE_RATE channels=2 format=s16le"
+        "-L", "module-sles-sink sink_name=neoterm"
       )
       val env = pb.environment()
       env["HOME"] = runtime.absolutePath
@@ -123,68 +113,9 @@ object PulseAudioBridge {
       pb.redirectErrorStream(true)
       pb.redirectOutput(ProcessBuilder.Redirect.to(File(dir, "pulse-stdout.log")))
       paProcess = pb.start()
-      NLog.e("PulseAudioBridge", "PulseAudio started on :4713")
+      NLog.e("PulseAudioBridge", "PulseAudio (OpenSL sink) started on :4713")
     }.onFailure {
       NLog.e("PulseAudioBridge", "Failed to start PulseAudio: ${it.localizedMessage}")
-    }
-  }
-
-  private fun pumpLoop(fifo: File) {
-    // Run at audio priority so the FIFO keeps draining even when the CPU is
-    // busy (e.g. software video decode) — otherwise the sink underruns.
-    runCatching {
-      android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-    }
-    val minBuf = AudioTrack.getMinBufferSize(
-      SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT
-    )
-    // ~0.75s of stereo s16 (192000 B/s) to absorb scheduling jitter under load.
-    val bufSize = maxOf(minBuf, 144 * 1024)
-    while (running) {
-      var track: AudioTrack? = null
-      var input: InputStream? = null
-      try {
-        // Blocks until PulseAudio's pipe-sink opens the write end.
-        input = FileInputStream(fifo)
-        track = AudioTrack.Builder()
-          .setAudioAttributes(
-            AudioAttributes.Builder()
-              .setUsage(AudioAttributes.USAGE_MEDIA)
-              .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-              .build()
-          )
-          .setAudioFormat(
-            AudioFormat.Builder()
-              .setSampleRate(SAMPLE_RATE)
-              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-              .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-              .build()
-          )
-          .setBufferSizeInBytes(bufSize)
-          .setTransferMode(AudioTrack.MODE_STREAM)
-          .build()
-        track.play()
-
-        val buf = ByteArray(8192)
-        while (running) {
-          val n = input.read(buf)
-          if (n < 0) break
-          if (n > 0) track.write(buf, 0, n)
-        }
-      } catch (e: Exception) {
-        // FIFO not ready yet / stream dropped — retry.
-      } finally {
-        runCatching { track?.stop() }
-        runCatching { track?.release() }
-        runCatching { input?.close() }
-      }
-      if (running) {
-        try {
-          Thread.sleep(800)
-        } catch (e: InterruptedException) {
-          break
-        }
-      }
     }
   }
 }
