@@ -41,6 +41,7 @@
 
 #include <pulse/rtclock.h>
 #include <pulse/timeval.h>
+#include <pulse/volume.h>
 #include <pulse/xmalloc.h>
 
 #include <pulsecore/i18n.h>
@@ -95,6 +96,7 @@ struct userdata {
     uint32_t latency;
     uint32_t pm;
     uint32_t preset;
+    uint32_t volume;
     bool no_close;
 
     size_t frame_size;
@@ -111,6 +113,7 @@ static const char* const valid_modargs[] = {
     "latency",
     "pm",
     "preset",
+    "volume",
     "no_close_hack",
     NULL
 };
@@ -172,7 +175,10 @@ static int pa_open_aaudio_stream(struct userdata *u)
 
     CHK(AAudio_createStreamBuilder(&u->builder));
     AAudioStreamBuilder_setDirection(u->builder, AAUDIO_DIRECTION_INPUT);
-    AAudioStreamBuilder_setInputPreset(u->builder, AAUDIO_INPUT_PRESET_GENERIC + u->preset);
+    /* The input preset is the single biggest factor in capture loudness: the
+     * GENERIC route is often low-sensitivity with no AGC, so we default to
+     * VOICE_RECOGNITION (tuned gain + AGC) — far louder for speech. */
+    AAudioStreamBuilder_setInputPreset(u->builder, u->preset);
     AAudioStreamBuilder_setPerformanceMode(u->builder, AAUDIO_PERFORMANCE_MODE_NONE + u->pm);
     AAudioStreamBuilder_setDataCallback(u->builder, data_callback, u);
     AAudioStreamBuilder_setErrorCallback(u->builder, error_callback, u);
@@ -362,9 +368,14 @@ int pa__init(pa_module*m) {
     u->pm = AAUDIO_PERFORMANCE_MODE_LOW_LATENCY - AAUDIO_PERFORMANCE_MODE_NONE;
     pa_modargs_get_value_u32(ma, "pm", &u->pm);
 
-    /* Offset from AAUDIO_INPUT_PRESET_GENERIC; 0 == generic (default). */
-    u->preset = 0;
+    /* Absolute AAudio input preset; default VOICE_RECOGNITION for loud speech. */
+    u->preset = AAUDIO_INPUT_PRESET_VOICE_RECOGNITION;
     pa_modargs_get_value_u32(ma, "preset", &u->preset);
+
+    /* Software source volume in percent (PA applies it as gain). Default 150%
+     * so the mic isn't too quiet out of the box; tune live with pactl. */
+    u->volume = 150;
+    pa_modargs_get_value_u32(ma, "volume", &u->volume);
 
     pa_modargs_get_value_boolean(ma, "no_close_hack", &u->no_close);
 
@@ -411,6 +422,13 @@ int pa__init(pa_module*m) {
     }
 
     pa_source_put(u->source);
+
+    /* Apply the default software gain so quiet mics are usable out of the box. */
+    if (u->volume != 100) {
+        pa_cvolume cv;
+        pa_cvolume_set(&cv, u->ss.channels, (pa_volume_t) (PA_VOLUME_NORM * (uint64_t) u->volume / 100));
+        pa_source_set_volume(u->source, &cv, true, false);
+    }
 
     pa_modargs_free(ma);
 
