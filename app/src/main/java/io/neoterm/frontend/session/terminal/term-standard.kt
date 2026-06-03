@@ -13,7 +13,6 @@ import android.media.RingtoneManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.util.Log
-import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -230,23 +229,31 @@ class TermViewClient(val context: Context) : TerminalViewClient {
     if (event == null) {
       return false
     }
+    // Only the volume keys are candidates for the special-key mapping.
+    if (keyCode != KeyEvent.KEYCODE_VOLUME_DOWN && keyCode != KeyEvent.KEYCODE_VOLUME_UP) {
+      return false
+    }
 
     val shellSession = termSessionData?.termSession as ShellTermSession? ?: return false
 
-    // Volume keys as special keys
-    val volumeAsSpecialKeys = shellSession.shellProfile.enableSpecialVolumeKeys
-
-    val inputDevice = event.device
-    if (inputDevice != null && inputDevice.keyboardType == InputDevice.KEYBOARD_TYPE_ALPHABETIC) {
+    // Honor the "use volume keys as special keys" setting directly: when it's
+    // off we DON'T consume the event, so the volume keys keep controlling the
+    // system volume. (Previously the keys were swallowed even when disabled.)
+    //
+    // We intentionally do NOT gate on event.device.keyboardType here: on many
+    // phones (e.g. Samsung) the built-in device that emits the volume keycodes
+    // reports KEYBOARD_TYPE_ALPHABETIC, which made the old guard bail out and
+    // the toggle appear to do nothing.
+    if (!shellSession.shellProfile.enableSpecialVolumeKeys) {
       return false
-    } else if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-      mVirtualControlKeyDown = down && volumeAsSpecialKeys
-      return true
-    } else if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
-      mVirtualFnKeyDown = down && volumeAsSpecialKeys
-      return true
     }
-    return false
+
+    if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+      mVirtualControlKeyDown = down   // Volume Down → Ctrl
+    } else {
+      mVirtualFnKeyDown = down         // Volume Up → Fn
+    }
+    return true
   }
 
   fun updateExtraKeys(title: String?, force: Boolean = false) {
