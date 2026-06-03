@@ -17,6 +17,9 @@
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+  <!-- Microphone: lets the bundled PulseAudio's AAudio source capture the device
+       mic so recording apps in the proot distro have audio input. -->
+  <uses-permission android:name="android.permission.RECORD_AUDIO"/>
   <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
 
   <application

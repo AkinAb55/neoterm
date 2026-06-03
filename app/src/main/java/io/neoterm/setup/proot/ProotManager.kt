@@ -186,6 +186,10 @@ object ProotManager {
     // nyúlnak hozzá).
     args.add("DISPLAY=:0")
     args.add("PULSE_SERVER=127.0.0.1:4713")
+    // Default recording source: NeoTerm's Android-side microphone (AAudio
+    // input). Usable only once the app holds RECORD_AUDIO; otherwise the module
+    // isn't loaded and capture apps simply find no such source.
+    args.add("PULSE_SOURCE=neoterm_mic")
     args.add("XDG_RUNTIME_DIR=/tmp")
     // Firefox's content sandbox can't work under proot (ptrace + no user
     // namespaces) and SIGSEGVs its child processes; disable it so the browser

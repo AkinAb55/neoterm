@@ -48,6 +48,30 @@ object PulseAudioBridge {
     thread = null
   }
 
+  /**
+   * Restart PulseAudio — used after the RECORD_AUDIO permission is granted, so
+   * the AAudio *source* (mic) module, which failed to load at app start without
+   * the permission, gets loaded. We wait for the old process to fully exit so
+   * the TCP module can rebind :4713 (otherwise it'd hit EADDRINUSE).
+   */
+  fun restart(context: Context) {
+    val app = context.applicationContext
+    thread = Thread({
+      val old = paProcess
+      running = false
+      runCatching { old?.destroy() }
+      runCatching { old?.waitFor() }   // block until :4713 is released
+      paProcess = null
+      running = true
+      val dir = prepare(app)
+      if (dir == null) {
+        running = false
+        return@Thread
+      }
+      startPulseAudio(dir)
+    }, "pulse-restart").apply { isDaemon = true; start() }
+  }
+
   /** Extract the bundled PulseAudio once per app version; returns its dir. */
   private fun prepare(context: Context): File? {
     return runCatching {
@@ -98,7 +122,11 @@ object PulseAudioBridge {
         "--dl-search-path=$modules",
         "--log-target=newfile:$log", "--log-level=notice",
         "-L", "module-native-protocol-tcp port=4713 auth-ip-acl=127.0.0.1 auth-anonymous=1",
-        "-L", "module-aaudio-sink sink_name=neoterm no_close_hack=1"
+        "-L", "module-aaudio-sink sink_name=neoterm no_close_hack=1",
+        // Microphone capture (AAudio input). Needs the app's RECORD_AUDIO
+        // runtime permission; if it's not granted the module just fails to load
+        // and the sink keeps working, so loading it unconditionally is safe.
+        "-L", "module-aaudio-source source_name=neoterm_mic no_close_hack=1"
       )
       val env = pb.environment()
       env["HOME"] = runtime.absolutePath

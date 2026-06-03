@@ -148,6 +148,14 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     ) {
       needed.add("android.permission.POST_NOTIFICATIONS")
     }
+    // RECORD_AUDIO lets the bundled PulseAudio's AAudio source capture the mic
+    // for recording apps in the distro. Best-effort: declining it just means no
+    // microphone input — audio output keeps working.
+    if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+      != PackageManager.PERMISSION_GRANTED
+    ) {
+      needed.add(Manifest.permission.RECORD_AUDIO)
+    }
 
     if (needed.isEmpty()) {
       onStartupPermissionsHandled()
@@ -545,6 +553,14 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
     when (requestCode) {
       NeoPermission.REQUEST_APP_PERMISSION -> {
+        // If the mic permission was just granted, restart the audio bridge so
+        // PulseAudio's AAudio source module loads (it failed to load at app
+        // start when the permission wasn't held yet).
+        val micGranted = permissions.indexOf(Manifest.permission.RECORD_AUDIO)
+          .let { it >= 0 && grantResults.getOrNull(it) == PackageManager.PERMISSION_GRANTED }
+        if (micGranted) {
+          io.neoterm.utils.PulseAudioBridge.restart(this)
+        }
         // Storage/notifications are best-effort: the rootfs lives in internal
         // storage, so the app still works if they are declined. Proceed with
         // startup regardless of the result instead of killing the app.
