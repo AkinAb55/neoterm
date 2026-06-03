@@ -130,10 +130,16 @@ object PulseAudioBridge {
   }
 
   private fun pumpLoop(fifo: File) {
+    // Run at audio priority so the FIFO keeps draining even when the CPU is
+    // busy (e.g. software video decode) — otherwise the sink underruns.
+    runCatching {
+      android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+    }
     val minBuf = AudioTrack.getMinBufferSize(
       SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT
     )
-    val bufSize = maxOf(minBuf, SAMPLE_RATE)
+    // ~0.75s of stereo s16 (192000 B/s) to absorb scheduling jitter under load.
+    val bufSize = maxOf(minBuf, 144 * 1024)
     while (running) {
       var track: AudioTrack? = null
       var input: InputStream? = null
