@@ -132,11 +132,13 @@ sed -i 's|^void pa_drop_root(void) {|void pa_drop_root(void) { return; /* NeoTer
 # Add Termux's proven OpenSL ES sink — a properly-clocked native Android sink
 # (PA → OpenSL → speaker), so we don't need the open-loop pipe-sink + FIFO +
 # AudioTrack (which drifted and underran).
-echo "── add OpenSL ES sink module ──"
-mkdir -p "$PA_SRC/src/modules/sles"
+echo "── add OpenSL ES + AAudio sink modules ──"
+mkdir -p "$PA_SRC/src/modules/sles" "$PA_SRC/src/modules/aaudio"
 curl -L -o "$PA_SRC/src/modules/sles/module-sles-sink.c" \
   "https://raw.githubusercontent.com/termux/termux-packages/master/packages/pulseaudio/module-sles-sink.c"
-sed -i "/^all_modules = \[/a\\  [ 'module-sles-sink', 'sles/module-sles-sink.c', [], [], [cc.find_library('OpenSLES', required: true)] ]," \
+curl -L -o "$PA_SRC/src/modules/aaudio/module-aaudio-sink.c" \
+  "https://raw.githubusercontent.com/termux/termux-packages/master/packages/pulseaudio/module-aaudio-sink.c"
+sed -i "/^all_modules = \[/a\\  [ 'module-sles-sink', 'sles/module-sles-sink.c', [], [], [cc.find_library('OpenSLES', required: true)] ],\n  [ 'module-aaudio-sink', 'aaudio/module-aaudio-sink.c', [], [], [cc.find_library('aaudio', required: true)] ]," \
   "$PA_SRC/src/modules/meson.build"
 
 cat > "$WORK/android-cross.ini" <<EOF
@@ -195,8 +197,8 @@ cp "$WORK/pa-install/bin/pulseaudio" "$OUT/bin/" 2>/dev/null || \
 find "$WORK/pa-install" -name '*.so*' ! -name 'module-*' -exec cp -a {} "$OUT/lib/" \;
 cp -a "$PREFIX"/lib/*.so* "$OUT/lib/" 2>/dev/null || true
 # The loadable modules we actually use.
-for m in module-native-protocol-tcp module-sles-sink module-pipe-sink \
-         module-null-sink module-simple-protocol-tcp; do
+for m in module-native-protocol-tcp module-aaudio-sink module-sles-sink \
+         module-pipe-sink module-null-sink module-simple-protocol-tcp; do
   find "$WORK/pa-install" -path '*/modules/*' -name "${m}.so" \
     -exec cp -a {} "$OUT/lib/pulseaudio/modules/" \; 2>/dev/null || true
 done

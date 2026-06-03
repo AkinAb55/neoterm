@@ -98,14 +98,15 @@ object PulseAudioBridge {
         "--dl-search-path=$modules",
         "--log-target=newfile:$log", "--log-level=notice",
         "-L", "module-native-protocol-tcp port=4713 auth-ip-acl=127.0.0.1 auth-anonymous=1",
-        "-L", "module-sles-sink sink_name=neoterm"
+        "-L", "module-aaudio-sink sink_name=neoterm no_close_hack=1"
       )
       val env = pb.environment()
       env["HOME"] = runtime.absolutePath
       env["XDG_RUNTIME_DIR"] = runtime.absolutePath
       env["PULSE_RUNTIME_PATH"] = runtime.absolutePath
+      // Include /system/lib64 so the AAudio sink's system deps resolve.
       env["LD_LIBRARY_PATH"] =
-        "${File(dir, "lib").absolutePath}:${File(dir, "lib/pulseaudio/modules").absolutePath}"
+        "${File(dir, "lib").absolutePath}:${File(dir, "lib/pulseaudio/modules").absolutePath}:/system/lib64"
       // Skip PulseAudio's startup self-exec (it canonicalizes the compile-time
       // PA_BINARY path /bin/pulseaudio, which doesn't exist on Android).
       env["LD_BIND_NOW"] = "1"
