@@ -195,6 +195,11 @@ class NeoTermService : Service() {
     val activity = NeoTermActivity.getInstance()
     NLog.e("NeoTermSvcDbg", "teardownAndStop: activityInstance=${activity != null}")
     activity?.finishAndRemoveTask()
+    // Close the embedded X11 window too (its server is unbound in onDestroy).
+    // We must NOT route this through startService(ACTION_X11_STOP): that would
+    // re-create this just-stopped service and bring back a session-less
+    // notification.
+    runCatching { com.termux.x11.MainActivity.getInstance()?.finishAndRemoveTask() }
     stopForeground(true)
     stopSelf()
     NLog.e("NeoTermSvcDbg", "teardownAndStop: stopSelf() called")
