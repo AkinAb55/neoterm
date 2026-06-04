@@ -38,6 +38,13 @@ public interface TerminalViewClient {
   boolean onLongPress(MotionEvent event);
 
   /**
+   * The "CC" (custom commands) button in the text-selection bar was tapped.
+   * Implementations open the custom-commands manager; {@code session} is the
+   * active session a chosen command may be run in.
+   */
+  void onCustomCommands(TerminalSession session);
+
+  /**
    * A horizontal swipe (fling) was detected on the terminal. Used to page
    * between tabs without interfering with vertical scrolling.
    *

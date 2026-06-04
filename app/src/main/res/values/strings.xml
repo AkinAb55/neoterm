@@ -4,6 +4,17 @@
   <string name="paste_text">Paste</string>
   <string name="super_paste_text">Super Paste</string>
   <string name="text_selection_more">More</string>
+  <string name="cc_button">CC</string>
+
+  <string name="custom_commands">Custom commands</string>
+  <string name="cc_add">Add</string>
+  <string name="cc_edit">Edit</string>
+  <string name="cc_close">Close</string>
+  <string name="cc_empty">No custom commands yet. Tap Add.</string>
+  <string name="cc_name_hint">Name (optional)</string>
+  <string name="cc_command_hint">Command</string>
+  <string name="cc_run_current">Run in current session</string>
+  <string name="cc_run_new">Run in new session</string>
 
   <string name="toggle_tab_switcher_menu_item">Toggle Tabs</string>
   <string name="new_session">New Session</string>

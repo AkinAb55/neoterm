@@ -86,6 +86,10 @@ class BasicViewClient(val terminalView: TerminalView) : TerminalViewClient {
     return false
   }
 
+  override fun onCustomCommands(session: TerminalSession?) {
+    // The basic/floating terminal has no custom-commands UI.
+  }
+
   override fun onSwipe(toLeft: Boolean) {
     // Floating/basic terminal has no tabs.
   }

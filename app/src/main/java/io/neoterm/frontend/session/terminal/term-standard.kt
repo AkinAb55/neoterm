@@ -219,6 +219,18 @@ class TermViewClient(val context: Context) : TerminalViewClient {
     return false
   }
 
+  override fun onCustomCommands(session: TerminalSession?) {
+    // The "CC" button: open the custom-commands manager. A chosen command runs
+    // either in the active session (write to it) or in a freshly opened one.
+    io.neoterm.ui.term.CustomCommandsDialog(
+      context,
+      runInCurrent = { cmd -> session?.write(cmd + "\n") },
+      runInNew = { cmd ->
+        org.greenrobot.eventbus.EventBus.getDefault().post(CreateNewSessionEvent(cmd))
+      }
+    ).show()
+  }
+
   override fun onSwipe(toLeft: Boolean) {
     // Page between tabs: swipe left -> next session, swipe right -> previous.
     val termUI = termSessionData?.termUI ?: return

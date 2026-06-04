@@ -1111,7 +1111,14 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   @Suppress("unused", "UNUSED_PARAMETER")
   @Subscribe(threadMode = ThreadMode.MAIN)
   fun onCreateNewSessionEvent(createNewSessionEvent: CreateNewSessionEvent) {
-    addNewSession()
+    val cmd = createNewSessionEvent.initialCommand
+    if (cmd.isNullOrEmpty()) {
+      addNewSession()
+    } else {
+      // Open a fresh session that runs the given custom command on startup.
+      val profile = ShellProfile.create().apply { initialCommand = cmd }
+      addNewSessionWithProfile(profile)
+    }
   }
 
   @Suppress("unused", "UNUSED_PARAMETER")
