@@ -102,6 +102,8 @@
   </string>
   <string name="pref_general_volume_as_control">Use volume up and down as special keys</string>
   <string name="pref_general_volume_as_control_desc">Volume Down as Ctrl\nVolume Up as FN</string>
+  <string name="pref_general_microphone">Microphone</string>
+  <string name="pref_general_microphone_desc">Let apps in the Linux distro use the device microphone (PulseAudio source)</string>
   <string name="pref_general_use_execve_wrapper">Use execve() wrapper</string>
   <string name="pref_general_use_execve_wrapper_desc">Hook execve() to avoid incorrect shebang</string>
   <string name="pref_general_enable_word_based_ime">Enable word based IME</string>

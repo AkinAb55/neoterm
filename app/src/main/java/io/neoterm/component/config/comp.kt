@@ -296,6 +296,13 @@ object NeoPreference {
     )
   }
 
+  fun isMicrophoneEnabled(): Boolean {
+    return loadBoolean(
+      R.string.key_general_microphone,
+      DefaultValues.enableMicrophone
+    )
+  }
+
   fun isAutoCompletionEnabled(): Boolean {
     return loadBoolean(
       R.string.key_general_auto_completion,

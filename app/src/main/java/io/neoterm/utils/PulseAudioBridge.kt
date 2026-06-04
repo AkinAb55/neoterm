@@ -117,17 +117,21 @@ object PulseAudioBridge {
       val bin = File(dir, "bin/pulseaudio").absolutePath
       val modules = File(dir, "lib/pulseaudio/modules").absolutePath
       val log = File(dir, "pulse.log").absolutePath
-      val pb = ProcessBuilder(
+      val cmd = arrayListOf(
         bin, "-n", "--daemonize=no", "--exit-idle-time=-1", "--disable-shm=true",
         "--dl-search-path=$modules",
         "--log-target=newfile:$log", "--log-level=notice",
         "-L", "module-native-protocol-tcp port=4713 auth-ip-acl=127.0.0.1 auth-anonymous=1",
-        "-L", "module-aaudio-sink sink_name=neoterm no_close_hack=1",
-        // Microphone capture (AAudio input). Needs the app's RECORD_AUDIO
-        // runtime permission; if it's not granted the module just fails to load
-        // and the sink keeps working, so loading it unconditionally is safe.
-        "-L", "module-aaudio-source source_name=neoterm_mic no_close_hack=1"
+        "-L", "module-aaudio-sink sink_name=neoterm no_close_hack=1"
       )
+      // Microphone capture (AAudio input) is opt-in via Settings → Microphone.
+      // It also needs the app's RECORD_AUDIO permission; loading the module only
+      // when enabled keeps the mic off (and unclaimed) unless the user wants it.
+      if (io.neoterm.component.config.NeoPreference.isMicrophoneEnabled()) {
+        cmd.add("-L")
+        cmd.add("module-aaudio-source source_name=neoterm_mic no_close_hack=1")
+      }
+      val pb = ProcessBuilder(cmd)
       val env = pb.environment()
       env["HOME"] = runtime.absolutePath
       env["XDG_RUNTIME_DIR"] = runtime.absolutePath

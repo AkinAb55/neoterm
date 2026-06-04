@@ -149,9 +149,10 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       needed.add("android.permission.POST_NOTIFICATIONS")
     }
     // RECORD_AUDIO lets the bundled PulseAudio's AAudio source capture the mic
-    // for recording apps in the distro. Best-effort: declining it just means no
-    // microphone input — audio output keeps working.
-    if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+    // for recording apps in the distro. Only requested when the user enabled the
+    // microphone in Settings; declining it just means no input (output stays).
+    if (NeoPreference.isMicrophoneEnabled() &&
+      ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
       != PackageManager.PERMISSION_GRANTED
     ) {
       needed.add(Manifest.permission.RECORD_AUDIO)
@@ -578,6 +579,23 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       getString(R.string.key_customization_color_scheme) -> {
         (tabSwitcher.selectedTab as? TermTab)?.updateColorScheme()
         applyTerminalSystemColors()
+      }
+
+      getString(R.string.key_general_microphone) -> {
+        // Toggle the mic: when enabling, make sure RECORD_AUDIO is granted (the
+        // grant callback restarts audio); otherwise restart now so PulseAudio
+        // loads/unloads its AAudio source module to match the new setting.
+        if (NeoPreference.isMicrophoneEnabled() &&
+          ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+          != PackageManager.PERMISSION_GRANTED
+        ) {
+          ActivityCompat.requestPermissions(
+            this, arrayOf(Manifest.permission.RECORD_AUDIO),
+            NeoPermission.REQUEST_APP_PERMISSION
+          )
+        } else {
+          io.neoterm.utils.PulseAudioBridge.restart(this)
+        }
       }
 
       getString(R.string.key_ui_eks_enabled) -> {
