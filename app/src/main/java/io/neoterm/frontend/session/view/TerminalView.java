@@ -22,6 +22,7 @@ import android.view.accessibility.AccessibilityManager;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.Scroller;
 import io.neoterm.R;
 import io.neoterm.backend.*;
@@ -344,6 +345,21 @@ public final class TerminalView extends View {
     setVerticalScrollBarEnabled(true);
 
     return true;
+  }
+
+  @Override
+  public void onWindowFocusChanged(boolean hasWindowFocus) {
+    super.onWindowFocusChanged(hasWindowFocus);
+    // Force the IME to restart input when we (re)gain focus so it re-reads the
+    // terminal colors we hand it through onCreateInputConnection. Bringing the
+    // app back from recents already did this implicitly, which is why the
+    // colors only reached a co-operating keyboard then — doing it on the first
+    // focus too means the keyboard is themed from the very first session.
+    if (hasWindowFocus && mEmulator != null) {
+      InputMethodManager imm =
+        (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+      if (imm != null) imm.restartInput(this);
+    }
   }
 
   @Override
