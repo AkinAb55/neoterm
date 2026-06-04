@@ -12,7 +12,6 @@ import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Bundle;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
@@ -34,15 +33,6 @@ import java.util.regex.Matcher;
  * View displaying and interacting with a {@link TerminalSession}.
  */
 public final class TerminalView extends View {
-
-  /**
-   * EditorInfo.extras keys used to advertise the terminal's colors to a
-   * co-operating on-screen keyboard (pcKeyboard). The values are ARGB ints;
-   * the keyboard derives its whole theme from them. Kept in sync with
-   * pcKeyboard's TerminalThemeBridge.
-   */
-  private static final String IME_THEME_BACKGROUND = "com.pckeyboard.ime.theme.BACKGROUND";
-  private static final String IME_THEME_FOREGROUND = "com.pckeyboard.ime.theme.FOREGROUND";
 
   /**
    * Log view key and IME events.
@@ -376,24 +366,12 @@ public final class TerminalView extends View {
     // keyboard on Android TV (see https://github.com/termux/termux-app/issues/221).
     outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN;
 
-    // Advertise the live terminal colors to a co-operating on-screen keyboard
-    // (pcKeyboard) so it can theme itself to match the terminal. We only hand
-    // over the background and foreground; the keyboard derives every other
-    // shade — including its accent — from these two so it deviates minimally
-    // from the terminal's own palette. Keys are namespaced under the keyboard's
-    // package and are simply ignored by any other IME.
-    //
-    // Fall back to the configured default color scheme when the emulator has
-    // not attached yet: the keyboard can be shown for the very first input
-    // session before the session is ready, and without this the colors would
-    // only reach the keyboard after the input connection is recreated (e.g.
-    // after a recents round-trip).
-    int[] colors = mEmulator != null
-      ? mEmulator.mColors.mCurrentColors
-      : TerminalColors.COLOR_SCHEME.mDefaultColors;
-    if (outAttrs.extras == null) outAttrs.extras = new Bundle();
-    outAttrs.extras.putInt(IME_THEME_BACKGROUND, colors[TextStyle.COLOR_INDEX_BACKGROUND]);
-    outAttrs.extras.putInt(IME_THEME_FOREGROUND, colors[TextStyle.COLOR_INDEX_FOREGROUND]);
+    // Advertise the terminal colors to a co-operating on-screen keyboard
+    // (pcKeyboard) so it can theme itself to match the terminal. The keyboard
+    // is themed from the very first input session even before the emulator has
+    // attached, because the bridge falls back to the user's configured color
+    // scheme. See KeyboardThemeBridge.
+    KeyboardThemeBridge.applyTo(outAttrs, mEmulator);
 
     return new BaseInputConnection(this, true) {
       @Override
