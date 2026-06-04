@@ -152,6 +152,9 @@ object ProotManager {
     // létezzen (a setup is létrehozza, de futásidőben is biztosítjuk).
     File(NeoTermPath.PROOT_TMP_PATH).mkdirs()
 
+    // Gondoskodunk róla, hogy a login shell betöltse a ~/.bashrc-t (lásd lent).
+    ensureLoginSourcesBashrc(distro)
+
     val args = ArrayList<String>(48)
     args.add("proot")
     args.add("--kill-on-exit")     // a teljes process-fa meghal a tracee után
@@ -260,6 +263,29 @@ object ProotManager {
   private fun bind(args: ArrayList<String>, host: String, guest: String? = null) {
     args.add("-b")
     args.add(if (guest == null) host else "$host:$guest")
+  }
+
+  /**
+   * Login shells (`bash --login`) read ~/.bash_profile/.profile, NOT ~/.bashrc.
+   * On some distros (e.g. Kali's root) nothing sources ~/.bashrc for a login
+   * shell, so PATH additions appended there — like `~/.local/bin` for tools
+   * installed via pip/npm (claude, etc.) — never take effect ("command not
+   * found"). Drop in a minimal ~/.bash_profile that loads ~/.bashrc, but only
+   * when the user has neither ~/.bash_profile nor ~/.bash_login (so we never
+   * clobber an explicit user setup). Idempotent and cheap (a couple of stats).
+   */
+  private fun ensureLoginSourcesBashrc(distro: Distro) {
+    if (!distro.defaultShell.endsWith("bash")) return
+    runCatching {
+      val home = File(distro.rootfsPath(), "root")
+      if (!home.isDirectory) return
+      if (File(home, ".bash_profile").exists() || File(home, ".bash_login").exists()) return
+      File(home, ".bash_profile").writeText(
+        "# Created by NeoTerm: load ~/.bashrc in login shells so PATH additions\n" +
+          "# (e.g. ~/.local/bin for pip/npm/claude installs) take effect.\n" +
+          "if [ -f \"\$HOME/.bashrc\" ]; then . \"\$HOME/.bashrc\"; fi\n"
+      )
+    }
   }
 
   /**
