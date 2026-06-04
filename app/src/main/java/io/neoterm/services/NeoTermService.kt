@@ -41,6 +41,14 @@ class NeoTermService : Service() {
   private var mWakeLock: PowerManager.WakeLock? = null
   private var mWifiLock: WifiManager.WifiLock? = null
 
+  // Set once we begin tearing down. Guards against the async session-finished
+  // callbacks (onSessionFinished -> removeTermSession -> updateNotification)
+  // re-posting the foreground notification via NotificationManager.notify()
+  // *after* we've already cancelled it, which made it look like the service
+  // "restarted" with no sessions.
+  @Volatile
+  private var stopping = false
+
   // The embedded X server runs in its own process (com.termux.x11.NeoX11Service).
   // We keep it alive by binding it with BIND_IMPORTANT, so it needs no
   // notification of its own — its status is shown in this service's notification.
@@ -187,6 +195,9 @@ class NeoTermService : Service() {
    * X11 server process.
    */
   private fun teardownAndStop() {
+    // Mark stopping first, so any async updateNotification() becomes a no-op and
+    // can't re-post the notification after we cancel it below.
+    stopping = true
     NeoTermActivity.getInstance()?.finishAndRemoveTask()
     // Close the embedded X11 window too (its server is unbound in onDestroy).
     // We must NOT route this through startService(ACTION_X11_STOP): that would
@@ -224,6 +235,8 @@ class NeoTermService : Service() {
   }
 
   private fun updateNotification() {
+    // Don't re-post once we've started tearing down (see `stopping`).
+    if (stopping) return
     val service = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     service.notify(NOTIFICATION_ID, createNotification())
   }
