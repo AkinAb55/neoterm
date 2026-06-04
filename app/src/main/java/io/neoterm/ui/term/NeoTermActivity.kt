@@ -465,6 +465,12 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       if (tabSwitcher.isSwitcherShown) return@postDelayed
       view.requestFocus()
       val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+      // Re-query the terminal's InputConnection so the IME adopts the terminal's
+      // input config (word- vs char-based, no autocorrect, …). On first launch
+      // the IME can connect before the session exists, so without this restart
+      // the keyboard only adapts after returning from recents (which restarts
+      // input for us).
+      imm.restartInput(view)
       imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
     }, 100)
   }
@@ -756,6 +762,11 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     if (view != null && view.width > 0 && view.height > 0) {
       view.updateSize()
       view.onScreenUpdated()
+      // The first session is now laid out: bind the keyboard to it (focus +
+      // IME restart). onWindowFocusChanged fires before the first session
+      // exists, so this is what makes the keyboard adapt to the terminal on
+      // first launch instead of only after returning from recents.
+      raiseKeyboardForSelectedTab()
       return
     }
     if (attempt < 12) {
