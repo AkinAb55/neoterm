@@ -93,7 +93,12 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     instance = this
-    io.neoterm.utils.NLog.e("NeoTermSvcDbg", "Activity.onCreate")
+    io.neoterm.utils.NLog.e(
+      "NeoTermSvcDbg",
+      "Activity.onCreate action=${intent?.action} cats=${intent?.categories} " +
+        "flags=0x${Integer.toHexString(intent?.flags ?: 0)} caller=${callingActivity} " +
+        "referrer=$referrer savedState=${savedInstanceState != null}"
+    )
 
     // Keep the screen on while the terminal is in front (on by default).
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)

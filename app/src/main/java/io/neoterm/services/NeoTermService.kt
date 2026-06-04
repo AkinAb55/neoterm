@@ -144,6 +144,11 @@ class NeoTermService : Service() {
 
   fun removeTermSession(sessionToRemove: TerminalSession): Int {
     val indexOfRemoved = mTerminalSessions.indexOf(sessionToRemove)
+    android.util.Log.e(
+      "NeoTermSvcDbg",
+      "removeTermSession idx=$indexOfRemoved running=${sessionToRemove.isRunning}",
+      Throwable("removeTermSession caller")
+    )
     if (indexOfRemoved >= 0) {
       mTerminalSessions.removeAt(indexOfRemoved)
       updateNotification()
