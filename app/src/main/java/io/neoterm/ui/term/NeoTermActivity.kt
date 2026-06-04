@@ -63,6 +63,15 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
      * settled and the content view is laid out (otherwise the terminal opens
      * blank). */
     private const val FIRST_SESSION_DELAY_MS = 350L
+
+    /** Live instance, so the service's "Exit" action can finish the activity
+     * (and remove its task) — otherwise the still-bound/recents activity would
+     * re-create the service and its notification right after Exit. Cleared in
+     * onDestroy, so it holds no reference past the activity's lifetime. */
+    @Volatile
+    private var instance: NeoTermActivity? = null
+
+    fun getInstance(): NeoTermActivity? = instance
   }
 
   lateinit var tabSwitcher: TabSwitcher
@@ -83,6 +92,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    instance = this
 
     // Keep the screen on while the terminal is in front (on by default).
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -420,6 +430,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   override fun onDestroy() {
     super.onDestroy()
+    if (instance === this) instance = null
     val tab = tabSwitcher.selectedTab as NeoTab?
     tab?.onDestroy()
     PreferenceManager.getDefaultSharedPreferences(this)

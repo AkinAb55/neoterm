@@ -73,7 +73,12 @@ class NeoTermService : Service() {
       ACTION_SERVICE_STOP -> {
         for (i in mTerminalSessions.indices)
           mTerminalSessions[i].finishIfRunning()
-        // onDestroy unbinds/stops the embedded X11 server process.
+        // Finish the activity and drop its task too: otherwise the still-bound
+        // (or recents-resident) activity re-creates this service right after
+        // Exit, so the notification comes back with no session. onDestroy
+        // unbinds/stops the embedded X11 server process.
+        NeoTermActivity.getInstance()?.finishAndRemoveTask()
+        stopForeground(true)
         stopSelf()
       }
 
