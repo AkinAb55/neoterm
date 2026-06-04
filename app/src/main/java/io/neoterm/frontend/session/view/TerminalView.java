@@ -28,7 +28,6 @@ import io.neoterm.R;
 import io.neoterm.backend.*;
 import io.neoterm.component.completion.OnAutoCompleteListener;
 
-import java.util.regex.Matcher;
 
 /**
  * View displaying and interacting with a {@link TerminalSession}.
@@ -192,9 +191,10 @@ public final class TerminalView extends View {
           toggleSelectingText(null);
           return true;
         }
-        // Tapping a URL opens it in the browser instead of raising the keyboard.
+        // Tapping a URL / path / git-hash offers a quick action instead of
+        // raising the keyboard.
         if (!mEmulator.isMouseTrackingActive() && !e.isFromSource(InputDevice.SOURCE_MOUSE)
-          && openUrlAtTap(e)) {
+          && handleTokenTap(e)) {
           return true;
         }
         requestFocus();
@@ -945,7 +945,7 @@ public final class TerminalView extends View {
    *
    * @return true if a URL was found and opened.
    */
-  private boolean openUrlAtTap(MotionEvent e) {
+  private boolean handleTokenTap(MotionEvent e) {
     if (mEmulator == null) return false;
     TerminalBuffer screen = mEmulator.getScreen();
     int columns = mEmulator.mColumns;
@@ -971,19 +971,72 @@ public final class TerminalView extends View {
     }
     if (tapIndex < 0) return false;
 
-    Matcher matcher = TerminalUrls.PATTERN.matcher(builder);
-    while (matcher.find()) {
-      int end = TerminalUrls.trimmedEnd(builder, matcher.start(), matcher.end());
-      // Only react if the tap landed on the trimmed (real) URL span.
-      if (tapIndex >= matcher.start() && tapIndex < end) {
-        String url = builder.substring(matcher.start(), end);
-        if (url.isEmpty()) return false;
-        if (url.regionMatches(true, 0, "www.", 0, 4)) url = "http://" + url;
-        openUrl(url);
-        return true;
+    TerminalTokens.Token token = TerminalTokens.find(builder, tapIndex);
+    if (token == null) return false;
+    showTokenActions(token);
+    return true;
+  }
+
+  /** Quick-action menu for a tapped URL / path / git-hash. */
+  private void showTokenActions(final TerminalTokens.Token token) {
+    final String value = token.value;
+    final CharSequence[] items;
+    final Runnable[] actions;
+    switch (token.type) {
+      case PATH: {
+        final String q = shellQuote(value);
+        items = new CharSequence[]{
+          getContext().getString(R.string.token_edit),
+          getContext().getString(R.string.token_list),
+          getContext().getString(R.string.token_cd),
+          getContext().getString(R.string.token_copy)
+        };
+        actions = new Runnable[]{
+          () -> runInSession("${EDITOR:-nano} " + q),
+          () -> runInSession("ls -la " + q),
+          () -> runInSession("cd " + q + " 2>/dev/null || cd \"$(dirname " + q + ")\""),
+          () -> mTermSession.clipboardText(value)
+        };
+        break;
+      }
+      case GIT_HASH: {
+        items = new CharSequence[]{
+          getContext().getString(R.string.token_git_show),
+          getContext().getString(R.string.token_copy)
+        };
+        actions = new Runnable[]{
+          () -> runInSession("git show " + value),
+          () -> mTermSession.clipboardText(value)
+        };
+        break;
+      }
+      case URL:
+      default: {
+        items = new CharSequence[]{
+          getContext().getString(R.string.token_open),
+          getContext().getString(R.string.token_copy)
+        };
+        actions = new Runnable[]{
+          () -> openUrl(value),
+          () -> mTermSession.clipboardText(value)
+        };
+        break;
       }
     }
-    return false;
+    new androidx.appcompat.app.AlertDialog.Builder(getContext())
+      .setTitle(value)
+      .setItems(items, (d, which) -> actions[which].run())
+      .show();
+  }
+
+  /** Type a command into the active session and run it (append newline). */
+  private void runInSession(String command) {
+    if (mTermSession != null) mTermSession.write(command + "\n");
+  }
+
+  /** Single-quote a string for safe use as one shell argument. */
+  private static String shellQuote(String s) {
+    return "'" + s.replace("'", "'\\''") + "'";
   }
 
   private void openUrl(String url) {

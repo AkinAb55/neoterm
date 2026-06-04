@@ -17,6 +17,13 @@
   <string name="cc_run_new">Run in new session</string>
   <string name="cc_delete">Delete</string>
 
+  <string name="token_open">Open</string>
+  <string name="token_copy">Copy</string>
+  <string name="token_edit">Edit</string>
+  <string name="token_list">List (ls -la)</string>
+  <string name="token_cd">Change directory</string>
+  <string name="token_git_show">git show</string>
+
   <string name="toggle_tab_switcher_menu_item">Toggle Tabs</string>
   <string name="new_session">New Session</string>
   <string name="new_session_more">New Session…</string>
