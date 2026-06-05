@@ -234,6 +234,15 @@ ldconfig 2>/dev/null || true
 echo
 echo "== done =="
 echo "Installed patched libusb to $PREFIX/lib (libusb-1.0.so.0)."
-echo "If $PREFIX/lib isn't picked up automatically, prefer it explicitly:"
+echo
+echo "To use it:"
 echo "  export LD_LIBRARY_PATH=$PREFIX/lib:\$LD_LIBRARY_PATH"
-echo "Then (NeoTerm running + USB permission granted):  lsusb -v"
+echo "  # NeoTerm must be RUNNING (it serves the USB fds over a socket), and"
+echo "  # the device's permission prompt must have been granted (Allow)."
+echo "  lsusb        # lists granted devices"
+echo "  lsusb -v     # full descriptors"
+echo "Notes:"
+echo "  - After updating the NeoTerm APK, force-stop + reopen it once so the USB"
+echo "    socket server starts."
+echo "  - 'lsusb -t' won't work: it reads /sys directly (blocked under Android),"
+echo "    not through libusb."
