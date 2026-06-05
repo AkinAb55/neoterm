@@ -99,6 +99,24 @@ if not m:
     print("anchor for helper insertion not found", file=sys.stderr); sys.exit(2)
 s = s[:m.end()] + helper + s[m.end():]
 
+# --- 0) usbfs dir not opendir-able as the app uid → don't make it fatal ---
+# (v1.0.27 returns -99 here; 1.0.30 already defaults to /dev/bus/usb and goes on)
+s2 = re.sub(
+    r'usbfs_path = find_usbfs_path\(\);\n'
+    r'\tif \(!usbfs_path\) \{\n'
+    r'\t\tusbi_err\(ctx, "could not find usbfs"\);\n'
+    r'\t\treturn LIBUSB_ERROR_OTHER;\n'
+    r'\t\}',
+    'usbfs_path = find_usbfs_path();\n'
+    '\tif (!usbfs_path) {\n'
+    '\t\tusbi_warn(ctx, "NeoTerm: usbfs not accessible, defaulting to /dev/bus/usb");\n'
+    '\t\tusbfs_path = "/dev/bus/usb";\n'
+    '\t}',
+    s, count=1)
+if s2 == s:
+    print("anchor for find_usbfs patch not found", file=sys.stderr); sys.exit(6)
+s = s2
+
 # --- 1) make the hotplug monitor failure non-fatal in op_init ---
 s2 = re.sub(
     r'r = linux_start_event_monitor\(\);\n\t\}',
