@@ -165,10 +165,11 @@ if s2 == s:
     print("anchor for hotplug patch not found", file=sys.stderr); sys.exit(3)
 s = s2
 
-# --- 2) EACCES fallback to the NeoTerm fd in get_usbfs_fd ---
+# --- 2) fall back to the NeoTerm fd in get_usbfs_fd on ANY open failure ---
+# (the node may be missing entirely under proot -> ENOENT, not just EACCES)
 s2 = re.sub(
     r'(\tif \(!silent\) \{\n\t\tusbi_err\(ctx, "libusb couldn)',
-    '\tif (errno == EACCES) {\n'
+    '\t{\n'
     '\t\tint nfd = neoterm_usb_fd(path);\n'
     '\t\tif (nfd != -1)\n'
     '\t\t\treturn nfd;\n'
