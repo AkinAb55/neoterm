@@ -31,7 +31,7 @@ if command -v apt-get >/dev/null 2>&1; then
   apt-get update
   apt-get install -y --no-install-recommends \
     build-essential autoconf automake libtool pkg-config git ca-certificates \
-    libudev-dev python3
+    python3
 fi
 
 echo "== fetch libusb $LIBUSB_TAG =="
@@ -66,7 +66,9 @@ static int neoterm_usb_fd(const char *path)
 	memcpy(a.sun_path + 1, nm, sizeof(nm) - 1);
 	socklen_t L = offsetof(struct sockaddr_un, sun_path) + 1 + (sizeof(nm) - 1);
 	if (connect(s, (struct sockaddr *)&a, L) < 0) { close(s); return -1; }
-	dprintf(s, "%s\n", path);
+	char line[64];
+	int ln = snprintf(line, sizeof line, "%s\n", path);
+	if (ln <= 0 || write(s, line, (size_t)ln) != ln) { close(s); return -1; }
 	struct msghdr m;
 	memset(&m, 0, sizeof m);
 	char buf[256];
@@ -96,34 +98,62 @@ s = s[:m.end()] + helper + s[m.end():]
 
 # --- 1) make the hotplug monitor failure non-fatal in op_init ---
 s2 = re.sub(
-    r'usbi_err\(ctx,\s*"error starting hotplug event monitor"\);\s*\n\s*return r;',
-    'usbi_warn(ctx, "NeoTerm: hotplug monitor unavailable, continuing without it");',
-    s)
+    r'r = linux_start_event_monitor\(\);\n\t\}',
+    'r = linux_start_event_monitor();\n'
+    '\t\tif (r != LIBUSB_SUCCESS) {\n'
+    '\t\t\tusbi_warn(ctx, "NeoTerm: hotplug monitor unavailable, continuing");\n'
+    '\t\t\tr = LIBUSB_SUCCESS;\n'
+    '\t\t}\n'
+    '\t}',
+    s, count=1)
 if s2 == s:
     print("anchor for hotplug patch not found", file=sys.stderr); sys.exit(3)
 s = s2
 
-# --- 2) EACCES fallback to the NeoTerm fd in _get_usbfs_fd ---
+# --- 2) EACCES fallback to the NeoTerm fd in get_usbfs_fd ---
 s2 = re.sub(
-    r'(fd = open\(path, mode[^;]*\);\s*\n\s*if \(fd != -1\)\s*\n\s*return fd;[^\n]*\n)',
-    r'\1\tif (errno == EACCES) {\n'
-    r'\t\tint nfd = neoterm_usb_fd(path);\n'
-    r'\t\tif (nfd != -1)\n'
-    r'\t\t\treturn nfd;\n'
-    r'\t}\n',
+    r'(\tif \(!silent\) \{\n\t\tusbi_err\(ctx, "libusb couldn)',
+    '\tif (errno == EACCES) {\n'
+    '\t\tint nfd = neoterm_usb_fd(path);\n'
+    '\t\tif (nfd != -1)\n'
+    '\t\t\treturn nfd;\n'
+    '\t}\n\n'
+    r'\1',
     s, count=1)
 if s2 == s:
-    print("anchor for _get_usbfs_fd patch not found", file=sys.stderr); sys.exit(4)
+    print("anchor for get_usbfs_fd patch not found", file=sys.stderr); sys.exit(4)
 s = s2
 
 open(p, 'w').write(s)
-print("patched OK (%d -> %d bytes)" % (len(orig), len(s)))
+print("patched linux_usbfs.c OK (%d -> %d bytes)" % (len(orig), len(s)))
+PY
+
+echo "== patch linux_netlink.c (stop guard) =="
+NL="$WORK/libusb/libusb/os/linux_netlink.c"
+test -f "$NL" || { echo "linux_netlink.c not found"; exit 1; }
+python3 - "$NL" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+# Our op_init patch keeps init going even if the netlink monitor failed to
+# start (socket bind is SELinux-blocked under proot), so stop must tolerate a
+# monitor that never started instead of asserting.
+needle = '\tassert(linux_netlink_socket != -1);'
+if needle not in s:
+    print("anchor for netlink stop patch not found", file=sys.stderr); sys.exit(5)
+s = s.replace(needle,
+    '\tif (linux_netlink_socket == -1)  /* NeoTerm: monitor never started */\n'
+    '\t\treturn LIBUSB_SUCCESS;', 1)
+open(p, 'w').write(s)
+print("patched linux_netlink.c OK")
 PY
 
 echo "== build =="
 cd "$WORK/libusb"
 ./bootstrap.sh
-./configure --prefix="$PREFIX" --disable-static
+# --disable-udev: enumerate from sysfs (readable under proot); hotplug uses
+# netlink (which we patch to fail-soft). Avoids the udev context complications.
+./configure --prefix="$PREFIX" --disable-udev --disable-static
 make -j"$(nproc)"
 make install
 ldconfig 2>/dev/null || true
