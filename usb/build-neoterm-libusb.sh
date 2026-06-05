@@ -89,6 +89,10 @@ static int neoterm_usb_fd(const char *path)
 			memcpy(&fd, CMSG_DATA(c), sizeof fd);
 	}
 	close(s);
+	/* The fd shares its file offset with NeoTerm's UsbDeviceConnection, which
+	 * may have already read past the descriptors; rewind so libusb reads them. */
+	if (fd != -1)
+		lseek(fd, 0, SEEK_SET);
 	return fd;
 }
 
