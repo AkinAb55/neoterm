@@ -40,17 +40,23 @@ object ChrootManager {
 
     // What to exec inside the chroot. For an interactive session use the distro's
     // own su (proper login + controlling terminal -> job control). For a one-shot
-    // package command, a plain bash -c is enough.
+    // package command, a plain bash -c is enough. "$CH" is the resolved host
+    // chroot binary (the guest PATH we export below would otherwise hide
+    // /system/bin/chroot).
     val inChroot = if (command.isEmpty()) {
-      "exec chroot \"\$R\" /bin/su -p"
+      "exec \"\$CH\" \"\$R\" /bin/su -p"
     } else {
-      "exec chroot \"\$R\" /bin/bash -c ${sq(command.joinToString(" "))}"
+      "exec \"\$CH\" \"\$R\" /bin/bash -c ${sq(command.joinToString(" "))}"
     }
 
     // Root boot script (run via `su … -c "sh <file>"`): bind the kernel fs,
     // export the guest env, then chroot. Written to a file so we don't have to
     // quote a whole script inside `su -c "…"`.
     val boot = buildString {
+      // Host PATH first so chroot/mount/grep/mkdir resolve before we switch to
+      // the guest PATH; remember the chroot binary while it's still reachable.
+      append("export PATH=/sbin:/system/bin:/system/xbin:/vendor/bin:/odm/bin:/product/bin\n")
+      append("CH=\$(command -v chroot 2>/dev/null); [ -z \"\$CH\" ] && CH=/system/bin/chroot\n")
       append("R=").append(sq(rootfs)).append('\n')
       append("for d in dev proc sys tmp dev/pts dev/shm tmp/.X11-unix root; do mkdir -p \"\$R/\$d\" 2>/dev/null; done\n")
       append(bindIfNeeded("/dev", "\$R/dev"))
