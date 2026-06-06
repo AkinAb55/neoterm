@@ -315,7 +315,11 @@ open class ShellTermSession private constructor(
         val loginName = NeoPreference.getLoginShellName()
         val guestShell = if (loginName.isNotEmpty() && loginName != DefaultValues.loginShell)
           ProotManager.findShell(loginName) ?: "/bin/$loginName" else null
-        val launch = ProotManager.buildLaunch(loginShell = guestShell)
+        // chroot (rooted devices) vs proot (default).
+        val launch = if (NeoPreference.isChroot() && io.neoterm.setup.proot.ChrootManager.isUsable())
+          io.neoterm.setup.proot.ChrootManager.buildLaunch(loginShell = guestShell)
+        else
+          ProotManager.buildLaunch(loginShell = guestShell)
         return ShellTermSession(
           launch.executable, launch.hostCwd, launch.args, launch.env,
           callback, initialCommand ?: "", shellProfile

@@ -91,7 +91,7 @@ object ProotManager {
    *  - Arch:               /etc/locale.conf
    * Az első nemüres `LANG=...` sort használjuk; ha nincs, C.UTF-8 a fallback.
    */
-  private fun guestLang(distro: Distro = selectedDistro()): String {
+  internal fun guestLang(distro: Distro = selectedDistro()): String {
     val rootfs = distro.rootfsPath()
     for (path in listOf("$rootfs/etc/default/locale", "$rootfs/etc/locale.conf")) {
       val f = File(path)

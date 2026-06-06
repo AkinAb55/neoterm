@@ -24,6 +24,11 @@
   <string name="token_cd">Change directory</string>
   <string name="token_git_show">git show</string>
 
+  <string name="runtime_mode_title">Rooted device detected</string>
+  <string name="runtime_mode_message">Run the Linux distro with chroot (real root: direct kernel access to audio, USB and storage; no app-side bridges) or proot (no root: audio/USB go through the Android app)?\n\nIf unsure, choose proot.</string>
+  <string name="runtime_mode_chroot">chroot (root)</string>
+  <string name="runtime_mode_proot">proot</string>
+
   <string name="toggle_tab_switcher_menu_item">Toggle Tabs</string>
   <string name="new_session">New Session</string>
   <string name="new_session_more">New Session…</string>

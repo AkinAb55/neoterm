@@ -66,12 +66,17 @@ class NeoTermService : Service() {
     // Wake lock on by default (keep the CPU running). Don't pop the battery-
     // optimization dialog at startup — that's only prompted on a manual acquire.
     acquireLock(promptBatteryOpt = false)
-    // Start the Android-side PulseAudio with the app, so terminal apps (not just
-    // X11) can play audio via PULSE_SERVER=127.0.0.1:4713.
-    io.neoterm.utils.PulseAudioBridge.start(this)
-    // USB host: detect plug-in/out and request permission via a BroadcastReceiver
-    // (no manifest device_filter), publishing granted devices to the distro.
-    io.neoterm.utils.UsbBridge.register(this)
+    // In chroot mode the distro has real kernel access (ALSA /dev/snd, USB
+    // /dev/bus/usb, …), so the Android-side audio/mic/USB bridges are neither
+    // started nor exposed — only proot needs them.
+    if (!io.neoterm.component.config.NeoPreference.isChroot()) {
+      // Start the Android-side PulseAudio with the app, so terminal apps (not
+      // just X11) can play audio via PULSE_SERVER=127.0.0.1:4713.
+      io.neoterm.utils.PulseAudioBridge.start(this)
+      // USB host: detect plug-in/out and request permission via a
+      // BroadcastReceiver (no manifest device_filter), serving granted devices.
+      io.neoterm.utils.UsbBridge.register(this)
+    }
   }
 
   override fun onBind(intent: Intent): IBinder? {

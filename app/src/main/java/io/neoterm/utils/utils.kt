@@ -7,6 +7,7 @@ import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import io.neoterm.R
+import io.neoterm.component.config.NeoPreference
 import io.neoterm.frontend.floating.TerminalDialog
 import io.neoterm.setup.proot.PackageAction
 import io.neoterm.setup.proot.ProotManager
@@ -63,12 +64,12 @@ fun Context.runPackageManager(
 ) {
   val distro = ProotManager.selectedDistro()
   val command = distro.packageCommand(action, pkg)
-  val launch = ProotManager.buildLaunch(
-    distro = distro,
-    // Keep apt non-interactive so dpkg's debconf prompts don't stall.
-    extraEnv = listOf("DEBIAN_FRONTEND=noninteractive"),
-    command = command
-  )
+  // Keep apt non-interactive so dpkg's debconf prompts don't stall.
+  val extra = listOf("DEBIAN_FRONTEND=noninteractive")
+  val launch = if (NeoPreference.isChroot() && io.neoterm.setup.proot.ChrootManager.isUsable())
+    io.neoterm.setup.proot.ChrootManager.buildLaunch(distro = distro, extraEnv = extra, command = command)
+  else
+    ProotManager.buildLaunch(distro = distro, extraEnv = extra, command = command)
   // The proot launch env is "KEY=VALUE" strings; ShellParameter wants pairs.
   val env = launch.env.map {
     val idx = it.indexOf('=')

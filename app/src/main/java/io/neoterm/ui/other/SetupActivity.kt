@@ -88,6 +88,27 @@ class SetupActivity : AppCompatActivity(), ResultListener {
     val distro = selectedDistro()
     NeoPreference.setProotDistro(distro.id)
 
+    // On rooted devices, offer chroot (real kernel access) before installing;
+    // otherwise default to proot. The rootfs download is identical either way.
+    if (io.neoterm.utils.RootUtils.isRooted()) {
+      AlertDialog.Builder(this)
+        .setTitle(R.string.runtime_mode_title)
+        .setMessage(R.string.runtime_mode_message)
+        .setCancelable(false)
+        .setPositiveButton(R.string.runtime_mode_chroot) { _, _ ->
+          NeoPreference.setRuntimeMode("chroot"); doInstall(distro)
+        }
+        .setNegativeButton(R.string.runtime_mode_proot) { _, _ ->
+          NeoPreference.setRuntimeMode("proot"); doInstall(distro)
+        }
+        .show()
+    } else {
+      NeoPreference.setRuntimeMode("proot")
+      doInstall(distro)
+    }
+  }
+
+  private fun doInstall(distro: Distro) {
     installing = true
     setInputsEnabled(false)
 

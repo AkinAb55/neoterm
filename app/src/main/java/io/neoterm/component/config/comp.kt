@@ -70,6 +70,8 @@ object NeoPreference {
   const val KEY_PROOT_ENABLED = "neoterm_core_proot_enabled"
   const val KEY_PROOT_DISTRO = "neoterm_core_proot_distro"
   const val KEY_PROOT_SOURCE = "neoterm_core_proot_source"
+  /** "proot" (default, no root) or "chroot" (rooted devices, real kernel access). */
+  const val KEY_RUNTIME_MODE = "neoterm_core_runtime_mode"
 
   const val VALUE_HAPPY_EGG_TRIGGER = 8
 
@@ -188,6 +190,14 @@ object NeoPreference {
   fun setProotDistro(distroId: String) {
     store(KEY_PROOT_DISTRO, distroId)
   }
+
+  /** Runtime mode: "proot" (default) or "chroot" (rooted devices). */
+  fun getRuntimeMode(): String = loadString(KEY_RUNTIME_MODE, DefaultValues.runtimeMode)
+
+  fun setRuntimeMode(mode: String) = store(KEY_RUNTIME_MODE, mode)
+
+  /** True when the distro is run via real-root chroot instead of proot. */
+  fun isChroot(): Boolean = getRuntimeMode() == "chroot"
 
   /**
    * A proot bináris + rootfs-ek kiszolgáló base-URL-je. Alapból az app saját

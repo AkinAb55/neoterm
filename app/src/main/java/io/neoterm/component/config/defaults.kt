@@ -26,6 +26,8 @@ object DefaultValues {
   // proot futtatókörnyezet — az átállás óta ez az alapértelmezett mód
   const val enableProot = true
   const val prootDistro = "ubuntu"
+  // "proot" (no root) or "chroot" (offered on rooted devices at setup)
+  const val runtimeMode = "proot"
 }
 
 object NeoTermPath {
