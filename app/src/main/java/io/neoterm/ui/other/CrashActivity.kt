@@ -1,8 +1,14 @@
 package io.neoterm.ui.other
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Build
 import android.os.Bundle
+import android.view.Menu
+import android.view.MenuItem
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import io.neoterm.R
 import java.io.ByteArrayOutputStream
@@ -20,6 +26,34 @@ class CrashActivity : AppCompatActivity() {
     (findViewById<TextView>(R.id.crash_model)).text = getString(R.string.crash_model, collectModelInfo())
     (findViewById<TextView>(R.id.crash_app_version)).text = getString(R.string.crash_app, collectAppInfo())
     (findViewById<TextView>(R.id.crash_details)).text = collectExceptionInfo()
+  }
+
+  override fun onCreateOptionsMenu(menu: Menu): Boolean {
+    menu.add(0, MENU_COPY, 0, R.string.copy_text)
+      .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+    return super.onCreateOptionsMenu(menu)
+  }
+
+  override fun onOptionsItemSelected(item: MenuItem): Boolean {
+    if (item.itemId == MENU_COPY) {
+      copyReport()
+      return true
+    }
+    return super.onOptionsItemSelected(item)
+  }
+
+  /** Copy the full crash report (device + app version + stack trace). */
+  private fun copyReport() {
+    val report = buildString {
+      append(getString(R.string.crash_model, collectModelInfo())).append('\n')
+      append(getString(R.string.crash_app, collectAppInfo())).append('\n')
+      append('\n')
+      append(getString(R.string.crash_stack_trace)).append('\n')
+      append(collectExceptionInfo())
+    }
+    val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText("NeoTerm crash report", report))
+    Toast.makeText(this, R.string.copied_to_clipboard, Toast.LENGTH_SHORT).show()
   }
 
   private fun collectExceptionInfo(): String {
@@ -55,5 +89,9 @@ class CrashActivity : AppCompatActivity() {
       }
     }
     return "Unknown Arch"
+  }
+
+  companion object {
+    private const val MENU_COPY = 1
   }
 }

@@ -25,6 +25,7 @@
       style="@style/TextAppearance.AppCompat.Medium"
       android:layout_width="match_parent"
       android:layout_height="wrap_content"
+      android:textIsSelectable="true"
       android:textColor="@color/textColorSecondary"/>
 
     <TextView
@@ -32,6 +33,7 @@
       style="@style/TextAppearance.AppCompat.Medium"
       android:layout_width="match_parent"
       android:layout_height="wrap_content"
+      android:textIsSelectable="true"
       android:textColor="@color/textColorSecondary"/>
 
     <TextView
@@ -55,6 +57,7 @@
         android:layout_marginEnd="@dimen/text_margin"
         android:layout_marginStart="@dimen/text_margin"
         android:gravity="start|top"
+        android:textIsSelectable="true"
         android:textColor="@color/textColor"/>
     </ScrollView>
 
