@@ -117,6 +117,9 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
           val tab = tabSwitcher.selectedTab as TermTab
           // isShow -> toolbarHide
           toggleToolbar(tab.toolbar, !isShow)
+          // The keyboard changed the usable height; re-measure once it settles so
+          // the terminal fills the new visible area exactly (no leftover gap).
+          scheduleTerminalRemeasure()
         }
       }
     })
@@ -463,6 +466,23 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       // focus. This is exactly what makes returning from recents recover a
       // blank first session, so doing it here also covers the first launch.
       (tab as? TermTab)?.resetStatus()
+      // ...and again once the layout (insets, keyboard, recents animation)
+      // settles, so the row count matches the final visible height instead of a
+      // transient one (which would leave the terminal shorter than the view).
+      scheduleTerminalRemeasure()
+    }
+  }
+
+  /**
+   * Re-measure the active terminal across the next few frames so the emulator's
+   * row/column count always settles on the final visible size after keyboard or
+   * recents transitions. updateSize() is a no-op when the size hasn't changed, so
+   * the redundant passes are cheap and never cause extra SIGWINCH/redraws.
+   */
+  private fun scheduleTerminalRemeasure() {
+    val view = (tabSwitcher.selectedTab as? TermTab)?.termData?.termView ?: return
+    for (delay in longArrayOf(0L, 120L, 320L)) {
+      view.postDelayed({ (tabSwitcher.selectedTab as? TermTab)?.resetStatus() }, delay)
     }
   }
 
