@@ -104,20 +104,26 @@ object UsbBridge {
   }
 
   /**
-   * Force-detach the Android kernel driver from every interface as soon as the
-   * device is opened. Mass-storage devices are grabbed by the kernel's
-   * usb-storage driver (auto-mount), so a later libusb claim from the distro
-   * fails with LIBUSB_ERROR_BUSY (-6). [UsbDeviceConnection.claimInterface] with
-   * force=true issues USBDEVFS_DISCONNECT (detach the kernel driver) + claim on
-   * the connection's fd; because we serve a dup of that same fd, the interface
-   * stays free for the guest libusb. We keep the claim so the driver can't
-   * re-grab it. Done for every interface whether or not a driver is attached.
+   * Detach the Android kernel driver from every interface as soon as the device
+   * is opened, WITHOUT keeping the interface claimed. Mass-storage devices are
+   * grabbed by the kernel's usb-storage driver (auto-mount), so a libusb claim
+   * fails with LIBUSB_ERROR_BUSY (-6).
+   *
+   * [UsbDeviceConnection.claimInterface] with force=true issues USBDEVFS_DISCONNECT
+   * (detach the kernel driver) and then claims the interface; we immediately
+   * release it again. Releasing only clears the claim bit — the kernel does NOT
+   * re-bind the driver (that only happens on a USB reset/re-plug) — so the
+   * interface is left with no kernel driver AND not held by us. That way the
+   * device is free for whoever opens it next (the guest libusb over our shared
+   * fd, or any other opener) instead of us re-grabbing it ourselves. Done for
+   * every interface whether or not a driver was attached.
    */
   private fun detachKernelDrivers(device: UsbDevice, conn: UsbDeviceConnection) {
     for (i in 0 until device.interfaceCount) {
       val iface = device.getInterface(i)
-      val ok = runCatching { conn.claimInterface(iface, true) }.getOrDefault(false)
-      NLog.e("UsbBridge", "detach/claim iface ${iface.id} on ${device.deviceName}: $ok")
+      val claimed = runCatching { conn.claimInterface(iface, true) }.getOrDefault(false)
+      if (claimed) runCatching { conn.releaseInterface(iface) }
+      NLog.e("UsbBridge", "detach iface ${iface.id} on ${device.deviceName}: $claimed")
     }
   }
 
