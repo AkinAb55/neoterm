@@ -10,14 +10,17 @@ import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.RingtoneManager
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.util.Base64
 import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.InputMethodManager
 import androidx.core.app.NotificationCompat
+import io.neoterm.App
 import io.neoterm.BuildConfig
 import io.neoterm.R
 import io.neoterm.backend.KeyHandler
@@ -324,6 +327,8 @@ class TermSessionCallback : TerminalSession.SessionChangedCallback {
 
   var bellController: BellController? = null
 
+  var oscNotificationController: OscNotificationController? = null
+
   override fun onTextChanged(changedSession: TerminalSession?) {
     termSessionData?.termView?.onScreenUpdated()
   }
@@ -367,6 +372,16 @@ class TermSessionCallback : TerminalSession.SessionChangedCallback {
       // colors (e.g. when a program changes the background via an OSC escape).
       termView.onTerminalColorsChanged()
     }
+  }
+
+  override fun onNotification(session: TerminalSession?, oscCode: Int, params: String?) {
+    if (params == null) return
+    if (oscNotificationController == null) {
+      oscNotificationController = OscNotificationController()
+    }
+    // Use the application context so notifications still post when the terminal
+    // view isn't attached (the whole point is to alert in the background).
+    oscNotificationController?.handle(App.get(), oscCode, params)
   }
 }
 
@@ -450,6 +465,217 @@ class BellController {
     channel.setShowBadge(false)
     manager.createNotificationChannel(channel)
     channelReady = true
+  }
+}
+
+/**
+ * Posts Android notifications requested by programs in the terminal via OSC
+ * escape sequences. Supports the three de-facto protocols:
+ *
+ *  - **OSC 9**   `ESC ] 9 ; <body> BEL`                 (iTerm2 / Windows Terminal)
+ *  - **OSC 777** `ESC ] 777 ; notify ; <title> ; <body>`(urxvt)
+ *  - **OSC 99**  `ESC ] 99 ; <metadata> ; <payload>`    (kitty — fully parameterized:
+ *                title/body, id for update/replace, urgency, base64 payloads, chunking)
+ *
+ * Gated behind the user's settings (master toggle + sound + urgency sub-toggles);
+ * off by default because any terminal output (including remote SSH) can trigger it.
+ * A light rate-limit guards against floods.
+ */
+class OscNotificationController {
+  companion object {
+    private const val CHANNEL_PREFIX = "neoterm_osc"
+    private const val BASE_NOTIFICATION_ID = 53000
+    private const val MIN_INTERVAL_MS = 250L
+
+    // kitty urgency levels.
+    private const val URGENCY_LOW = 0
+    private const val URGENCY_NORMAL = 1
+    private const val URGENCY_CRITICAL = 2
+  }
+
+  /** Accumulates a kitty (OSC 99) notification across chunks, keyed by its id. */
+  private class Pending99 {
+    val title = StringBuilder()
+    val body = StringBuilder()
+    var urgency = URGENCY_NORMAL
+  }
+
+  private val createdChannels = HashSet<String>()
+  private val pending = HashMap<String, Pending99>()
+  private var idlessCounter = 0
+  private var lastPostTime = 0L
+
+  fun handle(context: Context, oscCode: Int, params: String) {
+    if (!NeoPreference.isOscNotificationEnabled()) return
+    val app = context.applicationContext
+    when (oscCode) {
+      9 -> handleOsc9(app, params)
+      777 -> handleOsc777(app, params)
+      99 -> handleOsc99(app, params)
+    }
+  }
+
+  // OSC 9: "<body>". ConEmu overloads OSC 9 with "9;<n>;..." control commands
+  // (progress, cwd, …); skip those so we only react to iTerm2-style notifications.
+  private fun handleOsc9(context: Context, params: String) {
+    if (params.isEmpty()) return
+    val sep = params.indexOf(';')
+    if (sep >= 0 && params.substring(0, sep).toIntOrNull() != null) return
+    post(context, nextIdlessId(), "", params, URGENCY_NORMAL)
+  }
+
+  // OSC 777: "notify;<title>;<body>".
+  private fun handleOsc777(context: Context, params: String) {
+    val parts = params.split(';', limit = 3)
+    if (parts.firstOrNull() != "notify") return
+    val title = parts.getOrElse(1) { "" }
+    val body = parts.getOrElse(2) { "" }
+    if (title.isEmpty() && body.isEmpty()) return
+    post(context, nextIdlessId(), title, body, URGENCY_NORMAL)
+  }
+
+  // OSC 99 (kitty): "<metadata>;<payload>". metadata is a colon-separated list of
+  // key=value pairs (e.g. "i=1:d=0:p=body"):
+  //   i=<id>  p=title|body|close  e=0|1 (base64)  d=0|1 (done)  u=0|1|2 (urgency)
+  private fun handleOsc99(context: Context, params: String) {
+    val sep = params.indexOf(';')
+    val meta = if (sep >= 0) params.substring(0, sep) else params
+    val payloadRaw = if (sep >= 0) params.substring(sep + 1) else ""
+
+    var id = ""
+    var part = "title"
+    var encoded = false
+    var done = true
+    var urgency = URGENCY_NORMAL
+    for (kv in meta.split(':')) {
+      if (kv.isEmpty()) continue
+      val eq = kv.indexOf('=')
+      val key = if (eq >= 0) kv.substring(0, eq) else kv
+      val value = if (eq >= 0) kv.substring(eq + 1) else ""
+      when (key) {
+        "i" -> id = value
+        "p" -> part = value
+        "e" -> encoded = value == "1"
+        "d" -> done = value != "0"
+        "u" -> urgency = value.toIntOrNull() ?: URGENCY_NORMAL
+      }
+    }
+
+    if (part == "close") {
+      cancel(context, id)
+      pending.remove(id)
+      return
+    }
+
+    val payload = if (encoded) decodeBase64(payloadRaw) else payloadRaw
+    val buf = pending.getOrPut(id) { Pending99() }
+    buf.urgency = urgency
+    if (part == "body") buf.body.append(payload) else buf.title.append(payload)
+
+    if (done) {
+      val notifId = if (id.isEmpty()) nextIdlessId() else notifIdFor(id)
+      post(context, notifId, buf.title.toString(), buf.body.toString(), buf.urgency)
+      pending.remove(id)
+    }
+  }
+
+  private fun decodeBase64(s: String): String = try {
+    String(Base64.decode(s, Base64.DEFAULT), Charsets.UTF_8)
+  } catch (e: IllegalArgumentException) {
+    s // Not valid base64 — fall back to the raw text.
+  }
+
+  private fun nextIdlessId(): Int = BASE_NOTIFICATION_ID + 100 + (idlessCounter++ and 0x3f)
+
+  private fun notifIdFor(id: String): Int = BASE_NOTIFICATION_ID + (id.hashCode() and 0x7f)
+
+  private fun cancel(context: Context, id: String) {
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    manager.cancel(notifIdFor(id))
+  }
+
+  private fun post(context: Context, notifId: Int, title: String, body: String, urgency: Int) {
+    val now = SystemClock.elapsedRealtime()
+    if (now - lastPostTime < MIN_INTERVAL_MS) return
+    lastPostTime = now
+
+    val sound = NeoPreference.isOscNotificationSoundEnabled()
+    val importance = importanceFor(urgency)
+    val channelId = channelFor(context, importance, sound)
+
+    val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+      ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    val contentIntent = if (launch != null) {
+      PendingIntent.getActivity(
+        context, 0, launch,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+      )
+    } else null
+
+    val shownTitle = title.ifEmpty { context.getString(R.string.osc_notification_default_title) }
+    val builder = NotificationCompat.Builder(context, channelId)
+      .setSmallIcon(R.drawable.ic_terminal_running)
+      .setContentTitle(shownTitle)
+      .setAutoCancel(true)
+      .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+      .setPriority(priorityFor(urgency))
+    if (body.isNotEmpty()) {
+      builder.setContentText(body)
+      builder.setStyle(NotificationCompat.BigTextStyle().bigText(body))
+    }
+    if (!sound) builder.setSilent(true)
+    if (contentIntent != null) builder.setContentIntent(contentIntent)
+
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    manager.notify(notifId, builder.build())
+  }
+
+  private fun importanceFor(urgency: Int): Int {
+    if (!NeoPreference.isOscNotificationUrgencyEnabled()) {
+      return NotificationManager.IMPORTANCE_DEFAULT
+    }
+    return when (urgency) {
+      URGENCY_LOW -> NotificationManager.IMPORTANCE_LOW
+      URGENCY_CRITICAL -> NotificationManager.IMPORTANCE_HIGH
+      else -> NotificationManager.IMPORTANCE_DEFAULT
+    }
+  }
+
+  private fun priorityFor(urgency: Int): Int {
+    if (!NeoPreference.isOscNotificationUrgencyEnabled()) {
+      return NotificationCompat.PRIORITY_DEFAULT
+    }
+    return when (urgency) {
+      URGENCY_LOW -> NotificationCompat.PRIORITY_LOW
+      URGENCY_CRITICAL -> NotificationCompat.PRIORITY_HIGH
+      else -> NotificationCompat.PRIORITY_DEFAULT
+    }
+  }
+
+  // A channel's importance and sound are immutable once created, so we use a
+  // distinct channel per (importance, sound) combination, created on demand.
+  private fun channelFor(context: Context, importance: Int, sound: Boolean): String {
+    val id = "${CHANNEL_PREFIX}_${importance}_${if (sound) "snd" else "sil"}"
+    if (createdChannels.add(id)) {
+      val channel = NotificationChannel(
+        id, context.getString(R.string.osc_notification_channel_name), importance
+      )
+      if (sound) {
+        val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+        if (uri != null) {
+          val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+          channel.setSound(uri, attrs)
+        }
+      } else {
+        channel.setSound(null, null)
+      }
+      val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+      manager.createNotificationChannel(channel)
+    }
+    return id
   }
 }
 

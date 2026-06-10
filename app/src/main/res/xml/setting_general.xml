@@ -49,4 +49,24 @@
     android:summary="@string/pref_general_enable_word_based_ime_desc"
     android:title="@string/pref_general_enable_word_based_ime"/>
 
+  <CheckBoxPreference
+    android:defaultValue="false"
+    android:key="@string/key_general_osc_notification"
+    android:summary="@string/pref_general_osc_notification_desc"
+    android:title="@string/pref_general_osc_notification"/>
+
+  <CheckBoxPreference
+    android:defaultValue="true"
+    android:dependency="@string/key_general_osc_notification"
+    android:key="@string/key_general_osc_notification_sound"
+    android:summary="@string/pref_general_osc_notification_sound_desc"
+    android:title="@string/pref_general_osc_notification_sound"/>
+
+  <CheckBoxPreference
+    android:defaultValue="true"
+    android:dependency="@string/key_general_osc_notification"
+    android:key="@string/key_general_osc_notification_urgency"
+    android:summary="@string/pref_general_osc_notification_urgency_desc"
+    android:title="@string/pref_general_osc_notification_urgency"/>
+
 </PreferenceScreen>

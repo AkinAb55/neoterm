@@ -133,6 +133,14 @@
   <string name="pref_general_use_execve_wrapper_desc">Hook execve() to avoid incorrect shebang</string>
   <string name="pref_general_enable_word_based_ime">Enable word based IME</string>
   <string name="pref_general_enable_word_based_ime_desc">Word based or char based IME</string>
+  <string name="pref_general_osc_notification">Terminal notifications (OSC)</string>
+  <string name="pref_general_osc_notification_desc">Let programs post Android notifications via OSC 9 / 99 (kitty) / 777 escape sequences. Any terminal output (including remote SSH) can trigger these.</string>
+  <string name="pref_general_osc_notification_sound">Notification sound</string>
+  <string name="pref_general_osc_notification_sound_desc">Play a sound for terminal notifications</string>
+  <string name="pref_general_osc_notification_urgency">Honor urgency</string>
+  <string name="pref_general_osc_notification_urgency_desc">Map the escape sequence\'s urgency (low / normal / critical) to the notification importance</string>
+  <string name="osc_notification_channel_name">Terminal notifications</string>
+  <string name="osc_notification_default_title">Terminal</string>
   <string name="pref_ui_fullscreen">Full Screen</string>
   <string name="pref_ui_hide_toolbar">Hide Toolbar</string>
   <string name="pref_ui_hide_toolbar_desc">Hide toolbar when keyboard is showing</string>

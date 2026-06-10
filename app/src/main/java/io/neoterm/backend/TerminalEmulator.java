@@ -2021,6 +2021,13 @@ public final class TerminalEmulator {
         mCurrentHyperlink = uri.isEmpty() ? null : uri;
         break;
       }
+      case 9: // iTerm2 / Windows Terminal notification: "9 ; message".
+      case 99: // kitty desktop-notification protocol: "99 ; metadata ; payload".
+      case 777: // urxvt notification: "777 ; notify ; title ; body".
+        // Hand the raw parameters to the Android side, which honours the user's
+        // notification settings and parses the per-protocol fields.
+        mSession.onNotification(value, textParameter);
+        break;
       case 52: // Manipulate Selection Data. Skip the optional first selection parameter(s).
         int startIndex = textParameter.indexOf(";") + 1;
         try {

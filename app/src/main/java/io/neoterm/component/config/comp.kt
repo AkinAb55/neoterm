@@ -313,6 +313,27 @@ object NeoPreference {
     )
   }
 
+  fun isOscNotificationEnabled(): Boolean {
+    return loadBoolean(
+      R.string.key_general_osc_notification,
+      DefaultValues.enableOscNotification
+    )
+  }
+
+  fun isOscNotificationSoundEnabled(): Boolean {
+    return loadBoolean(
+      R.string.key_general_osc_notification_sound,
+      DefaultValues.enableOscNotificationSound
+    )
+  }
+
+  fun isOscNotificationUrgencyEnabled(): Boolean {
+    return loadBoolean(
+      R.string.key_general_osc_notification_urgency,
+      DefaultValues.enableOscNotificationUrgency
+    )
+  }
+
   fun isAutoCompletionEnabled(): Boolean {
     return loadBoolean(
       R.string.key_general_auto_completion,

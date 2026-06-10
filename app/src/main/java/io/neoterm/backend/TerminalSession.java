@@ -42,6 +42,13 @@ public class TerminalSession extends TerminalOutput {
 
     void onColorsChanged(TerminalSession session);
 
+    /**
+     * A desktop-notification OSC escape (OSC 9 / 99 / 777) was received. Default:
+     * ignore, so existing callbacks don't need to implement it.
+     */
+    default void onNotification(TerminalSession session, int oscCode, String params) {
+    }
+
   }
 
   @SuppressWarnings("JavaReflectionMemberAccess")
@@ -363,6 +370,11 @@ public class TerminalSession extends TerminalOutput {
   @Override
   public void onBell() {
     mChangeCallback.onBell(this);
+  }
+
+  @Override
+  public void onNotification(int oscCode, String params) {
+    mChangeCallback.onNotification(this, oscCode, params);
   }
 
   @Override

@@ -19,6 +19,13 @@ object DefaultValues {
   const val enableMicrophone = false
   const val enableWordBasedIme = false
 
+  // OSC-escape desktop notifications (OSC 9 / 99 kitty / 777 urxvt). Off by
+  // default: any terminal output (incl. remote SSH) could otherwise post a
+  // system notification. The sub-options only apply when the master is on.
+  const val enableOscNotification = false
+  const val enableOscNotificationSound = true
+  const val enableOscNotificationUrgency = true
+
   const val loginShell = "bash"
   const val initialCommand = ""
   const val defaultFont = "SourceCodePro"

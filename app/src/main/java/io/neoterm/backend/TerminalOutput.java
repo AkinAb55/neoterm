@@ -37,4 +37,12 @@ public abstract class TerminalOutput {
 
   public abstract void onColorsChanged();
 
+  /**
+   * Notify the terminal client that a desktop-notification OSC escape was received
+   * (OSC 9 / OSC 99 kitty / OSC 777 urxvt). {@code oscCode} is the OSC number and
+   * {@code params} the raw text after "{@code <code>;}". Default: ignore.
+   */
+  public void onNotification(int oscCode, String params) {
+  }
+
 }
