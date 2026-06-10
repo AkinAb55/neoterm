@@ -295,6 +295,15 @@ public final class TerminalEmulator {
   private boolean mAboutToAutoWrap;
 
   /**
+   * Display width of the last printed code point (0 after a control char or cursor
+   * move). Used to promote a width-1 base char to width 2 when a U+FE0F (VS16,
+   * emoji presentation) follows, so the cursor model matches apps that count e.g.
+   * "▶️" as two cells (otherwise the cursor drifts and TUIs that redraw by cursor
+   * address — like Claude Code's live region — slide apart).
+   */
+  private int mLastPrintedWidth = 0;
+
+  /**
    * Current foregroundColor and backgroundColor colors. Can either be a color index in [0,259] or a truecolor (24-bit) value.
    * For a 24-bit value the top byte (0xff000000) is set.
    *
@@ -2478,6 +2487,11 @@ public final class TerminalEmulator {
 
     final boolean autoWrap = isDecsetInternalBitSet(DECSET_BIT_AUTOWRAP);
     final int displayWidth = WcWidth.width(codePoint);
+    // VS16 (U+FE0F) after a width-1 base makes it emoji-presentation, which apps
+    // count as width 2. Promote: append the selector to the base cell (combining,
+    // below) and consume one extra column so the cursor stays in sync.
+    final boolean promoteVs16 = codePoint == 0xFE0F && mLastPrintedWidth == 1
+      && !mAboutToAutoWrap && mCursorCol > mLeftMargin && mCursorCol < mRightMargin;
     final boolean cursorInLastColumn = mCursorCol == mRightMargin - 1;
 
     if (autoWrap) {
@@ -2515,16 +2529,26 @@ public final class TerminalEmulator {
       mAboutToAutoWrap = (mCursorCol == mRightMargin - displayWidth);
 
     mCursorCol = Math.min(mCursorCol + displayWidth, mRightMargin - 1);
+
+    // Track the base width for a following VS16, and apply the promotion.
+    if (promoteVs16) {
+      mCursorCol = Math.min(mCursorCol + 1, mRightMargin - 1);
+      mLastPrintedWidth = 2;
+    } else if (displayWidth >= 1) {
+      mLastPrintedWidth = displayWidth;
+    }
   }
 
   private void setCursorRow(int row) {
     mCursorRow = row;
     mAboutToAutoWrap = false;
+    mLastPrintedWidth = 0;
   }
 
   private void setCursorCol(int col) {
     mCursorCol = col;
     mAboutToAutoWrap = false;
+    mLastPrintedWidth = 0;
   }
 
   /**
@@ -2541,6 +2565,7 @@ public final class TerminalEmulator {
     mCursorRow = Math.max(0, Math.min(row, mRows - 1));
     mCursorCol = Math.max(0, Math.min(col, mColumns - 1));
     mAboutToAutoWrap = false;
+    mLastPrintedWidth = 0;
   }
 
   public int getScrollCounter() {

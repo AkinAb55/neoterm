@@ -123,7 +123,12 @@ final class TerminalRenderer {
         final boolean charIsHighsurrogate = Character.isHighSurrogate(charAtIndex);
         final int charsForCodePoint = charIsHighsurrogate ? 2 : 1;
         final int codePoint = charIsHighsurrogate ? Character.toCodePoint(charAtIndex, line[currentCharIndex + 1]) : charAtIndex;
-        final int codePointWcWidth = WcWidth.width(codePoint);
+        int codePointWcWidth = WcWidth.width(codePoint);
+        // VS16 (U+FE0F) right after a width-1 base makes it emoji-presentation,
+        // width 2 — match the emulator's cursor model (see emitCodePoint).
+        if (codePointWcWidth == 1 && followedByVs16(line, currentCharIndex + charsForCodePoint, charsUsedInLine)) {
+          codePointWcWidth = 2;
+        }
         final boolean insideCursor = (column >= selx1 && column <= selx2) || (cursorX == column || (codePointWcWidth == 2 && cursorX == column + 1));
         final boolean insideUrl = rowUrlMask != null && column < rowUrlMask.length && rowUrlMask[column];
         final long style = lineObject.getStyle(column);
@@ -177,6 +182,22 @@ final class TerminalRenderer {
         drawImageCells(canvas, mEmulator, lineObject, columns, heightOffset);
       }
     }
+  }
+
+  /**
+   * Whether the combining sequence starting at {@code index} (zero-width code
+   * points attached to the preceding cell) contains a VS16 (U+FE0F). Scans only
+   * the run of zero-width code points, mirroring how the render loop eats them.
+   */
+  private static boolean followedByVs16(char[] line, int index, int charsUsed) {
+    int i = index;
+    while (i < charsUsed && WcWidth.width(line, i) <= 0) {
+      boolean high = Character.isHighSurrogate(line[i]);
+      int cp = high ? Character.toCodePoint(line[i], line[i + 1]) : line[i];
+      if (cp == 0xFE0F) return true;
+      i += high ? 2 : 1;
+    }
+    return false;
   }
 
   /** Draw the bitmap tile of every inline-image cell in a row. */
