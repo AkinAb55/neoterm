@@ -120,6 +120,18 @@ public final class TerminalView extends View {
   float mScaleFactor = 1.f;
   /* final */ GestureAndScaleRecognizer mGestureRecognizer;
 
+  // ---- Horizontal tab-swipe (drag to page between tabs, with live feedback) ----
+  private static final int SWIPE_UNDECIDED = 0, SWIPE_VERTICAL = 1, SWIPE_HORIZONTAL = 2;
+  /** Direction this gesture committed to, so a started vertical scroll never
+   *  turns into a tab-swipe (or vice versa) mid-gesture. */
+  private int mSwipeMode = SWIPE_UNDECIDED;
+  /** Accumulated finger travel for the current gesture (translation space:
+   *  rightwards positive). */
+  private float mSwipeTotalX, mSwipeTotalY;
+  /** True while actively dragging the content sideways for a tab-swipe. */
+  private boolean mTabSwiping;
+  private VelocityTracker mSwipeVelocityTracker;
+
   /**
    * Keep track of where mouse touch event started which we report as mouse scroll.
    */
@@ -220,10 +232,34 @@ public final class TerminalView extends View {
           // since we cannot just start sending these events without a starting press event,
           // which we do not do for touch input, only mouse in onTouchEvent().
           sendMouseEventCode(e, TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED, true);
-        } else {
-          scrolledWithFinger = true;
-          scrollByPixels(e, distanceY);
+          return true;
         }
+
+        // Decide once per gesture whether this is a sideways tab-swipe or a normal
+        // vertical scroll, then stick with that for the rest of the gesture.
+        mSwipeTotalX += -distanceX; // translation space: moving the finger right is +
+        mSwipeTotalY += distanceY;
+        if (mSwipeMode == SWIPE_UNDECIDED) {
+          if (Math.abs(mSwipeTotalX) > dpToPx(16) && Math.abs(mSwipeTotalX) > Math.abs(mSwipeTotalY) * 1.4f) {
+            mSwipeMode = SWIPE_HORIZONTAL;
+          } else if (Math.abs(mSwipeTotalY) > dpToPx(8)) {
+            mSwipeMode = SWIPE_VERTICAL;
+          }
+        }
+
+        if (mSwipeMode == SWIPE_HORIZONTAL) {
+          mTabSwiping = true;
+          // Follow the finger with rubber-band resistance so the drag feels bounded
+          // and the user can see how far they've gone before it commits to a switch.
+          float w = Math.max(1, getWidth());
+          float raw = mSwipeTotalX;
+          float tx = (float) (Math.signum(raw) * w * 0.5f * Math.tanh(Math.abs(raw) / (w * 0.5f)));
+          setTranslationX(tx);
+          return true;
+        }
+
+        scrolledWithFinger = true;
+        scrollByPixels(e, distanceY);
         return true;
       }
 
@@ -241,15 +277,10 @@ public final class TerminalView extends View {
         // While selecting, flinging is driven manually from onTouchEvent.
         if (mEmulator == null || mIsSelectingText) return true;
 
-        // A predominantly horizontal flick pages between tabs. Vertical
-        // scrolling is unaffected (it is driven by onScroll's distanceY, which
-        // stays small during a horizontal swipe).
-        if (mClient != null
-          && Math.abs(velocityX) > Math.abs(velocityY) * 1.5f
-          && Math.abs(velocityX) > dpToPx(160)) {
-          mClient.onSwipe(velocityX < 0);
-          return true;
-        }
+        // A horizontal tab-swipe is finalized on touch-up (finalizeTabSwipe),
+        // using the drag distance + release velocity — so don't also start a
+        // vertical fling for it here.
+        if (mTabSwiping || mSwipeMode == SWIPE_HORIZONTAL) return true;
 
         startFling(e2, velocityY);
         return true;
@@ -829,8 +860,68 @@ public final class TerminalView extends View {
       }
     }
 
+    // Horizontal tab-swipe bookkeeping (the sideways translation itself is driven
+    // by onScroll). Reset on down, track velocity, and decide/animate on up.
+    if (!ev.isFromSource(InputDevice.SOURCE_MOUSE)) {
+      switch (action) {
+        case MotionEvent.ACTION_DOWN:
+          mSwipeMode = SWIPE_UNDECIDED;
+          mSwipeTotalX = mSwipeTotalY = 0;
+          mTabSwiping = false;
+          animate().cancel();
+          if (getTranslationX() != 0) setTranslationX(0);
+          if (mSwipeVelocityTracker != null) mSwipeVelocityTracker.recycle();
+          mSwipeVelocityTracker = VelocityTracker.obtain();
+          mSwipeVelocityTracker.addMovement(ev);
+          break;
+        case MotionEvent.ACTION_MOVE:
+          if (mSwipeVelocityTracker != null) mSwipeVelocityTracker.addMovement(ev);
+          break;
+        case MotionEvent.ACTION_UP:
+        case MotionEvent.ACTION_CANCEL:
+          if (mTabSwiping) {
+            float vx = 0;
+            if (mSwipeVelocityTracker != null) {
+              mSwipeVelocityTracker.addMovement(ev);
+              mSwipeVelocityTracker.computeCurrentVelocity(1000);
+              vx = mSwipeVelocityTracker.getXVelocity();
+            }
+            finalizeTabSwipe(action == MotionEvent.ACTION_UP, vx);
+          }
+          if (mSwipeVelocityTracker != null) {
+            mSwipeVelocityTracker.recycle();
+            mSwipeVelocityTracker = null;
+          }
+          break;
+      }
+    }
+
     mGestureRecognizer.onTouchEvent(ev);
     return true;
+  }
+
+  /**
+   * Decide whether a finished horizontal drag pages to an adjacent tab. It commits
+   * only on a clear drag (≈28% of the width) or a deliberate flick, so accidental
+   * sideways movement no longer switches tabs. The content always animates back to
+   * rest; on a commit the tab switch swaps in the new session underneath.
+   */
+  private void finalizeTabSwipe(boolean releasedUp, float velocityX) {
+    final float tx = getTranslationX();
+    final float w = Math.max(1, getWidth());
+    final boolean far = Math.abs(tx) > w * 0.28f;
+    final boolean flicked = releasedUp && Math.abs(velocityX) > dpToPx(700)
+      && Math.signum(velocityX) == Math.signum(tx) && Math.abs(tx) > dpToPx(24);
+    final boolean doSwitch = mClient != null && tx != 0 && (far || flicked);
+
+    mTabSwiping = false;
+    mSwipeMode = SWIPE_UNDECIDED;
+
+    animate().translationX(0).setDuration(160).withEndAction(() -> setTranslationX(0)).start();
+    if (doSwitch) {
+      // Dragged right -> previous tab; dragged left -> next tab.
+      mClient.onSwipe(tx < 0);
+    }
   }
 
   /**
