@@ -485,7 +485,8 @@ class OscNotificationController {
   companion object {
     private const val CHANNEL_PREFIX = "neoterm_osc"
     private const val BASE_NOTIFICATION_ID = 53000
-    private const val MIN_INTERVAL_MS = 250L
+    private const val MIN_INTERVAL_MS = 150L
+    private const val MAX_PENDING = 16
 
     // kitty urgency levels.
     private const val URGENCY_LOW = 0
@@ -498,12 +499,23 @@ class OscNotificationController {
     val title = StringBuilder()
     val body = StringBuilder()
     var urgency = URGENCY_NORMAL
+
+    /** True once the sender marked the notification complete (d=1). */
+    var sealed = false
+
+    fun reset() {
+      title.setLength(0)
+      body.setLength(0)
+      urgency = URGENCY_NORMAL
+      sealed = false
+    }
   }
 
   private val createdChannels = HashSet<String>()
-  private val pending = HashMap<String, Pending99>()
+  private val pending = LinkedHashMap<String, Pending99>()
   private var idlessCounter = 0
   private var lastPostTime = 0L
+  private var lastNotifId = -1
 
   fun handle(context: Context, oscCode: Int, params: String) {
     if (!NeoPreference.isOscNotificationEnabled()) return
@@ -537,6 +549,13 @@ class OscNotificationController {
   // OSC 99 (kitty): "<metadata>;<payload>". metadata is a colon-separated list of
   // key=value pairs (e.g. "i=1:d=0:p=body"):
   //   i=<id>  p=title|body|close  e=0|1 (base64)  d=0|1 (done)  u=0|1|2 (urgency)
+  //
+  // Title and body arrive as separate chunks; we accumulate them per id and
+  // (re)post the SAME notification on every chunk so the body shows up and a
+  // later chunk with the same id updates in place. A title chunk arriving after
+  // the notification was completed (sealed) starts a fresh notification (so the
+  // same id can be reused to replace), while a body chunk after completion just
+  // adds the body to the existing one.
   private fun handleOsc99(context: Context, params: String) {
     val sep = params.indexOf(';')
     val meta = if (sep >= 0) params.substring(0, sep) else params
@@ -568,15 +587,30 @@ class OscNotificationController {
     }
 
     val payload = if (encoded) decodeBase64(payloadRaw) else payloadRaw
-    val buf = pending.getOrPut(id) { Pending99() }
+
+    // Notifications without an id are one-shot (each escape is independent).
+    if (id.isEmpty()) {
+      val title = if (part == "body") "" else payload
+      val body = if (part == "body") payload else ""
+      post(context, nextIdlessId(), title, body, urgency)
+      return
+    }
+
+    val buf = pending.getOrPut(id) {
+      // Cap memory: drop the oldest tracked notification if the map grows.
+      if (pending.size >= MAX_PENDING) pending.keys.firstOrNull()?.let { pending.remove(it) }
+      Pending99()
+    }
+    if (buf.sealed) {
+      // The previous notification for this id was completed. A new title starts
+      // a fresh one; a new body extends the existing one.
+      if (part != "body") buf.reset() else buf.sealed = false
+    }
     buf.urgency = urgency
     if (part == "body") buf.body.append(payload) else buf.title.append(payload)
 
-    if (done) {
-      val notifId = if (id.isEmpty()) nextIdlessId() else notifIdFor(id)
-      post(context, notifId, buf.title.toString(), buf.body.toString(), buf.urgency)
-      pending.remove(id)
-    }
+    post(context, notifIdFor(id), buf.title.toString(), buf.body.toString(), buf.urgency)
+    if (done) buf.sealed = true
   }
 
   private fun decodeBase64(s: String): String = try {
@@ -595,9 +629,13 @@ class OscNotificationController {
   }
 
   private fun post(context: Context, notifId: Int, title: String, body: String, urgency: Int) {
+    // Always allow updating the SAME notification (e.g. a title chunk followed by
+    // a body chunk, or a same-id replace). Only throttle bursts of NEW (distinct)
+    // notifications, to guard against floods without dropping legitimate updates.
     val now = SystemClock.elapsedRealtime()
-    if (now - lastPostTime < MIN_INTERVAL_MS) return
+    if (notifId != lastNotifId && now - lastPostTime < MIN_INTERVAL_MS) return
     lastPostTime = now
+    lastNotifId = notifId
 
     val sound = NeoPreference.isOscNotificationSoundEnabled()
     val importance = importanceFor(urgency)
@@ -619,6 +657,9 @@ class OscNotificationController {
       .setAutoCancel(true)
       .setCategory(NotificationCompat.CATEGORY_MESSAGE)
       .setPriority(priorityFor(urgency))
+      // Title and body arrive as separate chunks that re-post the same id; only
+      // alert (sound/heads-up) on the first so chunked updates don't double-buzz.
+      .setOnlyAlertOnce(true)
     if (body.isNotEmpty()) {
       builder.setContentText(body)
       builder.setStyle(NotificationCompat.BigTextStyle().bigText(body))
