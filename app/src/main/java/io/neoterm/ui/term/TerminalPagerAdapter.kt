@@ -17,6 +17,7 @@ import io.neoterm.component.colorscheme.NeoColorScheme
 import io.neoterm.component.completion.OnAutoCompleteListener
 import io.neoterm.component.config.DefaultValues
 import io.neoterm.component.config.NeoPreference
+import io.neoterm.frontend.session.terminal.*
 import io.neoterm.frontend.session.view.TerminalView
 import io.neoterm.frontend.session.view.extrakey.ExtraKeysView
 import io.neoterm.utils.Terminals
