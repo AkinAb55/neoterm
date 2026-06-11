@@ -80,9 +80,10 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   }
 
   // The pager replaces the old chrome-tabs TabSwitcher: one page per open
-  // session, with adjacent pages laid out & live (offscreenPageLimit = 1) so a
-  // horizontal drag peeks the destination tab's real content and snaps back if
-  // the swipe is not committed.
+  // session, with adjacent pages laid out & live so a horizontal drag peeks the
+  // destination tab's real content and snaps back if the swipe is not committed.
+  // The offscreenPageLimit policy is tab-count dependent (see
+  // updateOffscreenPageLimit): 1 for >= 3 tabs, DEFAULT for the 2-tab wrap.
   lateinit var viewPager: ViewPager2
   private lateinit var pagerAdapter: TerminalPagerAdapter
   /** The model the adapter renders: the open tabs, terminal and X, in order. */
