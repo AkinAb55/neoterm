@@ -120,16 +120,11 @@ public final class TerminalView extends View {
   float mScaleFactor = 1.f;
   /* final */ GestureAndScaleRecognizer mGestureRecognizer;
 
-  // ---- Horizontal tab-swipe (drag to page between tabs, with live feedback) ----
-  private static final int SWIPE_UNDECIDED = 0, SWIPE_VERTICAL = 1, SWIPE_HORIZONTAL = 2;
-  /** Direction this gesture committed to, so a started vertical scroll never
-   *  turns into a tab-swipe (or vice versa) mid-gesture. */
-  private int mSwipeMode = SWIPE_UNDECIDED;
-  /** Accumulated finger travel for the current gesture (translation space:
-   *  rightwards positive). */
-  private float mSwipeTotalX, mSwipeTotalY;
-  /** True while actively dragging the content sideways for a tab-swipe. */
-  private boolean mTabSwiping;
+  // Horizontal tab paging is now owned by the enclosing ViewPager2 (so adjacent
+  // tabs are live during the swipe). The TerminalView no longer translates
+  // itself sideways; instead it tells the pager to keep its hands off vertical
+  // scrolls / text selection / pinch via requestDisallowInterceptTouchEvent (see
+  // onTouchEvent), and lets clearly-horizontal drags fall through to the pager.
 
   /**
    * Keep track of where mouse touch event started which we report as mouse scroll.
@@ -234,25 +229,11 @@ public final class TerminalView extends View {
           return true;
         }
 
-        // Decide once per gesture whether this is a sideways tab-swipe or a normal
-        // vertical scroll, then stick with that for the rest of the gesture.
-        mSwipeTotalX += -distanceX; // translation space: moving the finger right is +
-        mSwipeTotalY += distanceY;
-        if (mSwipeMode == SWIPE_UNDECIDED) {
-          if (Math.abs(mSwipeTotalX) > dpToPx(16) && Math.abs(mSwipeTotalX) > Math.abs(mSwipeTotalY) * 1.4f) {
-            mSwipeMode = SWIPE_HORIZONTAL;
-          } else if (Math.abs(mSwipeTotalY) > dpToPx(8)) {
-            mSwipeMode = SWIPE_VERTICAL;
-          }
-        }
-
-        if (mSwipeMode == SWIPE_HORIZONTAL) {
-          mTabSwiping = true;
-          // Follow the finger 1:1 (clamped to one screen width) so it's obvious
-          // how far you've dragged toward the half-screen commit point.
-          float w = Math.max(1, getWidth());
-          setTranslationX(Math.max(-w, Math.min(w, mSwipeTotalX)));
-          return true;
+        // A clearly-vertical scroll belongs to the terminal: ask the enclosing
+        // ViewPager2 not to steal the gesture so the swipe scrolls the transcript
+        // instead of paging tabs. (Horizontal drags are left for the pager.)
+        if (Math.abs(distanceY) >= Math.abs(distanceX)) {
+          disallowParentIntercept();
         }
 
         scrolledWithFinger = true;
@@ -263,6 +244,9 @@ public final class TerminalView extends View {
       @Override
       public boolean onScale(float focusX, float focusY, float scale) {
         if (mEmulator == null || mIsSelectingText) return true;
+        // A pinch is a two-finger terminal gesture (font zoom): keep the pager
+        // from hijacking it as a horizontal page swipe.
+        disallowParentIntercept();
         mScaleFactor *= scale;
         // 这里一般是改变文字大小
         mScaleFactor = mClient.onScale(mScaleFactor);
@@ -273,11 +257,6 @@ public final class TerminalView extends View {
       public boolean onFling(final MotionEvent e2, float velocityX, float velocityY) {
         // While selecting, flinging is driven manually from onTouchEvent.
         if (mEmulator == null || mIsSelectingText) return true;
-
-        // A horizontal tab-swipe is finalized on touch-up (finalizeTabSwipe),
-        // using the drag distance + release velocity — so don't also start a
-        // vertical fling for it here.
-        if (mTabSwiping || mSwipeMode == SWIPE_HORIZONTAL) return true;
 
         startFling(e2, velocityY);
         return true;
@@ -755,6 +734,9 @@ public final class TerminalView extends View {
     final int action = ev.getAction();
 
     if (mIsSelectingText) {
+      // The whole gesture belongs to text selection / its scroll: keep the pager
+      // from intercepting any part of it as a page swipe.
+      disallowParentIntercept();
       switch (action) {
         case MotionEvent.ACTION_UP:
         case MotionEvent.ACTION_CANCEL:
@@ -857,46 +839,26 @@ public final class TerminalView extends View {
       }
     }
 
-    // Horizontal tab-swipe bookkeeping (the sideways translation itself is driven
-    // by onScroll). Reset on down and decide/animate on up.
-    if (!ev.isFromSource(InputDevice.SOURCE_MOUSE)) {
-      switch (action) {
-        case MotionEvent.ACTION_DOWN:
-          mSwipeMode = SWIPE_UNDECIDED;
-          mSwipeTotalX = mSwipeTotalY = 0;
-          mTabSwiping = false;
-          animate().cancel();
-          if (getTranslationX() != 0) setTranslationX(0);
-          break;
-        case MotionEvent.ACTION_UP:
-        case MotionEvent.ACTION_CANCEL:
-          if (mTabSwiping) finalizeTabSwipe();
-          break;
-      }
-    }
-
     mGestureRecognizer.onTouchEvent(ev);
     return true;
   }
 
   /**
-   * Decide whether a finished horizontal drag pages to an adjacent tab. It commits
-   * only on a deliberate drag of at least half the screen width, so accidental
-   * sideways movement never switches tabs. The content always animates back to
-   * rest; on a commit the tab switch swaps in the new session underneath.
+   * Ask the enclosing scrolling container (the ViewPager2's internal
+   * RecyclerView) not to intercept the rest of this gesture, so a vertical
+   * terminal scroll / text selection / pinch is not stolen and turned into a
+   * horizontal page swipe. A clearly-horizontal drag never calls this, so the
+   * pager is still free to page between live tabs.
    */
-  private void finalizeTabSwipe() {
-    final float w = Math.max(1, getWidth());
-    final boolean doSwitch = mClient != null && Math.abs(mSwipeTotalX) >= w * 0.5f;
-
-    mTabSwiping = false;
-    mSwipeMode = SWIPE_UNDECIDED;
-
-    animate().translationX(0).setDuration(160).withEndAction(() -> setTranslationX(0)).start();
-    if (doSwitch) {
-      // Dragged right -> previous tab; dragged left -> next tab.
-      mClient.onSwipe(mSwipeTotalX < 0);
-    }
+  private void disallowParentIntercept() {
+    // TODO(on-device): if a near-diagonal vertical scroll occasionally pages the
+    // tab instead of scrolling, the pager committed to a horizontal drag before
+    // our gesture detector reported onScroll. If so, tighten by disallowing
+    // intercept on ACTION_DOWN and only re-allowing it once a clearly-horizontal
+    // drag is detected. In practice the per-event disallow below is enough
+    // because ViewPager2's RecyclerView re-checks the flag each MOVE.
+    ViewParent parent = getParent();
+    if (parent != null) parent.requestDisallowInterceptTouchEvent(true);
   }
 
   /**
