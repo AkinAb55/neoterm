@@ -169,10 +169,11 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     viewPager = findViewById(R.id.terminal_pager)
     pagerAdapter = TerminalPagerAdapter(this, tabs)
     viewPager.adapter = pagerAdapter
-    // Keep the neighbours laid out & LIVE so the user can peek the adjacent
-    // tab's real terminal content while dragging (this is what makes the swipe
-    // a live page rather than a snapshot).
-    viewPager.offscreenPageLimit = 1
+    // Keep the neighbours laid out & LIVE so the user can peek the adjacent tab's
+    // real terminal content while dragging. The exact policy depends on the tab
+    // count (see updateOffscreenPageLimit): 1 neighbour pre-bound for >= 3 tabs,
+    // DEFAULT for the 2-tab wrap so the same session is never bound to two views.
+    updateOffscreenPageLimit()
     ViewCompat.setOnApplyWindowInsetsListener(viewPager, createWindowInsetsListener())
     viewPager.registerOnPageChangeCallback(pageChangeCallback)
 
@@ -206,6 +207,13 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       }
       updateTabDots()
       applyTerminalSystemColors()
+      // Guarantee the now-current page is bound LIVE to its session BEFORE raising
+      // the keyboard. Critical in the 2-tab wrap case: both neighbours map to the
+      // same single "other" session, so a prior off-screen bind may have stolen
+      // that session's view (termData.termView left pointing off-screen). Re-
+      // binding the visible holder re-points the session at the on-screen view, so
+      // raiseKeyboardForSelectedTab then focuses the live view, not a stale one.
+      pagerAdapter.rebindCurrent(position)
       raiseKeyboardForSelectedTab()
     }
 
@@ -215,6 +223,11 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       // Done only while idle so we never jump mid-drag/mid-settle.
       if (state == ViewPager2.SCROLL_STATE_IDLE) {
         recenterIfNeeded()
+        // Safety net for a reversed drag (both neighbours momentarily laid out,
+        // both the same session in the 2-tab case): once settled, re-bind the
+        // visible page so its session is attached to the on-screen view — never
+        // left showing a stale/blank duplicate.
+        pagerAdapter.rebindCurrent(viewPager.currentItem)
       }
     }
   }
@@ -236,6 +249,28 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     if (driftBlocks >= RECENTER_DRIFT_BLOCKS) {
       viewPager.setCurrentItem(centered, false)
     }
+  }
+
+  /**
+   * Set ViewPager2's offscreenPageLimit according to the real tab count:
+   *
+   *   - realCount >= 3: keep `1` so the single neighbour on each side is
+   *     pre-bound and LIVE — the user peeks the adjacent terminal's real content
+   *     while dragging. Those neighbours are distinct sessions, so no conflict.
+   *   - realCount == 2 (the wrap special case): use OFFSCREEN_PAGE_LIMIT_DEFAULT.
+   *     With 2 tabs both neighbours (position-1 and position+1) map to the SAME
+   *     other session; pre-binding both would bind one session to two views and
+   *     blank the off-screen duplicate. DEFAULT lays out only the page being
+   *     dragged toward (one neighbour at a time), so the double-bind is only ever
+   *     transient and rebindCurrent() keeps the visible page live.
+   *   - realCount <= 1: DEFAULT is fine (nothing to peek).
+   *
+   * Must be called whenever realCount changes (add/remove/reseat), not just once.
+   */
+  private fun updateOffscreenPageLimit() {
+    viewPager.offscreenPageLimit =
+      if (pagerAdapter.realCount >= TerminalPagerAdapter.MIN_LOOP_TABS + 1) 1
+      else ViewPager2.OFFSCREEN_PAGE_LIMIT_DEFAULT
   }
 
   /**
@@ -1059,6 +1094,9 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     } else {
       pagerAdapter.notifyItemInserted(tabs.size - 1)
     }
+    // realCount changed (and possibly the finite<->loop mode): re-apply the
+    // offscreen policy so the 2-tab wrap uses DEFAULT and >= 3 uses 1.
+    updateOffscreenPageLimit()
     update_colors()
     updateTabDots()
   }
@@ -1149,6 +1187,9 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     } else {
       pagerAdapter.notifyItemRemoved(index)
     }
+    // realCount changed (and possibly the loop<->finite mode): re-apply the
+    // offscreen policy (e.g. 3->2 must drop from 1 back to DEFAULT).
+    updateOffscreenPageLimit()
   }
 
   private fun getStoredCurrentSessionOrLast(): TerminalSession? {
