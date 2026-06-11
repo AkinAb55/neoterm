@@ -34,9 +34,30 @@ import io.neoterm.utils.Terminals
  * content while dragging.
  *
  * The model is the list of [NeoTab] (TermTab / XSessionTab) held by the
- * activity; the adapter never owns sessions, it only renders them. Stable ids
- * (the tab's identity hash) keep ViewPager2 from rebinding the wrong page after
- * insert/remove.
+ * activity; the adapter never owns sessions, it only renders them.
+ *
+ * ## Infinite (circular) paging
+ * When there are >= 3 real tabs the adapter switches to an *infinite* mode: it
+ * reports a large virtual item count ([LOOP_COUNT]) and maps every virtual
+ * position to a real tab with `position % realCount`. The user starts at a
+ * middle multiple of realCount (see [startPosition]) so swiping past either end
+ * wraps around endlessly. The activity is responsible for re-centering the
+ * current virtual position when it drifts toward the ends (see
+ * NeoTermActivity.recenterIfNeeded).
+ *
+ * For <= 2 real tabs we keep the simple finite adapter: the count is the real
+ * count and `position == realIndex`. Wrapping is meaningless with 1 tab, and
+ * with exactly 2 tabs an infinite modulo adapter would lay out the SAME session
+ * at both neighbours of any page (current-1 and current+1 both map to the other
+ * single tab) — two live [TerminalView]s bound to one session steals the
+ * session's view and blanks it. So we only enable looping once both neighbours
+ * are guaranteed to be DISTINCT real tabs (realCount >= 3).
+ *
+ * Stable ids are intentionally NOT used: in infinite mode the same session
+ * appears at many virtual positions, which violates RecyclerView's "unique id
+ * per item" contract. Binding is idempotent (it always re-runs
+ * initializeViewWith + attachSession for the correct session), so position-keyed
+ * rebinding is safe.
  */
 class TerminalPagerAdapter(
   private val activity: NeoTermActivity,
@@ -46,26 +67,46 @@ class TerminalPagerAdapter(
   companion object {
     private const val VIEW_TYPE_TERM = 0
     private const val VIEW_TYPE_X = 1
-  }
 
-  /** Stable id per tab, so ViewPager2 keeps each page bound to its session. */
-  private val tabIds = HashMap<NeoTab, Long>()
-  private var nextId = 1L
+    /** Looping kicks in only when both pager neighbours are distinct sessions. */
+    const val MIN_LOOP_TABS = 3
 
-  init {
-    setHasStableIds(true)
+    /** Virtual item count in infinite mode (kept even so the middle is a clean
+     *  multiple of realCount; large enough the user never reaches an end). */
+    const val LOOP_COUNT = 100_000
   }
 
   class PageHolder(val root: View) : RecyclerView.ViewHolder(root)
 
-  private fun idFor(tab: NeoTab): Long = tabIds.getOrPut(tab) { nextId++ }
+  /** Number of real tabs (the model size). */
+  val realCount: Int
+    get() = tabs.size
 
-  override fun getItemId(position: Int): Long = idFor(tabs[position])
+  /** Whether the adapter is currently in infinite/circular mode. */
+  val isLooping: Boolean
+    get() = realCount >= MIN_LOOP_TABS
 
-  override fun getItemCount(): Int = tabs.size
+  /** Map a (possibly virtual) pager position to the real tab index. */
+  fun realIndex(position: Int): Int {
+    if (realCount == 0) return 0
+    return if (isLooping) Math.floorMod(position, realCount) else position
+  }
+
+  /**
+   * A virtual position near the middle of the loop range whose real index is
+   * [realIndex]. The user is parked here so there's a huge runway of pages on
+   * both sides before either end of the virtual range is reached.
+   */
+  fun startPosition(realIndex: Int): Int {
+    if (!isLooping) return realIndex.coerceIn(0, (realCount - 1).coerceAtLeast(0))
+    val middleBlock = (LOOP_COUNT / 2) / realCount
+    return middleBlock * realCount + realIndex
+  }
+
+  override fun getItemCount(): Int = if (isLooping) LOOP_COUNT else realCount
 
   override fun getItemViewType(position: Int): Int =
-    if (tabs[position] is XSessionTab) VIEW_TYPE_X else VIEW_TYPE_TERM
+    if (tabs[realIndex(position)] is XSessionTab) VIEW_TYPE_X else VIEW_TYPE_TERM
 
   override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): PageHolder {
     val inflater = LayoutInflater.from(parent.context)
@@ -96,7 +137,7 @@ class TerminalPagerAdapter(
   }
 
   override fun onBindViewHolder(holder: PageHolder, position: Int) {
-    val tab = tabs[position]
+    val tab = tabs[realIndex(position)]
     when (tab) {
       is TermTab -> bindTerminalPage(holder, tab)
       is XSessionTab -> bindXPage(holder, tab)
@@ -204,6 +245,13 @@ class TerminalPagerAdapter(
 
   override fun onViewRecycled(holder: PageHolder) {
     super.onViewRecycled(holder)
+    // Terminal pages need no teardown here: binding is idempotent and the
+    // session<->view link (termData.termView + TerminalView.attachSession) is
+    // re-established on the next bind. The double-bind guarantee comes from
+    // never laying out the same session twice at once: in infinite mode that
+    // holds because looping is only enabled for realCount >= 3, so the three
+    // laid-out pages (current +/- 1) always map to three DISTINCT real tabs.
+    //
     // Detach the X GL view from a recycled page so it can be re-parented onto the
     // page it gets re-bound to (the GL surface is a single live instance).
     val videoLayout = holder.root.findViewById<FrameLayout>(R.id.xorg_video_layout) ?: return
