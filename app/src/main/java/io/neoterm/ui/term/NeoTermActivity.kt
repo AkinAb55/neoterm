@@ -18,8 +18,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.ColorUtils
 import androidx.core.view.OnApplyWindowInsetsListener
 import androidx.core.view.ViewCompat
-import de.mrapp.android.tabswitcher.*
-import io.neoterm.App
+import androidx.viewpager2.widget.ViewPager2
 import io.neoterm.BuildConfig
 import io.neoterm.R
 import io.neoterm.backend.TerminalSession
@@ -74,7 +73,15 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     fun getInstance(): NeoTermActivity? = instance
   }
 
-  lateinit var tabSwitcher: TabSwitcher
+  // The pager replaces the old chrome-tabs TabSwitcher: one page per open
+  // session, with adjacent pages laid out & live (offscreenPageLimit = 1) so a
+  // horizontal drag peeks the destination tab's real content and snaps back if
+  // the swipe is not committed.
+  lateinit var viewPager: ViewPager2
+  private lateinit var pagerAdapter: TerminalPagerAdapter
+  /** The model the adapter renders: the open tabs, terminal and X, in order. */
+  private val tabs = ArrayList<NeoTab>()
+
   private lateinit var fullScreenHelper: FullScreenHelper
   lateinit var toolbar: Toolbar
   private lateinit var tabDots: TabDotsIndicator
@@ -89,6 +96,22 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   private var permissionsHandled = false
   private var startupProceeded = false
   private var updateChecked = false
+
+  // ---- Pager model helpers (mirror the old TabSwitcher accessors) ----
+
+  /** The currently visible tab (or null when there are no tabs). */
+  private val selectedTab: NeoTab?
+    get() = tabs.getOrNull(viewPager.currentItem)
+
+  private val selectedTabIndex: Int
+    get() = viewPager.currentItem
+
+  private val tabCount: Int
+    get() = tabs.size
+
+  private fun getTab(index: Int): NeoTab? = tabs.getOrNull(index)
+
+  private fun indexOf(tab: NeoTab): Int = tabs.indexOf(tab)
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -113,8 +136,8 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     fullScreenHelper = FullScreenHelper.injectActivity(this, fullscreen, peekRecreating())
     fullScreenHelper.setKeyBoardListener(object : FullScreenHelper.KeyBoardListener {
       override fun onKeyboardChange(isShow: Boolean, keyboardHeight: Int) {
-        if (tabSwitcher.selectedTab is TermTab) {
-          val tab = tabSwitcher.selectedTab as TermTab
+        val tab = selectedTab
+        if (tab is TermTab) {
           // isShow -> toolbarHide
           toggleToolbar(tab.toolbar, !isShow)
           // The keyboard changed the usable height; re-measure once it settles so
@@ -126,15 +149,15 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
     // tabDots is bound later from the app-bar action view (onCreateOptionsMenu).
 
-    tabSwitcher = findViewById(R.id.tab_switcher)
-    // Don't let the switcher persist tabs into instance state: restored tabs
-    // come back as plain Tab (the NeoTab subclass is lost in the Parcelable),
-    // which crashed lifecycle casts after fold/unfold recreation. Tabs are
-    // rebuilt from the service's live sessions anyway (enterMain).
-    tabSwitcher.isSaveEnabled = false
-    tabSwitcher.decorator = NeoTabDecorator(this)
-    ViewCompat.setOnApplyWindowInsetsListener(tabSwitcher, createWindowInsetsListener())
-    tabSwitcher.showToolbars(false)
+    viewPager = findViewById(R.id.terminal_pager)
+    pagerAdapter = TerminalPagerAdapter(this, tabs)
+    viewPager.adapter = pagerAdapter
+    // Keep the neighbours laid out & LIVE so the user can peek the adjacent
+    // tab's real terminal content while dragging (this is what makes the swipe
+    // a live page rather than a snapshot).
+    viewPager.offscreenPageLimit = 1
+    ViewCompat.setOnApplyWindowInsetsListener(viewPager, createWindowInsetsListener())
+    viewPager.registerOnPageChangeCallback(pageChangeCallback)
 
     val serviceIntent = Intent(this, NeoTermService::class.java)
     startService(serviceIntent)
@@ -142,6 +165,31 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
     // Ask for the runtime permissions up front, before any setup runs.
     requestStartupPermissions()
+  }
+
+  /**
+   * Reacts to the user paging to another tab: persist the new current session,
+   * update the title + dots, and raise the keyboard for the now-active terminal.
+   */
+  private val pageChangeCallback = object : ViewPager2.OnPageChangeCallback() {
+    override fun onPageSelected(position: Int) {
+      when (val tab = tabs.getOrNull(position)) {
+        is TermTab -> {
+          toolbar.visibility = View.VISIBLE
+          tab.termData.termSession?.let { NeoPreference.storeCurrentSession(it) }
+          toolbar.title = tab.termData.termSession?.title ?: tab.title
+        }
+        is XSessionTab -> {
+          // The X (SDL) surface owns the whole screen; hide the toolbar like the
+          // old decorator did.
+          toolbar.visibility = View.GONE
+        }
+        else -> {}
+      }
+      updateTabDots()
+      applyTerminalSystemColors()
+      raiseKeyboardForSelectedTab()
+    }
   }
 
   /**
@@ -260,8 +308,8 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
         true
       }
       R.id.menu_item_close_session -> {
-        // Close the active tab (its session is cleaned up via onTabRemoved).
-        tabSwitcher.selectedTab?.let { tabSwitcher.removeTab(it) }
+        // Close the active tab (its session is cleaned up in removeTabAt).
+        closeTab(selectedTab)
         true
       }
       R.id.menu_item_new_session_with_profile -> {
@@ -315,70 +363,18 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   override fun onPause() {
     super.onPause()
-    val tab = tabSwitcher.selectedTab as? NeoTab
-    tab?.onPause()
+    selectedTab?.onPause()
   }
 
   override fun onResume() {
     super.onResume()
     PreferenceManager.getDefaultSharedPreferences(this)
       .registerOnSharedPreferenceChangeListener(this)
-    tabSwitcher.addListener(object : TabSwitcherListener {
-      override fun onSwitcherShown(tabSwitcher: TabSwitcher) {
-        toolbar.setNavigationIcon(R.drawable.ic_add_box_white_24dp)
-        toolbar.setNavigationOnClickListener(addSessionListener)
-        toolbar.setBackgroundResource(android.R.color.transparent)
-        toolbar.animate().alpha(0f).setDuration(300).withEndAction {
-          toolbar.alpha = 1f
-        }.start()
-        updateTabDots()
-      }
-
-      override fun onSwitcherHidden(tabSwitcher: TabSwitcher) {
-        toolbar.navigationIcon = null
-        toolbar.setNavigationOnClickListener(null)
-        // Match the title bar + system bars to the terminal background.
-        applyTerminalSystemColors()
-        updateTabDots()
-        // Returned to a single terminal: focus it and raise the keyboard.
-        raiseKeyboardForSelectedTab()
-      }
-
-      override fun onSelectionChanged(tabSwitcher: TabSwitcher, selectedTabIndex: Int, selectedTab: Tab?) {
-        if (selectedTab is TermTab && selectedTab.termData.termSession != null) {
-          NeoPreference.storeCurrentSession(selectedTab.termData.termSession!!)
-        }
-        updateTabDots()
-      }
-
-      override fun onTabAdded(tabSwitcher: TabSwitcher, index: Int, tab: Tab, animation: Animation) {
-        update_colors()
-        updateTabDots()
-      }
-
-      override fun onTabRemoved(tabSwitcher: TabSwitcher, index: Int, tab: Tab, animation: Animation) {
-        if (tab is TermTab) {
-          SessionRemover.removeSession(termService, tab)
-        } else if (tab is XSessionTab) {
-          SessionRemover.removeXSession(termService, tab)
-        }
-        updateTabDots()
-      }
-
-      override fun onAllTabsRemoved(tabSwitcher: TabSwitcher, tabs: Array<out Tab>, animation: Animation) {
-      }
-    })
-    // Safe cast: after activity recreation (e.g. fold/unfold, theme change) the
-    // TabSwitcher can restore plain Tab instances from saved state that are not
-    // our NeoTab subclasses — a forced cast crashes onResume.
-    val tab = tabSwitcher.selectedTab as? NeoTab
-    tab?.onResume()
+    selectedTab?.onResume()
     // Match the title bar + system bars to the terminal background on every
     // resume (incl. the very first launch), so it applies without having to
     // change the color scheme.
-    if (!tabSwitcher.isSwitcherShown) {
-      applyTerminalSystemColors()
-    }
+    applyTerminalSystemColors()
     // Returning from recents/background: re-raise the keyboard for the terminal.
     raiseKeyboardForSelectedTab()
     maybeCheckForUpdate()
@@ -399,7 +395,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     UpdateManager.checkForUpdate { info ->
       if (isFinishing) return@checkForUpdate
       prefs.edit().putLong(KEY_LAST_UPDATE_CHECK, now).apply()
-      if (info != null && !tabSwitcher.isSwitcherShown) {
+      if (info != null) {
         AlertDialog.Builder(this)
           .setTitle(getString(R.string.update_available_title, info.tag))
           .setMessage(info.notes.ifBlank { getString(R.string.update_available_message) })
@@ -426,8 +422,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   override fun onStart() {
     super.onStart()
     EventBus.getDefault().register(this)
-    val tab = tabSwitcher.selectedTab as? NeoTab
-    tab?.onStart()
+    selectedTab?.onStart()
   }
 
   override fun onStop() {
@@ -435,16 +430,14 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     // After stopped, window locations may changed
     // Rebind it at next time.
     forEachTab<TermTab> { it.resetAutoCompleteStatus() }
-    val tab = tabSwitcher.selectedTab as? NeoTab
-    tab?.onStop()
+    selectedTab?.onStop()
     EventBus.getDefault().unregister(this)
   }
 
   override fun onDestroy() {
     super.onDestroy()
     if (instance === this) instance = null
-    val tab = tabSwitcher.selectedTab as? NeoTab
-    tab?.onDestroy()
+    selectedTab?.onDestroy()
     PreferenceManager.getDefaultSharedPreferences(this)
       .unregisterOnSharedPreferenceChangeListener(this)
 
@@ -459,7 +452,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   override fun onWindowFocusChanged(hasFocus: Boolean) {
     super.onWindowFocusChanged(hasFocus)
-    val tab = tabSwitcher.selectedTab as? NeoTab
+    val tab = selectedTab
     tab?.onWindowFocusChanged(hasFocus)
     if (hasFocus) {
       raiseKeyboardForSelectedTab()
@@ -474,7 +467,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     }
   }
 
-  private val remeasureRunnable = Runnable { (tabSwitcher.selectedTab as? TermTab)?.resetStatus() }
+  private val remeasureRunnable = Runnable { (selectedTab as? TermTab)?.resetStatus() }
 
   /**
    * Re-measure the active terminal once the layout settles, so the emulator's
@@ -487,7 +480,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
    * the size hasn't changed, so it never causes a spurious SIGWINCH/redraw.
    */
   private fun scheduleTerminalRemeasure() {
-    val view = (tabSwitcher.selectedTab as? TermTab)?.termData?.termView ?: return
+    val view = (selectedTab as? TermTab)?.termData?.termView ?: return
     view.removeCallbacks(remeasureRunnable)
     view.postDelayed(remeasureRunnable, 120)
     view.postDelayed(remeasureRunnable, 350)
@@ -497,7 +490,6 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     // Delay slightly so it runs after the window has settled (e.g. when
     // returning from recents), otherwise requestFocus/showSoftInput no-op.
     view.postDelayed({
-      if (tabSwitcher.isSwitcherShown) return@postDelayed
       view.requestFocus()
       val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
       // Re-query the terminal's InputConnection so the IME adopts the terminal's
@@ -511,7 +503,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   }
 
   private fun raiseKeyboardForSelectedTab() {
-    val tab = tabSwitcher.selectedTab as? TermTab ?: return
+    val tab = selectedTab as? TermTab ?: return
     val view = tab.termData.termView ?: return
     raiseKeyboard(view)
   }
@@ -538,36 +530,28 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   /**
    * Refresh the page-dots indicator: one dot per tab, the active one
-   * highlighted. Hidden while the switcher overview is shown (the cards already
-   * show every tab) and for a single tab.
+   * highlighted (hidden for a single tab).
    */
   fun updateTabDots() {
     if (!::tabDots.isInitialized) {
       return
     }
-    if (tabSwitcher.isSwitcherShown) {
-      tabDots.visibility = View.GONE
-      return
-    }
     // Dots live in the (terminal-colored) app bar, so colour them from the
     // terminal foreground; the toolbar provides the background.
     tabDots.setBaseColor(currentTerminalForegroundColor())
-    tabDots.setTabs(tabSwitcher.count, tabSwitcher.selectedTabIndex)
+    tabDots.setTabs(tabCount, selectedTabIndex)
   }
 
   /**
    * Match the title bar (toolbar) and the system status/navigation bars to the
-   * terminal background color. The toolbar is only recolored while the switcher
-   * overview is hidden (the overview keeps it transparent).
+   * terminal background color.
    */
   fun applyTerminalSystemColors() {
     val bg = currentTerminalBackgroundColor()
-    if (!tabSwitcher.isSwitcherShown) {
-      toolbar.setBackgroundColor(bg)
-    }
-    // Match the switcher container too, so tab switches don't flash a different
+    toolbar.setBackgroundColor(bg)
+    // Match the pager container too, so tab switches don't flash a different
     // color behind the terminal.
-    tabSwitcher.setBackgroundColor(bg)
+    viewPager.setBackgroundColor(bg)
     window.statusBarColor = bg
     window.navigationBarColor = bg
 
@@ -586,12 +570,6 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
     when (keyCode) {
-      KeyEvent.KEYCODE_BACK -> {
-        if (event?.action == KeyEvent.ACTION_DOWN && tabSwitcher.isSwitcherShown && tabSwitcher.count > 0) {
-          toggleSwitcher(showSwitcher = false, easterEgg = false)
-          return true
-        }
-      }
       KeyEvent.KEYCODE_MENU -> {
         if (toolbar.isOverflowMenuShowing) {
           toolbar.hideOverflowMenu()
@@ -630,7 +608,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
         setFullScreenMode(NeoPreference.isFullScreenEnabled())
 
       getString(R.string.key_customization_color_scheme) -> {
-        (tabSwitcher.selectedTab as? TermTab)?.updateColorScheme()
+        (selectedTab as? TermTab)?.updateColorScheme()
         applyTerminalSystemColors()
       }
 
@@ -719,16 +697,16 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     when (requestCode) {
       REQUEST_SETUP -> {
         when (resultCode) {
-          // onActivityResult runs before the activity is resumed and the tab
-          // switcher is laid out, so creating the first session right here gives
-          // it a zero-sized view and the terminal stays blank (just the
-          // background). Defer it briefly so the rootfs that was just extracted
-          // is settled and the content view is measured before the shell opens.
+          // onActivityResult runs before the activity is resumed and the pager
+          // is laid out, so creating the first session right here gives it a
+          // zero-sized view and the terminal stays blank (just the background).
+          // Defer it briefly so the rootfs that was just extracted is settled
+          // and the content view is measured before the shell opens.
           AppCompatActivity.RESULT_OK ->
-            tabSwitcher.postDelayed({ enterMain() }, FIRST_SESSION_DELAY_MS)
+            viewPager.postDelayed({ enterMain() }, FIRST_SESSION_DELAY_MS)
           AppCompatActivity.RESULT_CANCELED -> {
             setSystemShellMode(true)
-            tabSwitcher.postDelayed({ forceAddSystemSession() }, FIRST_SESSION_DELAY_MS)
+            viewPager.postDelayed({ forceAddSystemSession() }, FIRST_SESSION_DELAY_MS)
           }
         }
       }
@@ -752,9 +730,8 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   }
 
   private fun forceAddSystemSession() {
-    // Open a system shell like any other session: no switcher reveal/animation,
-    // routed through the normal add path so the current profile (extra keys,
-    // etc.) applies.
+    // Open a system shell like any other session, routed through the normal add
+    // path so the current profile (extra keys, etc.) applies.
     addNewSession(null, true)
   }
 
@@ -780,12 +757,12 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       }
 
     } else {
-      // Fore system shell mode to be disabled. No switcher reveal -> the first
-      // session opens directly with the keyboard up.
+      // Force system shell mode to be disabled. The first session opens directly
+      // with the keyboard up.
       addNewSession(null, false)
     }
 
-    // Make sure the active terminal actually renders. On first launch the tab's
+    // Make sure the active terminal actually renders. On first launch the page's
     // view can be created before it gets a real size, so the emulator is never
     // built and the terminal stays blank until an unrelated relayout (returning
     // from recents). Nudge a layout pass and refresh, bounded so it can never
@@ -794,7 +771,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   }
 
   private fun ensureSelectedTerminalRendered(attempt: Int) {
-    val view = (tabSwitcher.selectedTab as? TermTab)?.termData?.termView
+    val view = (selectedTab as? TermTab)?.termData?.termView
     if (view != null && view.width > 0 && view.height > 0) {
       view.updateSize()
       view.onScreenUpdated()
@@ -808,7 +785,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     if (attempt < 12) {
       // What returning from recents effectively does: force a full layout pass.
       window.decorView.requestLayout()
-      tabSwitcher.postDelayed({ ensureSelectedTerminalRendered(attempt + 1) }, 120)
+      viewPager.postDelayed({ ensureSelectedTerminalRendered(attempt + 1) }, 120)
     }
   }
 
@@ -836,8 +813,8 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   private fun setFullScreenMode(fullScreen: Boolean) {
     fullScreenHelper.fullScreen = fullScreen
-    if (tabSwitcher.selectedTab is TermTab) {
-      val tab = tabSwitcher.selectedTab as TermTab
+    val tab = selectedTab
+    if (tab is TermTab) {
       tab.requireHideIme()
       tab.onFullScreenModeChanged(fullScreen)
     }
@@ -875,7 +852,6 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     addNewSessionWithProfile(sessionName, systemShell, ShellProfile.create())
 
   private fun addNewSessionWithProfile(profile: ShellProfile) {
-    // No switcher reveal: open the new session directly (no animation).
     addNewSessionWithProfile(null, getSystemShellMode(), profile)
   }
 
@@ -898,7 +874,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     tab.termData.initializeSessionWith(session, sessionCallback, viewClient)
 
     addNewTab(tab)
-    switchToSession(tab)
+    switchToTab(tab)
   }
 
   private fun addNewSessionFromExisting(session: TerminalSession?) {
@@ -906,13 +882,10 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       return
     }
 
-    // Do not add the same session again
-    // Or app will crash when rotate
-    val tabCount = tabSwitcher.count
-    (0..(tabCount - 1))
-      .map { tabSwitcher.getTab(it) }
-      .filter { it is TermTab && it.termData.termSession == session }
-      .forEach { return }
+    // Do not add the same session again (e.g. when re-entering after rotation).
+    if (tabs.any { it is TermTab && it.termData.termSession == session }) {
+      return
+    }
 
     val sessionCallback = session.sessionChangedCallback as TermSessionCallback
     val viewClient = TermViewClient(this)
@@ -921,7 +894,6 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     tab.termData.initializeSessionWith(session, sessionCallback, viewClient)
 
     addNewTab(tab)
-    switchToSession(tab)
   }
 
   private fun addXSession() {
@@ -934,10 +906,6 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       return
     }
 
-    if (!tabSwitcher.isSwitcherShown) {
-      toggleSwitcher(showSwitcher = true, easterEgg = false)
-    }
-
     val parameter = XParameter()
     val session = termService!!.createXSession(this, parameter)
 
@@ -946,7 +914,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     tab.session = session
 
     addNewTab(tab)
-    switchToSession(tab)
+    switchToTab(tab)
   }
 
   private fun addXSession(session: XSession?) {
@@ -954,18 +922,15 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       return
     }
 
-    // Do not add the same session again
-    // Or app will crash when rotate
-    val tabCount = tabSwitcher.count
-    (0..(tabCount - 1))
-      .map { tabSwitcher.getTab(it) }
-      .filter { it is XSessionTab && it.session == session }
-      .forEach { return }
+    // Do not add the same session again.
+    if (tabs.any { it is XSessionTab && it.session == session }) {
+      return
+    }
 
     val tab = createXTab(session.mSessionName) as XSessionTab
+    tab.session = session
 
     addNewTab(tab)
-    switchToSession(tab)
   }
 
   private fun generateSessionName(prefix: String): String {
@@ -980,27 +945,81 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     if (session == null) {
       return
     }
-
-    for (i in 0 until tabSwitcher.count) {
-      val tab = tabSwitcher.getTab(i)
-      if (tab is TermTab && tab.termData.termSession == session) {
-        switchToSession(tab)
-        break
-      }
+    val index = tabs.indexOfFirst { it is TermTab && it.termData.termSession == session }
+    if (index >= 0) {
+      viewPager.setCurrentItem(index, false)
     }
   }
 
-  private fun switchToSession(tab: Tab?) {
+  private fun switchToTab(tab: NeoTab?) {
     if (tab == null) {
       return
     }
-    tabSwitcher.selectTab(tab)
+    val index = indexOf(tab)
+    if (index >= 0) {
+      // Animate to the newly added (or selected) page so the switch is visible
+      // when it is not the immediate neighbour; ViewPager2 still snaps cleanly.
+      viewPager.setCurrentItem(index, true)
+    }
   }
 
-  private fun addNewTab(tab: Tab) {
-    // Add without animation and keep the switcher hidden: the tab is added and
-    // then selected (switchToSession) instantly, with no reveal/swipe animation.
-    tabSwitcher.addTab(tab, 0)
+  /**
+   * Append a tab to the model and notify the adapter. The page is created lazily
+   * by ViewPager2; offscreenPageLimit keeps the neighbours live.
+   */
+  private fun addNewTab(tab: NeoTab) {
+    tabs.add(tab)
+    pagerAdapter.notifyItemInserted(tabs.size - 1)
+    update_colors()
+    updateTabDots()
+  }
+
+  /**
+   * Close a tab: remove its session (cleanup via SessionRemover) and drop the
+   * page. Closing the last tab exits the app, matching the old behaviour.
+   */
+  private fun closeTab(tab: NeoTab?) {
+    if (tab == null) return
+    val index = indexOf(tab)
+    if (index < 0) return
+
+    // Closing the last tab exits the app (the service tears everything down once
+    // no sessions remain — see onTabCloseEvent's note).
+    if (tabCount <= 1) {
+      removeTabAt(index)
+      finish()
+      return
+    }
+
+    // Work out which neighbour to focus *before* removing the tab, honouring the
+    // next/previous preference (matches the old close behaviour).
+    var target = index
+    if (NeoPreference.isNextTabEnabled()) {
+      if (--target < 0) target = tabCount - 1
+    } else {
+      if (++target >= tabCount) target = 0
+    }
+    val targetTab = getTab(target)
+
+    removeTabAt(index)
+
+    // After removal the indices shifted; select the tab we picked by identity.
+    val newIndex = if (targetTab != null) indexOf(targetTab) else (index.coerceAtMost(tabCount - 1))
+    if (newIndex >= 0) {
+      viewPager.setCurrentItem(newIndex, false)
+    }
+    updateTabDots()
+  }
+
+  /** Remove the tab at [index], cleaning up its underlying session. */
+  private fun removeTabAt(index: Int) {
+    val tab = tabs.getOrNull(index) ?: return
+    when (tab) {
+      is TermTab -> SessionRemover.removeSession(termService, tab)
+      is XSessionTab -> SessionRemover.removeXSession(termService, tab)
+    }
+    tabs.removeAt(index)
+    pagerAdapter.notifyItemRemoved(index)
   }
 
   private fun getStoredCurrentSessionOrLast(): TerminalSession? {
@@ -1017,11 +1036,11 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     }
   }
 
-  private fun createTab(tabTitle: String?): Tab {
+  private fun createTab(tabTitle: String?): NeoTab {
     return postTabCreated(TermTab(tabTitle ?: "NeoTerm"))
   }
 
-  private fun createXTab(tabTitle: String?): Tab {
+  private fun createXTab(tabTitle: String?): NeoTab {
     return postTabCreated(XSessionTab(tabTitle ?: "NeoTerm"))
   }
 
@@ -1039,7 +1058,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   private fun createWindowInsetsListener(): OnApplyWindowInsetsListener {
     return OnApplyWindowInsetsListener { _, insets ->
-      tabSwitcher.setPadding(
+      viewPager.setPadding(
         insets.systemWindowInsetLeft,
         insets.systemWindowInsetTop, insets.systemWindowInsetRight,
         insets.systemWindowInsetBottom
@@ -1054,19 +1073,6 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     }
   }
 
-  private fun toggleSwitcher(showSwitcher: Boolean, easterEgg: Boolean) {
-    if (tabSwitcher.count == 0 && easterEgg) {
-      App.get().easterEgg(this, "Stop! You don't know what you are doing!")
-      return
-    }
-
-    if (showSwitcher) {
-      tabSwitcher.showSwitcher()
-    } else {
-      tabSwitcher.hideSwitcher()
-    }
-  }
-
   private fun setSystemShellMode(systemShell: Boolean) {
     NeoPreference.store(NeoPreference.KEY_SYSTEM_SHELL, systemShell)
   }
@@ -1076,10 +1082,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   }
 
   private inline fun <reified T> forEachTab(callback: (T) -> Unit) {
-    (0 until tabSwitcher.count)
-      .map { tabSwitcher.getTab(it) }
-      .filterIsInstance(T::class.java)
-      .forEach(callback)
+    tabs.filterIsInstance<T>().forEach(callback)
   }
 
   @Suppress("unused")
@@ -1088,42 +1091,13 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     val tab = tabCloseEvent.termTab
 
     // Closing the last tab exits the app. Removing the tab cleans up its session
-    // (onTabRemoved -> SessionRemover -> service.removeTermSession), and once no
-    // sessions remain the service tears everything down: it finishes this
-    // activity, closes the embedded X11 window and unbinds the X11 server. We do
-    // NOT call X11Manager.stopServer here: it routes through
+    // (SessionRemover -> service.removeTermSession), and once no sessions remain
+    // the service tears everything down: it finishes this activity, closes the
+    // embedded X11 window and unbinds the X11 server. We do NOT call
+    // X11Manager.stopServer here: it routes through
     // startService(ACTION_X11_STOP), which would re-create the just-stopped
     // service and bring its notification back with zero sessions.
-    if (tabSwitcher.count <= 1) {
-      tabSwitcher.removeTab(tab)
-      finish()
-      return
-    }
-
-    // Work out which neighbour to switch to *before* removing the closing tab.
-    var index = tabSwitcher.indexOf(tab)
-    if (NeoPreference.isNextTabEnabled()) {
-      // 关闭当前窗口后，向下一个窗口切换
-      if (--index < 0) index = tabSwitcher.count - 1
-    } else {
-      // 关闭当前窗口后，向上一个窗口切换
-      if (++index >= tabSwitcher.count) index = 0
-    }
-    val target = tabSwitcher.getTab(index)
-
-    // Select the neighbour first, then remove the closing tab. With the
-    // switcher hidden, mrapp's removeTab only re-inflates the auto-selected
-    // neighbour when its index differs from the previously selected index.
-    // Closing the front tab (index 0, the common case) keeps the selected
-    // index at 0, so the neighbour is never inflated and the terminal stays
-    // blank until the next layout pass (which is why backgrounding/foreground
-    // or opening the switcher "fixed" it). Selecting the neighbour up front
-    // forces its view to inflate and show; the subsequent removeTab then just
-    // drops the now-unselected closing tab.
-    if (target !== tab) {
-      switchToSession(target)
-    }
-    tabSwitcher.removeTab(tab)
+    closeTab(tab)
   }
 
   @Suppress("unused", "UNUSED_PARAMETER")
@@ -1136,16 +1110,19 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   @Suppress("unused", "UNUSED_PARAMETER")
   @Subscribe(threadMode = ThreadMode.MAIN)
   fun onToggleImeEvent(toggleImeEvent: ToggleImeEvent) {
-    if (!tabSwitcher.isSwitcherShown) {
-      val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-      imm.toggleSoftInput(InputMethodManager.SHOW_IMPLICIT, 0)
-    }
+    val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+    imm.toggleSoftInput(InputMethodManager.SHOW_IMPLICIT, 0)
   }
 
   @Suppress("unused", "UNUSED_PARAMETER")
   @Subscribe(threadMode = ThreadMode.MAIN)
   fun onTitleChangedEvent(titleChangedEvent: TitleChangedEvent) {
-    if (!tabSwitcher.isSwitcherShown) {
+    // Keep the toolbar title bound to the *active* page only, so a background
+    // tab's title change (e.g. its shell prompt) doesn't clobber the visible
+    // title. The active tab's own title-changed event always matches its tab
+    // title (requireUpdateTitle set it just before posting).
+    val tab = selectedTab as? TermTab ?: return
+    if (tab.title == titleChangedEvent.title) {
       toolbar.title = titleChangedEvent.title
     }
   }
@@ -1166,24 +1143,21 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   @Suppress("unused", "UNUSED_PARAMETER")
   @Subscribe(threadMode = ThreadMode.MAIN)
   fun onSwitchSessionEvent(switchSessionEvent: SwitchSessionEvent) {
-    if (tabSwitcher.count < 2) {
+    if (tabCount < 2) {
       return
     }
 
-    val rangedInt = RangedInt(tabSwitcher.selectedTabIndex, (0 until tabSwitcher.count))
+    val rangedInt = RangedInt(selectedTabIndex, (0 until tabCount))
     val nextIndex = if (switchSessionEvent.toNext) rangedInt.inc() else rangedInt.dec()
-    // Switch directly without revealing the switcher overview, so there is no
-    // tab-switch animation.
-    switchToSession(tabSwitcher.getTab(nextIndex))
+    viewPager.setCurrentItem(nextIndex, true)
   }
 
   @Suppress("unused", "UNUSED_PARAMETER")
   @Subscribe(threadMode = ThreadMode.MAIN)
   fun onSwitchIndexedSessionEvent(switchIndexedSessionEvent: SwitchIndexedSessionEvent) {
     val nextIndex = switchIndexedSessionEvent.index - 1
-    if (nextIndex in (0 until tabSwitcher.count) && nextIndex != tabSwitcher.selectedTabIndex) {
-      // Do not show animation here, users may get tired
-      switchToSession(tabSwitcher.getTab(nextIndex))
+    if (nextIndex in (0 until tabCount) && nextIndex != selectedTabIndex) {
+      viewPager.setCurrentItem(nextIndex, true)
     }
   }
 
@@ -1191,8 +1165,8 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     // Simple fix to bug on custom color
     Handler().postDelayed({
 
-      if (tabSwitcher.count > 0) {
-        val tab = tabSwitcher.selectedTab
+      if (tabCount > 0) {
+        val tab = selectedTab
         if (tab is TermTab) {
           tab.updateColorScheme()
         }
