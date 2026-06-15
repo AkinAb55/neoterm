@@ -114,6 +114,15 @@ public final class TerminalView extends View {
   TerminalViewClient mClient;
 
   /**
+   * Vertical pan, in pixels, applied so the soft keyboard does not force a PTY resize. When the
+   * keyboard covers the bottom of the view we keep the terminal's row/column count fixed (see
+   * {@link #updateSize}) and instead shift the rendered content up by this amount, so the cursor
+   * and bottom rows stay visible above the keyboard. This avoids reflowing the screen on every
+   * keyboard toggle, which strands the bottom UI of main-buffer apps (e.g. a CLI status box).
+   */
+  private int mKeyboardPanPx = 0;
+
+  /**
    * The top row of text to display. Ranges from -activeTranscriptRows to 0.
    */
   int mTopRow;
@@ -824,6 +833,10 @@ public final class TerminalView extends View {
   @TargetApi(23)
   public boolean onTouchEvent(MotionEvent ev) {
     if (mEmulator == null) return true;
+    // Map touch coordinates into the (keyboard-)panned content space, so taps/selection land on
+    // the same rows the renderer drew. A single offset here covers every downstream getY() use
+    // (gesture detector, selection, hit-testing).
+    if (mKeyboardPanPx != 0) ev.offsetLocation(0, mKeyboardPanPx);
     final int action = ev.getAction();
 
     // Claim the gesture up front (touch only) so a long-press/selection/vertical
@@ -1422,11 +1435,27 @@ public final class TerminalView extends View {
   }
 
   /**
+   * Set the keyboard pan (px). Called by the host activity when the soft keyboard overlaps the
+   * view. We deliberately do NOT resize here: the value is stored and the next layout pass
+   * ({@link #onSizeChanged} -> {@link #updateSize}) recomputes rows against the un-panned height,
+   * keeping the row count constant across the keyboard toggle. Only a repaint is needed to apply
+   * the new content offset.
+   */
+  public void setKeyboardPan(int panPx) {
+    if (panPx < 0) panPx = 0;
+    if (panPx == mKeyboardPanPx) return;
+    mKeyboardPanPx = panPx;
+    invalidate();
+  }
+
+  /**
    * Check if the terminal size in rows and columns should be updated.
    */
   public void updateSize() {
     int viewWidth = getWidth();
-    int viewHeight = getHeight();
+    // Add back the keyboard pan so the row count is computed against the full (un-covered) height:
+    // the keyboard pans the content instead of resizing the terminal.
+    int viewHeight = getHeight() + mKeyboardPanPx;
     if (viewWidth == 0 || viewHeight == 0 || mTermSession == null) return;
 
     // Set to 80 and 24 if you want to enable vttest.
@@ -1454,6 +1483,13 @@ public final class TerminalView extends View {
     if (mEmulator == null) {
       canvas.drawColor(0XFF000000);
     } else {
+      // Pan the content up when the keyboard covers the bottom (see mKeyboardPanPx). Wrapped in
+      // save/restore so the offset doesn't leak into foreground drawing (e.g. scrollbars).
+      int saveCount = -1;
+      if (mKeyboardPanPx != 0) {
+        saveCount = canvas.save();
+        canvas.translate(0, -mKeyboardPanPx);
+      }
       mRenderer.render(mEmulator, canvas, mTopRow, mSelY1, mSelY2, mSelX1, mSelX2);
 
       if (mIsSelectingText) {
@@ -1470,6 +1506,8 @@ public final class TerminalView extends View {
         mRightSelectionHandle.setBounds(left, top, left + gripHandleWidth, top + mRightSelectionHandle.getIntrinsicHeight());
         mRightSelectionHandle.draw(canvas);
       }
+
+      if (saveCount != -1) canvas.restoreToCount(saveCount);
     }
   }
 

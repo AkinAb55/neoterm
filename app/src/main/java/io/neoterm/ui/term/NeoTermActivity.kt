@@ -1254,6 +1254,13 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
         insets.systemWindowInsetTop, insets.systemWindowInsetRight,
         insets.systemWindowInsetBottom
       )
+      // Pan the terminal content up by the keyboard overlap instead of resizing the PTY.
+      // The keyboard's height is how much the bottom inset grew beyond the stable nav-bar
+      // inset. Setting it now (before the padding change lays out and fires onSizeChanged)
+      // lets the terminal keep its row count constant across the toggle, so a foreground
+      // main-buffer UI (e.g. a CLI status box) is not reflowed/stranded by the resize.
+      val keyboardPan = (insets.systemWindowInsetBottom - insets.stableInsetBottom).coerceAtLeast(0)
+      forEachTab<TermTab> { it.termData.termView?.setKeyboardPan(keyboardPan) }
       // The bottom inset (keyboard) just changed the usable height — even small
       // changes (suggestion bar, keyboard layout switches) that the keyboard
       // show/hide listener's threshold misses. Re-measure once the new padding is
