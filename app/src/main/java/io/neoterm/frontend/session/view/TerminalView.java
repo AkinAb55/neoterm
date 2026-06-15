@@ -103,11 +103,37 @@ public final class TerminalView extends View {
     mViewAttached = true;
   }
 
+  /**
+   * After a resize, a foreground app that paints its UI in the main buffer with a differential
+   * renderer (e.g. a CLI with a live status box, like Claude Code) can desync from the reflowed
+   * screen and leave a stale copy of that box stranded in the buffer. We nudge it with Ctrl+L to
+   * force a full repaint/resync once the size settles. Ctrl+L preserves any in-progress input.
+   */
+  private static final byte[] APP_REDRAW_SEQUENCE = {0x0C}; // Ctrl+L (form feed)
+  private static final long APP_REDRAW_DELAY_MILLIS = 250;
+  private final Runnable mRequestAppRedraw = new Runnable() {
+    @Override
+    public void run() {
+      if (mTermSession != null) mTermSession.write(APP_REDRAW_SEQUENCE, 0, APP_REDRAW_SEQUENCE.length);
+    }
+  };
+
+  /**
+   * Debounced redraw nudge: every resize step (e.g. each frame of the keyboard slide) reschedules
+   * this, so exactly one Ctrl+L fires once the size has stopped changing -- after the keyboard is
+   * fully open or fully closed -- rather than once per intermediate size.
+   */
+  private void scheduleAppRedraw() {
+    removeCallbacks(mRequestAppRedraw);
+    postDelayed(mRequestAppRedraw, APP_REDRAW_DELAY_MILLIS);
+  }
+
   @Override
   protected void onDetachedFromWindow() {
     mViewAttached = false;
     mRefreshScheduled = false;
     Choreographer.getInstance().removeFrameCallback(mRefreshFrameCallback);
+    removeCallbacks(mRequestAppRedraw);
     super.onDetachedFromWindow();
   }
 
@@ -1434,12 +1460,16 @@ public final class TerminalView extends View {
     int newRows = Math.max(4, (viewHeight - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
 
     if (mEmulator == null || (newColumns != mEmulator.mColumns || newRows != mEmulator.mRows)) {
+      // False on the very first emulator creation: don't nudge the app before it has started.
+      boolean isReResize = mEmulator != null;
       mTermSession.updateSize(newColumns, newRows);
       mEmulator = mTermSession.getEmulator();
 
       mTopRow = 0;
       scrollTo(0, 0);
       invalidate();
+
+      if (isReResize) scheduleAppRedraw();
     }
 
     // Keep the emulator's cell pixel size current so Sixel images map to the
