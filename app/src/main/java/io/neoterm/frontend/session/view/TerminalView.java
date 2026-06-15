@@ -58,6 +58,59 @@ public final class TerminalView extends View {
 
   TerminalRenderer mRenderer;
 
+  /**
+   * Drives repaints off the display's frame clock (vsync, ~60 Hz or the panel's native rate)
+   * rather than only when output arrives. After each emulator update the view keeps refreshing
+   * for a short tail window, so the screen always converges to the latest buffer state within a
+   * frame even if an individual repaint was coalesced away or suppressed (e.g. during DEC 2026
+   * synchronized output) -- a stale frame can't get stuck. Idles when no updates arrive so it
+   * doesn't burn power on a quiet terminal.
+   */
+  private boolean mViewAttached = false;
+  private boolean mRefreshScheduled = false;
+  private long mLastScreenUpdateUptime = 0;
+  /** Keep ticking this long after the last emulator update, then idle until the next one. */
+  private static final long REFRESH_TAIL_MILLIS = 250;
+  private final Choreographer.FrameCallback mRefreshFrameCallback = new Choreographer.FrameCallback() {
+    @Override
+    public void doFrame(long frameTimeNanos) {
+      if (!mViewAttached) {
+        mRefreshScheduled = false;
+        return;
+      }
+      // Animation callbacks run before this frame's draw pass, so this invalidate is served on
+      // the same vsync (no extra latency).
+      invalidate();
+      if (android.os.SystemClock.uptimeMillis() - mLastScreenUpdateUptime < REFRESH_TAIL_MILLIS) {
+        Choreographer.getInstance().postFrameCallback(this);
+      } else {
+        mRefreshScheduled = false;
+      }
+    }
+  };
+
+  /** Mark the screen dirty and ensure the vsync refresh loop is running. */
+  private void scheduleRefresh() {
+    mLastScreenUpdateUptime = android.os.SystemClock.uptimeMillis();
+    if (mRefreshScheduled || !mViewAttached) return;
+    mRefreshScheduled = true;
+    Choreographer.getInstance().postFrameCallback(mRefreshFrameCallback);
+  }
+
+  @Override
+  protected void onAttachedToWindow() {
+    super.onAttachedToWindow();
+    mViewAttached = true;
+  }
+
+  @Override
+  protected void onDetachedFromWindow() {
+    mViewAttached = false;
+    mRefreshScheduled = false;
+    Choreographer.getInstance().removeFrameCallback(mRefreshFrameCallback);
+    super.onDetachedFromWindow();
+  }
+
   TerminalViewClient mClient;
 
   /**
@@ -615,7 +668,7 @@ public final class TerminalView extends View {
     }
 
     mEmulator.clearScrollCounter();
-    invalidate();
+    scheduleRefresh();
 
     // Basic accessibility service
     String contentText = mEmulator.getScreen()
