@@ -667,6 +667,15 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     // Match the pager container too, so tab switches don't flash a different
     // color behind the terminal.
     viewPager.setBackgroundColor(bg)
+    // The window must opt in to painting the system bar backgrounds, otherwise
+    // statusBarColor/navigationBarColor are ignored and the system keeps drawing its default
+    // (black) bars even though the toolbar is themed. Clear the translucent-bar flags too, since
+    // they'd likewise suppress the solid colour.
+    window.clearFlags(
+      WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS or
+        WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION
+    )
+    window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
     window.statusBarColor = bg
     window.navigationBarColor = bg
     // Make the bars *exactly* the terminal background. The nav-bar divider (a thin line at the
