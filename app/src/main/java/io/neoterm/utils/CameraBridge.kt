@@ -67,6 +67,8 @@ object CameraBridge {
   private val clientCount = AtomicInteger(0)
   private val frameLock = Object()
   @Volatile private var latestJpeg: ByteArray? = null
+  /** Camera sensor mounting orientation in degrees; frames are rotated by this to be upright. */
+  @Volatile private var sensorOrientation = 0
 
   fun start(context: Context) {
     if (running) return
@@ -122,6 +124,7 @@ object CameraBridge {
     val first = clientCount.incrementAndGet() == 1
     if (first) openCamera()
     try {
+      runCatching { socket.tcpNoDelay = true } // push frames out immediately (low latency)
       socket.use { s ->
         // Drain the request line(s); the path is ignored (we always serve the stream).
         s.getInputStream().let { input ->
@@ -177,6 +180,8 @@ object CameraBridge {
       try {
         val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val camId = pickCamera(cm) ?: return
+        sensorOrientation = cm.getCameraCharacteristics(camId)
+          .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         val size = chooseSize(cm, camId)
 
         val thread = HandlerThread("camera-capture").apply { start() }
@@ -302,11 +307,66 @@ object CameraBridge {
   }
 
   private fun yuvToJpeg(image: Image): ByteArray? {
-    val nv21 = yuv420ToNv21(image)
-    val yuv = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+    var nv21 = yuv420ToNv21(image)
+    var w = image.width
+    var h = image.height
+    // Rotate to upright using the sensor mounting orientation (back cameras are usually 90°),
+    // otherwise the stream comes out sideways.
+    val rot = ((sensorOrientation % 360) + 360) % 360
+    if (rot != 0) {
+      nv21 = rotateNv21(nv21, w, h, rot)
+      if (rot == 90 || rot == 270) { val t = w; w = h; h = t }
+    }
+    val yuv = YuvImage(nv21, ImageFormat.NV21, w, h, null)
     val out = ByteArrayOutputStream()
-    return if (yuv.compressToJpeg(Rect(0, 0, image.width, image.height), JPEG_QUALITY, out))
+    return if (yuv.compressToJpeg(Rect(0, 0, w, h), JPEG_QUALITY, out))
       out.toByteArray() else null
+  }
+
+  /** Rotate an NV21 buffer by 90/180/270° clockwise. Returns a new buffer; for 90/270 the
+   *  caller must swap width/height. */
+  private fun rotateNv21(input: ByteArray, w: Int, h: Int, rotation: Int): ByteArray {
+    val output = ByteArray(input.size)
+    val ySize = w * h
+    val cw = w / 2
+    val ch = h / 2
+    when (rotation) {
+      90 -> {
+        for (j in 0 until h) {
+          val rowBase = j * w
+          for (i in 0 until w) output[i * h + (h - 1 - j)] = input[rowBase + i]
+        }
+        for (cj in 0 until ch) for (ci in 0 until cw) {
+          val src = ySize + cj * w + ci * 2
+          val dst = ySize + ci * h + (ch - 1 - cj) * 2
+          output[dst] = input[src]; output[dst + 1] = input[src + 1]
+        }
+      }
+      270 -> {
+        for (j in 0 until h) {
+          val rowBase = j * w
+          for (i in 0 until w) output[(w - 1 - i) * h + j] = input[rowBase + i]
+        }
+        for (cj in 0 until ch) for (ci in 0 until cw) {
+          val src = ySize + cj * w + ci * 2
+          val dst = ySize + (cw - 1 - ci) * h + cj * 2
+          output[dst] = input[src]; output[dst + 1] = input[src + 1]
+        }
+      }
+      180 -> {
+        for (j in 0 until h) {
+          val rowBase = j * w
+          for (i in 0 until w) output[(h - 1 - j) * w + (w - 1 - i)] = input[rowBase + i]
+        }
+        for (cj in 0 until ch) for (ci in 0 until cw) {
+          val src = ySize + cj * w + ci * 2
+          val dst = ySize + (ch - 1 - cj) * w + (cw - 1 - ci) * 2
+          output[dst] = input[src]; output[dst + 1] = input[src + 1]
+        }
+      }
+      else -> return input
+    }
+    return output
   }
 
   /** Convert a YUV_420_888 [Image] to a packed NV21 byte array (handles row/pixel strides). */
