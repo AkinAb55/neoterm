@@ -669,6 +669,16 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     viewPager.setBackgroundColor(bg)
     window.statusBarColor = bg
     window.navigationBarColor = bg
+    // Make the bars *exactly* the terminal background. The nav-bar divider (a thin line at the
+    // top of the navigation bar, API 28+) and the system's contrast scrim on the bars (gesture
+    // nav, API 29+) would otherwise sit slightly off-colour from the terminal; drop both.
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+      window.navigationBarDividerColor = bg
+    }
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+      window.isStatusBarContrastEnforced = false
+      window.isNavigationBarContrastEnforced = false
+    }
 
     // Use dark status/navigation icons on a light background and light icons on
     // a dark one, so they stay legible whatever color scheme is active.
