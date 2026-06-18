@@ -3,6 +3,7 @@ package io.neoterm.utils
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.hardware.GeomagneticField
 import android.location.GnssStatus
 import android.location.Location
 import android.location.LocationListener
@@ -327,6 +328,10 @@ object GpsBridge {
       putNum("altHAE", loc.altitude)
       putNum("alt", loc.altitude)
     }
+    // Mean-sea-level altitude is only provided by Android on API 33+.
+    if (android.os.Build.VERSION.SDK_INT >= 33 && loc.hasMslAltitude()) {
+      putNum("altMSL", loc.mslAltitudeMeters)
+    }
     if (loc.hasAccuracy()) {
       val acc = loc.accuracy.toDouble()
       putNum("eph", acc); putNum("epx", acc); putNum("epy", acc)
@@ -334,17 +339,31 @@ object GpsBridge {
     if (loc.hasVerticalAccuracy()) putNum("epv", loc.verticalAccuracyMeters.toDouble())
     if (loc.hasSpeed()) putNum("speed", loc.speed.toDouble())
     if (loc.hasSpeedAccuracy()) putNum("eps", loc.speedAccuracyMetersPerSecond.toDouble())
-    if (loc.hasBearing()) putNum("track", loc.bearing.toDouble())
+    if (loc.hasBearing()) {
+      putNum("track", loc.bearing.toDouble())
+      // Magnetic track/variation from the geomagnetic model (gpsd's magvar is West-positive).
+      val decl = GeomagneticField(
+        loc.latitude.toFloat(), loc.longitude.toFloat(),
+        (if (loc.hasAltitude()) loc.altitude else 0.0).toFloat(),
+        if (loc.time > 0) loc.time else System.currentTimeMillis()
+      ).declination.toDouble()
+      putNum("magvar", -decl)
+      putNum("magtrack", ((loc.bearing.toDouble() - decl) % 360 + 360) % 360)
+    }
     if (loc.hasBearingAccuracy()) putNum("epd", loc.bearingAccuracyDegrees.toDouble())
+    // ECEF position from lat/lon/alt (gpsd would otherwise derive this from the receiver).
+    val ecef = geodeticToEcef(loc.latitude, loc.longitude, if (loc.hasAltitude()) loc.altitude else 0.0)
+    putNum("ecefx", ecef[0]); putNum("ecefy", ecef[1]); putNum("ecefz", ecef[2])
   }
 
   private fun skyJson(gnss: GnssStatus?): JSONObject = JSONObject().apply {
     put("class", "SKY")
     put("device", DEVICE)
     latestLocation?.let { put("time", iso(it.time)) }
-    dop?.let { putNum("pdop", it[0]); putNum("hdop", it[1]); putNum("vdop", it[2]) }
     val arr = JSONArray()
     var used = 0
+    val usedEl = ArrayList<Double>()
+    val usedAz = ArrayList<Double>()
     if (gnss != null) {
       // Android reports one entry per satellite *signal*, so a sat tracked on multiple bands
       // (e.g. L1+L5) appears 2-3 times. Collapse to one entry per physical satellite
@@ -372,18 +391,33 @@ object GpsBridge {
         }
       }
       for ((key, v) in merged) {
-        if (v[2] == 1) used++
+        val el = (elOf[key] ?: 0f).toDouble()
+        val az = (azOf[key] ?: 0f).toDouble()
+        if (v[2] == 1) { used++; usedEl.add(el); usedAz.add(az) }
         arr.put(JSONObject().apply {
           put("PRN", v[1])
           put("svid", v[1])
           put("gnssid", v[0])
-          putNum("el", (elOf[key] ?: 0f).toDouble())
-          putNum("az", (azOf[key] ?: 0f).toDouble())
+          putNum("el", el)
+          putNum("az", az)
           putNum("ss", (ssOf[key] ?: 0f).toDouble())
           put("used", v[2] == 1)
         })
       }
     }
+
+    // DOPs the way gpsd computes them: from the used satellites' geometry. Falls back to the
+    // PDOP/HDOP/VDOP parsed from the chip's NMEA GSA when there aren't enough sats to solve.
+    // Order: [gdop, pdop, hdop, vdop, tdop, xdop, ydop].
+    val geo = computeDops(usedEl, usedAz)
+    val d = geo ?: dop?.let {
+      doubleArrayOf(Double.NaN, it[0], it[1], it[2], Double.NaN, Double.NaN, Double.NaN)
+    }
+    if (d != null) {
+      putNum("gdop", d[0]); putNum("pdop", d[1]); putNum("hdop", d[2]); putNum("vdop", d[3])
+      putNum("tdop", d[4]); putNum("xdop", d[5]); putNum("ydop", d[6])
+    }
+
     put("nSat", arr.length())
     put("uSat", used)
     put("satellites", arr)
@@ -396,6 +430,68 @@ object GpsBridge {
     put("active", if (loc != null) 1 else 0)
     put("tpv", JSONArray().apply { loc?.let { put(tpvJson(it)) } })
     put("sky", JSONArray().put(skyJson(latestGnss)))
+  }
+
+  /**
+   * Dilution-of-precision values from the geometry of the satellites used in the fix (the same
+   * computation gpsd does in fill_dop): build the line-of-sight matrix A (rows of
+   * [cos el·sin az, cos el·cos az, sin el, 1]), invert AᵀA and read the diagonal.
+   * Returns [gdop, pdop, hdop, vdop, tdop, xdop, ydop], or null if it can't be solved.
+   */
+  private fun computeDops(elDeg: List<Double>, azDeg: List<Double>): DoubleArray? {
+    val n = elDeg.size
+    if (n < 4) return null
+    val h = Array(4) { DoubleArray(4) }
+    for (i in 0 until n) {
+      val el = Math.toRadians(elDeg[i])
+      val az = Math.toRadians(azDeg[i])
+      val ce = Math.cos(el)
+      val row = doubleArrayOf(ce * Math.sin(az), ce * Math.cos(az), Math.sin(el), 1.0)
+      for (r in 0 until 4) for (c in 0 until 4) h[r][c] += row[r] * row[c]
+    }
+    val q = invert4(h) ?: return null
+    fun s(x: Double) = if (x > 0) Math.sqrt(x) else Double.NaN
+    val xdop = s(q[0][0]); val ydop = s(q[1][1]); val vdop = s(q[2][2]); val tdop = s(q[3][3])
+    val hdop = s(q[0][0] + q[1][1])
+    val pdop = s(q[0][0] + q[1][1] + q[2][2])
+    val gdop = s(q[0][0] + q[1][1] + q[2][2] + q[3][3])
+    return doubleArrayOf(gdop, pdop, hdop, vdop, tdop, xdop, ydop)
+  }
+
+  /** Invert a 4×4 matrix via Gauss-Jordan with partial pivoting; null if (near-)singular. */
+  private fun invert4(m: Array<DoubleArray>): Array<DoubleArray>? {
+    val n = 4
+    val a = Array(n) { i -> DoubleArray(2 * n) { j -> if (j < n) m[i][j] else if (j - n == i) 1.0 else 0.0 } }
+    for (col in 0 until n) {
+      var piv = col
+      for (r in col + 1 until n) if (Math.abs(a[r][col]) > Math.abs(a[piv][col])) piv = r
+      if (Math.abs(a[piv][col]) < 1e-12) return null
+      val tmp = a[col]; a[col] = a[piv]; a[piv] = tmp
+      val pv = a[col][col]
+      for (j in 0 until 2 * n) a[col][j] /= pv
+      for (r in 0 until n) if (r != col) {
+        val f = a[r][col]
+        if (f != 0.0) for (j in 0 until 2 * n) a[r][j] -= f * a[col][j]
+      }
+    }
+    return Array(n) { i -> DoubleArray(n) { j -> a[i][j + n] } }
+  }
+
+  /** WGS84 geodetic (deg, deg, metres HAE) to ECEF metres. */
+  private fun geodeticToEcef(latDeg: Double, lonDeg: Double, h: Double): DoubleArray {
+    val a = 6378137.0
+    val f = 1.0 / 298.257223563
+    val e2 = f * (2 - f)
+    val lat = Math.toRadians(latDeg)
+    val lon = Math.toRadians(lonDeg)
+    val sinLat = Math.sin(lat)
+    val cosLat = Math.cos(lat)
+    val nN = a / Math.sqrt(1 - e2 * sinLat * sinLat)
+    return doubleArrayOf(
+      (nN + h) * cosLat * Math.cos(lon),
+      (nN + h) * cosLat * Math.sin(lon),
+      (nN * (1 - e2) + h) * sinLat
+    )
   }
 
   /** Map an Android constellation to the gpsd/u-blox gnssid. */
