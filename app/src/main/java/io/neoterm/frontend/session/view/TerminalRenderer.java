@@ -444,7 +444,14 @@ final class TerminalRenderer {
     }
 
     if ((effect & TextStyle.CHARACTER_ATTRIBUTE_INVISIBLE) == 0) {
-      if (dim) {
+      // A block cursor fills the whole cell with the cursor colour and the glyph is painted on
+      // top of it. Draw that glyph in the cell's background colour (reverse video under the
+      // cursor) so it stays readable -- otherwise a glyph whose colour happens to match the
+      // cursor colour would vanish under the block. Bar/underline cursors don't cover the glyph.
+      final boolean blockCursorOverGlyph = cursor != 0 && cursorStyle == TerminalEmulator.CURSOR_STYLE_BLOCK;
+      if (blockCursorOverGlyph) foreColor = backColor;
+
+      if (dim && !blockCursorOverGlyph) {
         int red = (0xFF & (foreColor >> 16));
         int green = (0xFF & (foreColor >> 8));
         int blue = (0xFF & foreColor);
