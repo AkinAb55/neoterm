@@ -276,11 +276,15 @@ object GpsBridge {
   }
 
   private fun versionJson(): JSONObject = JSONObject().apply {
+    // libgps clients (cgps, …) compare these to the gpsd they were built against and print a
+    // cosmetic warning on mismatch (functionality is unaffected — the JSON wire format is the
+    // same). Track the current stable gpsd so the common distro clients don't warn; bump if a
+    // newer gpsd changes its release/protocol numbers.
     put("class", "VERSION")
-    put("release", "3.25")
+    put("release", "3.27.5")
     put("rev", "neoterm")
-    put("proto_major", 3)
-    put("proto_minor", 14)
+    put("proto_major", 16)
+    put("proto_minor", 1)
   }
 
   private fun deviceJson(): JSONObject = JSONObject().apply {
