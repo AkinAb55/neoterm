@@ -63,6 +63,10 @@ object GpsBridge {
 
   @Volatile private var latestLocation: Location? = null
   @Volatile private var latestGnss: GnssStatus? = null
+  /** Vertical speed (m/s) derived from successive altitudes, lightly smoothed. */
+  @Volatile private var latestClimb = Double.NaN
+  @Volatile private var prevAlt = 0.0
+  @Volatile private var prevAltMillis = 0L
   /** [pdop, hdop, vdop] parsed from the latest NMEA GSA sentence, or null. */
   @Volatile private var dop: DoubleArray? = null
 
@@ -197,6 +201,16 @@ object GpsBridge {
         locationHandler = handler
 
         val listener = LocationListener { loc ->
+          // Derive vertical speed (climb) from the altitude change since the last fix; Android
+          // doesn't expose it directly. Lightly EMA-smoothed because GPS altitude is jittery.
+          if (loc.hasAltitude() && prevAltMillis > 0L) {
+            val dt = (loc.time - prevAltMillis) / 1000.0
+            if (dt in 0.05..10.0) {
+              val raw = (loc.altitude - prevAlt) / dt
+              latestClimb = if (latestClimb.isNaN()) raw else 0.5 * latestClimb + 0.5 * raw
+            }
+          }
+          if (loc.hasAltitude()) { prevAlt = loc.altitude; prevAltMillis = loc.time }
           latestLocation = loc
           broadcast(tpvJson(loc))
         }
@@ -248,6 +262,9 @@ object GpsBridge {
       latestLocation = null
       latestGnss = null
       dop = null
+      latestClimb = Double.NaN
+      prevAlt = 0.0
+      prevAltMillis = 0L
     }
   }
 
@@ -351,9 +368,22 @@ object GpsBridge {
       putNum("magtrack", ((loc.bearing.toDouble() - decl) % 360 + 360) % 360)
     }
     if (loc.hasBearingAccuracy()) putNum("epd", loc.bearingAccuracyDegrees.toDouble())
+    val climb = latestClimb
+    if (!climb.isNaN()) putNum("climb", climb)
     // ECEF position from lat/lon/alt (gpsd would otherwise derive this from the receiver).
     val ecef = geodeticToEcef(loc.latitude, loc.longitude, if (loc.hasAltitude()) loc.altitude else 0.0)
     putNum("ecefx", ecef[0]); putNum("ecefy", ecef[1]); putNum("ecefz", ecef[2])
+    // ECEF velocity: build the local ENU velocity (horizontal from speed/track, vertical from
+    // climb) and rotate it into ECEF.
+    if (loc.hasSpeed() && loc.hasBearing()) {
+      val sp = loc.speed.toDouble()
+      val tr = Math.toRadians(loc.bearing.toDouble())
+      val vE = sp * Math.sin(tr)
+      val vN = sp * Math.cos(tr)
+      val vU = if (!climb.isNaN()) climb else 0.0
+      val v = enuVelToEcef(loc.latitude, loc.longitude, vE, vN, vU)
+      putNum("ecefvx", v[0]); putNum("ecefvy", v[1]); putNum("ecefvz", v[2])
+    }
   }
 
   private fun skyJson(gnss: GnssStatus?): JSONObject = JSONObject().apply {
@@ -491,6 +521,19 @@ object GpsBridge {
       (nN + h) * cosLat * Math.cos(lon),
       (nN + h) * cosLat * Math.sin(lon),
       (nN * (1 - e2) + h) * sinLat
+    )
+  }
+
+  /** Rotate a local ENU (east, north, up) velocity into ECEF at the given geodetic position. */
+  private fun enuVelToEcef(latDeg: Double, lonDeg: Double, vE: Double, vN: Double, vU: Double): DoubleArray {
+    val lat = Math.toRadians(latDeg)
+    val lon = Math.toRadians(lonDeg)
+    val sLat = Math.sin(lat); val cLat = Math.cos(lat)
+    val sLon = Math.sin(lon); val cLon = Math.cos(lon)
+    return doubleArrayOf(
+      -sLon * vE - sLat * cLon * vN + cLat * cLon * vU,
+      cLon * vE - sLat * sLon * vN + cLat * sLon * vU,
+      cLat * vN + sLat * vU
     )
   }
 
