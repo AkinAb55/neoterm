@@ -539,6 +539,19 @@ public final class WcWidth {
     }
 
     /**
+     * Whether {@code cp} is part of the same grapheme cluster as the preceding code point
+     * {@code prevCp} and so should join its cell (rendered width 0) rather than start a new cell.
+     * Covers the common emoji cases: ZWJ sequences (family/profession emoji) and skin-tone
+     * modifiers. Both the emulator (cell storage) and the renderer (layout) use this so they
+     * agree on widths. (Regional-indicator flags are not handled here — they need pair parity.)
+     */
+    public static boolean joinsPreviousGrapheme(int prevCp, int cp) {
+        return cp == 0x200D                       // ZWJ itself attaches to the previous cell
+            || prevCp == 0x200D                    // anything immediately after a ZWJ joins
+            || (cp >= 0x1F3FB && cp <= 0x1F3FF);   // emoji skin-tone modifiers
+    }
+
+    /**
      * The zero width characters count like combining characters in the `chars` array from start
      * index to end index (exclusive).
      */
