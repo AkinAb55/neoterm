@@ -244,13 +244,17 @@ public final class TerminalBuffer {
 
         int currentOldCol = 0;
         long styleAtCol = 0;
+        int underlineColorAtCol = 0;
         for (int i = 0; i < lastNonSpaceIndex; i++) {
           // Note that looping over java character, not cells.
           char c = oldLine.mText[i];
           int codePoint = (Character.isHighSurrogate(c)) ? Character.toCodePoint(c, oldLine.mText[++i]) : c;
           int displayWidth = WcWidth.width(codePoint);
           // Use the last style if this is a zero-width character:
-          if (displayWidth > 0) styleAtCol = oldLine.getStyle(currentOldCol);
+          if (displayWidth > 0) {
+            styleAtCol = oldLine.getStyle(currentOldCol);
+            underlineColorAtCol = oldLine.getUnderlineColor(currentOldCol);
+          }
 
           // Line wrap as necessary:
           if (currentOutputExternalColumn + displayWidth > mColumns) {
@@ -267,6 +271,8 @@ public final class TerminalBuffer {
           int offsetDueToCombiningChar = ((displayWidth <= 0 && currentOutputExternalColumn > 0) ? 1 : 0);
           int outputColumn = currentOutputExternalColumn - offsetDueToCombiningChar;
           setChar(outputColumn, currentOutputExternalRow, codePoint, styleAtCol);
+          // Carry the underline colour across the reflow (setChar cleared it).
+          if (underlineColorAtCol != 0) setUnderlineColorAt(outputColumn, currentOutputExternalRow, underlineColorAtCol);
 
           if (displayWidth > 0) {
             if (oldCursorRow == externalOldRow && oldCursorColumn == currentOldCol) {
