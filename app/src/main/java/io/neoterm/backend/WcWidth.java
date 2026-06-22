@@ -529,6 +529,17 @@ public final class WcWidth {
         // combining characters with zero width
         if (intable(ZERO_WIDTH, ucs)) return 0;
 
+        // Emoji (Emoji_Presentation) are wide. The static WIDE_EASTASIAN table predates the newer
+        // emoji blocks (e.g. U+1FAC0 🫀, U+1F6B5 🚵), so without this they'd be treated as width 1
+        // and the cursor would land on the emoji's second half. Covers the main supplementary
+        // emoji ranges only (not BMP dingbats/symbols, many of which TUIs use as width 1).
+        if ((ucs >= 0x1F300 && ucs <= 0x1F64F)   // Misc Symbols & Pictographs + Emoticons
+            || (ucs >= 0x1F680 && ucs <= 0x1F6FF) // Transport & Map Symbols
+            || (ucs >= 0x1F900 && ucs <= 0x1F9FF) // Supplemental Symbols & Pictographs
+            || (ucs >= 0x1FA00 && ucs <= 0x1FAFF)) { // Symbols & Pictographs Extended-A
+            return 2;
+        }
+
         return intable(WIDE_EASTASIAN, ucs) ? 2 : 1;
     }
 
