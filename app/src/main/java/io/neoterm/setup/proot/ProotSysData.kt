@@ -214,6 +214,18 @@ unevictable_pgs_stranded 0
   )
 
   /**
+   * Újraírja a `/proc/uptime` fake-et az aktuális NeoTerm-futásidővel. A fake
+   * egy statikus fájl-bind, ezért magától nem „ketyeg"; periodikusan hívva (amíg
+   * fut terminál — lásd NeoTermService) a guest uptime-ja folyamatosan frissül.
+   * Olcsó: néhány bájt írása az app saját könyvtárába.
+   */
+  fun refreshUptime() {
+    val dir = File("${NeoTermPath.PROOT_ROOT_PATH}/sysdata")
+    if (!dir.isDirectory) return
+    runCatching { File(dir, "uptime").writeText(uptimeContent()) }
+  }
+
+  /**
    * `/proc/uptime` tartalom: a **NeoTerm futásideje** másodpercben (az app-folyamat
    * indulása óta, [App.startElapsedRealtimeMs]). Így a guest „uptime"-ja az
    * elindítása óta eltelt időt mutatja, és amikor az app teljesen leáll, a

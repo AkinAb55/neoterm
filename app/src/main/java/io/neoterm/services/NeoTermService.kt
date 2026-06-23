@@ -49,6 +49,13 @@ class NeoTermService : Service() {
   @Volatile
   private var stopping = false
 
+  // Periodikusan frissíti a fake /proc/uptime-ot, hogy a guest uptime-ja
+  // „ketyegjen" (a fake statikus fájl-bind, magától nem változna). Csak amíg a
+  // service él (azaz fut terminál) — idle-ben nincs költsége.
+  @Volatile
+  private var uptimeTickerRunning = false
+  private var uptimeThread: Thread? = null
+
   // The embedded X server runs in its own process (com.termux.x11.NeoX11Service).
   // We keep it alive by binding it with BIND_IMPORTANT, so it needs no
   // notification of its own — its status is shown in this service's notification.
@@ -63,6 +70,7 @@ class NeoTermService : Service() {
     super.onCreate()
     createNotificationChannel()
     startForeground(NOTIFICATION_ID, createNotification())
+    startUptimeTicker()
     // Wake lock on by default (keep the CPU running). Don't pop the battery-
     // optimization dialog at startup — that's only prompted on a manual acquire.
     acquireLock(promptBatteryOpt = false)
@@ -110,7 +118,25 @@ class NeoTermService : Service() {
     return Service.START_NOT_STICKY
   }
 
+  private fun startUptimeTicker() {
+    if (uptimeThread != null) return
+    uptimeTickerRunning = true
+    uptimeThread = Thread {
+      while (uptimeTickerRunning) {
+        io.neoterm.setup.proot.ProotSysData.refreshUptime()
+        try {
+          Thread.sleep(5000)
+        } catch (e: InterruptedException) {
+          break
+        }
+      }
+    }.apply { isDaemon = true; name = "uptime-ticker"; start() }
+  }
+
   override fun onDestroy() {
+    uptimeTickerRunning = false
+    uptimeThread?.interrupt()
+    uptimeThread = null
     stopForeground(true)
     runCatching {
       (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID)
