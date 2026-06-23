@@ -1,5 +1,6 @@
 package io.neoterm.setup.proot
 
+import android.os.SystemClock
 import io.neoterm.component.config.NeoTermPath
 import java.io.File
 
@@ -12,10 +13,17 @@ import java.io.File
  * (`ps`, `top`, `htop`, `uptime`, `free`, `vmstat`), hibára futnak — pl.
  * „Unable to get system boot time” (a `/proc/stat` `btime` sora miatt).
  *
- * Megoldás: statikus, valószerű tartalmú fake fájlokat írunk egy host-oldali
+ * Megoldás: valószerű tartalmú fake fájlokat írunk egy host-oldali
  * `sysdata/` könyvtárba, és proot `-b fake:/proc/...` bind-mounttal a guestbe
  * tesszük — DE csak azokra a célokra, amik a valóságban olvashatatlanok
  * (a stat esetén akkor is, ha hiányzik a `btime`).
+ *
+ * A SELinux miatt a valódi `/proc` többnyire zárt, de néhány érték kinyerhető
+ * Android API-ból `/proc` olvasása nélkül is: az `uptime` a tényleges
+ * eszköz-uptime ([SystemClock.elapsedRealtime]), a `/proc/stat` `btime` sora
+ * pedig a valódi boot-időbélyeg. Ezeket session-induláskor (minden
+ * [bindings] hívásnál) újragenráljuk, hogy a valósághoz közeli adatot adjanak
+ * — a load average-re viszont nincs Android API, az becsült marad.
  *
  * @author kiva
  */
@@ -26,7 +34,6 @@ object ProotSysData {
 
   private const val LOADAVG = "0.12 0.07 0.02 2/165 765\n"
   private const val OVERFLOW_ID = "65534\n"
-  private const val UPTIME = "124.08 932.80\n"
   private const val CAP_LAST_CAP = "40\n"
   private const val MAX_USER_WATCHES = "4096\n"
 
@@ -161,30 +168,58 @@ unevictable_pgs_stranded 0
     val dir = File("${NeoTermPath.PROOT_ROOT_PATH}/sysdata")
     dir.mkdirs()
 
-    // real /proc cél, sysdata fájlnév, tartalom
+    // real /proc cél, sysdata fájlnév, tartalom, dinamikus-e (minden indításnál újraírjuk)
     val entries = listOf(
-      Triple("/proc/loadavg", "loadavg", LOADAVG),
-      Triple("/proc/stat", "stat", STAT),
-      Triple("/proc/uptime", "uptime", UPTIME),
-      Triple("/proc/version", "version", VERSION),
-      Triple("/proc/vmstat", "vmstat", VMSTAT),
-      Triple("/proc/sys/kernel/cap_last_cap", "sysctl_entry_cap_last_cap", CAP_LAST_CAP),
-      Triple("/proc/sys/fs/inotify/max_user_watches", "sysctl_inotify_max_user_watches", MAX_USER_WATCHES),
-      Triple("/proc/sys/kernel/overflowuid", "sysctl_kernel_overflowuid", OVERFLOW_ID),
-      Triple("/proc/sys/kernel/overflowgid", "sysctl_kernel_overflowgid", OVERFLOW_ID)
+      Entry("/proc/loadavg", "loadavg", LOADAVG, dynamic = false),
+      Entry("/proc/stat", "stat", statContent(), dynamic = true),
+      Entry("/proc/uptime", "uptime", uptimeContent(), dynamic = true),
+      Entry("/proc/version", "version", VERSION, dynamic = false),
+      Entry("/proc/vmstat", "vmstat", VMSTAT, dynamic = false),
+      Entry("/proc/sys/kernel/cap_last_cap", "sysctl_entry_cap_last_cap", CAP_LAST_CAP, dynamic = false),
+      Entry("/proc/sys/fs/inotify/max_user_watches", "sysctl_inotify_max_user_watches", MAX_USER_WATCHES, dynamic = false),
+      Entry("/proc/sys/kernel/overflowuid", "sysctl_kernel_overflowuid", OVERFLOW_ID, dynamic = false),
+      Entry("/proc/sys/kernel/overflowgid", "sysctl_kernel_overflowgid", OVERFLOW_ID, dynamic = false)
     )
 
     val binds = ArrayList<Pair<String, String>>(entries.size)
-    for ((real, name, content) in entries) {
-      val fake = File(dir, name)
-      if (!fake.exists()) {
-        runCatching { fake.writeText(content) }
+    for (e in entries) {
+      val fake = File(dir, e.name)
+      // A dinamikus fájlokat (uptime, stat) minden session-indításnál frissítjük,
+      // hogy a valódi eszköz-uptime-ot / boot-időt tükrözzék; a statikusakat csak egyszer.
+      if (e.dynamic || !fake.exists()) {
+        runCatching { fake.writeText(e.content) }
       }
-      if (fake.exists() && needsFake(real)) {
-        binds.add(fake.absolutePath to real)
+      if (fake.exists() && needsFake(e.real)) {
+        binds.add(fake.absolutePath to e.real)
       }
     }
     return binds
+  }
+
+  private data class Entry(
+    val real: String,
+    val name: String,
+    val content: String,
+    val dynamic: Boolean
+  )
+
+  /**
+   * Valós `/proc/uptime` tartalom Android API-ból: első mező az eszköz tényleges
+   * uptime-ja másodpercben ([SystemClock.elapsedRealtime], mély alvással együtt),
+   * a második az idle-idő közelítése (uptime × magszám). A fájl statikus, így a
+   * session indulásakor pontos, és menet közben nem „ketyeg" tovább.
+   */
+  private fun uptimeContent(): String {
+    val up = SystemClock.elapsedRealtime() / 1000.0
+    val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+    val idle = up * cores * 0.93
+    return "%.2f %.2f\n".format(up, idle)
+  }
+
+  /** A `/proc/stat` valódi `btime` (boot epoch) sorral — a beégetett dátum helyett. */
+  private fun statContent(): String {
+    val btime = (System.currentTimeMillis() - SystemClock.elapsedRealtime()) / 1000
+    return STAT.replace(Regex("(?m)^btime .*$"), "btime $btime")
   }
 
   /** A valós /proc cél olvashatatlan/hiányos → fake kell. */
