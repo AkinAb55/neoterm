@@ -19,8 +19,10 @@ import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import io.neoterm.backend.Pty
 import io.neoterm.component.config.NeoPreference
+import io.neoterm.component.config.NeoTermPath
 import io.neoterm.setup.proot.Kmsg
 import io.neoterm.utils.NLog
+import java.io.File
 
 /**
  * USB-serial bridge with proper hotplug. /dev/ttyUSB<n> is a VIRTUAL port: the
@@ -41,7 +43,9 @@ object UsbSerialBridge {
   private const val POOL = 4
   private const val TAG = "UsbSerial"
 
-  private class Slot(val ttyName: String) {
+  private val sysBase = File("${NeoTermPath.PROOT_ROOT_PATH}/ttyusb-sys")
+
+  private class Slot(val ttyName: String, val index: Int) {
     @Volatile var running = false
     var deviceName: String? = null
     var port: UsbSerialPort? = null
@@ -55,7 +59,7 @@ object UsbSerialBridge {
     var lastModemLogMs = 0L
   }
 
-  private val slots = Array(POOL) { Slot("ttyUSB$it") }
+  private val slots = Array(POOL) { Slot("ttyUSB$it", it) }
   private var controlServer: LocalServerSocket? = null
   @Volatile private var started = false
 
@@ -140,6 +144,7 @@ object UsbSerialBridge {
     slot.conn = conn
     slot.dtr = false; slot.rts = false; slot.lastParams = null; slot.running = true
     startPump(slot, slot.pfd!!)
+    writeSysfs(slot, device)
     val product = runCatching { device.productName }.getOrNull()?.takeIf { it.isNotBlank() } ?: ""
     Kmsg.log("usb-serial: ${slot.ttyName} <- $id ${product.ifEmpty { driver.javaClass.simpleName }} (${driver.javaClass.simpleName}) @9600 8N1")
     NLog.e(TAG, "attached ${slot.ttyName} ($id)")
@@ -169,6 +174,7 @@ object UsbSerialBridge {
     runCatching { slot.port?.close() }
     runCatching { slot.conn?.close() }
     runCatching { slot.pfd?.close() }   // -> guest read returns EOF
+    deleteRec(File(sysBase, slot.ttyName))
     slot.port = null
     slot.conn = null
     slot.pfd = null
@@ -203,6 +209,11 @@ object UsbSerialBridge {
       "LIST" -> {
         val active = synchronized(this) { slots.filter { it.slavePath != null }.map { it.ttyName } }
         reply(if (active.isEmpty()) "-" else active.joinToString(" "))
+      }
+      "SYSPATH" -> {
+        val tty = parts.getOrNull(1)
+        val slot = synchronized(this) { slots.firstOrNull { it.ttyName == tty && it.deviceName != null } }
+        reply(if (slot != null) File(sysBase, slot.ttyName).absolutePath else "NAK")
       }
       "GET", "SET", "BIS", "BIC", "BRK" -> handleModem(parts, ::reply)
       else -> reply("NAK")
@@ -317,5 +328,40 @@ object UsbSerialBridge {
     val pc = "NOEMS"[p[3].coerceIn(0, 4)]
     val flow = when (p[4]) { 1 -> "rts/cts"; 2 -> "xon/xoff"; else -> "none" }
     Kmsg.log("usb-serial: ${slot.ttyName} set ${p[0]} ${p[1]}$pc${p[2]} flow=$flow${if (ok) "" else " (FAILED)"}")
+  }
+
+  // ── fake sysfs (/sys/class/tty/ttyUSB*) for pyserial / esptool enumeration ──
+  // The proot redirect maps /sys/class/tty/ttyUSB<n>[/...] to this host tree
+  // (queried via "SYSPATH"), and getdents injects the names into /sys/class/tty.
+  private fun writeSysfs(slot: Slot, device: UsbDevice) {
+    runCatching {
+      val dir = File(sysBase, slot.ttyName)
+      deleteRec(dir)
+      val dev = File(dir, "device").apply { mkdirs() }
+      val vid = "%04x".format(device.vendorId)
+      val pid = "%04x".format(device.productId)
+      val product = runCatching { device.productName }.getOrNull()?.takeIf { it.isNotBlank() } ?: "USB Serial"
+      val manuf = runCatching { device.manufacturerName }.getOrNull() ?: ""
+      val serial = runCatching { device.serialNumber }.getOrNull() ?: ""
+      File(dir, "dev").writeText("188:${slot.index}\n")
+      File(dir, "uevent").writeText("MAJOR=188\nMINOR=${slot.index}\nDEVNAME=${slot.ttyName}\n")
+      // Write the identifying attributes at both levels — pyserial reads them from
+      // slightly different places depending on its version.
+      for (base in arrayOf(dir, dev)) {
+        File(base, "idVendor").writeText("$vid\n")
+        File(base, "idProduct").writeText("$pid\n")
+        File(base, "product").writeText("$product\n")
+        File(base, "manufacturer").writeText("$manuf\n")
+        File(base, "serial").writeText("$serial\n")
+      }
+      File(dev, "uevent").writeText("DEVTYPE=usb_interface\nPRODUCT=$vid/$pid\n")
+      // subsystem symlink whose basename is "usb" -> pyserial treats it as a USB port.
+      runCatching { Os.symlink("/sys/bus/usb", File(dev, "subsystem").absolutePath) }
+    }.onFailure { NLog.e(TAG, "sysfs gen: ${it.message}") }
+  }
+
+  private fun deleteRec(f: File) {
+    if (f.isDirectory) f.listFiles()?.forEach { deleteRec(it) }
+    runCatching { f.delete() }
   }
 }
