@@ -175,8 +175,12 @@ final class TerminalRenderer {
         final int codePoint = charIsHighsurrogate ? Character.toCodePoint(charAtIndex, line[currentCharIndex + 1]) : charAtIndex;
         int codePointWcWidth = WcWidth.width(codePoint);
         // VS16 (U+FE0F) right after a width-1 base makes it emoji-presentation,
-        // width 2 — match the emulator's cursor model (see emitCodePoint).
-        if (codePointWcWidth == 1 && followedByVs16(line, currentCharIndex + charsForCodePoint, charsUsedInLine)) {
+        // width 2 — match the emulator's cursor model (see emitCodePoint). It also
+        // means Android renders the cell with the colour emoji font, so it must be
+        // treated as an emoji below even when the user font has the base text glyph.
+        final boolean hasVs16 = codePointWcWidth == 1
+          && followedByVs16(line, currentCharIndex + charsForCodePoint, charsUsedInLine);
+        if (hasVs16) {
           codePointWcWidth = 2;
         }
         final boolean insideCursor = (column >= selx1 && column <= selx2) || (cursorX == column || (codePointWcWidth == 2 && cursorX == column + 1));
@@ -195,16 +199,18 @@ final class TerminalRenderer {
         // into the exact cell, gap-free, instead of using the font glyph.
         final boolean lineDraw = codePointWcWidth > 0 && LineBlockCharacters.canDraw(codePoint);
         final boolean missingGlyph = !lineDraw && codePointWcWidth > 0 && !fontHasGlyph(codePoint);
-        // Colour emoji (drawn via the system emoji font) get their own run, so each is scaled and
-        // clipped to its own cell box. Noto draws some emoji (e.g. the ♀/♂ gender signs) with ink
-        // wider than their advance; sharing a run would let that ink overlap the next emoji.
-        final boolean emoji = missingGlyph && isEmojiCodepoint(codePoint);
+        // Colour emoji (drawn via the system emoji font) get their own run, drawn with the emoji
+        // typeface and clipped to their own cell box. Noto draws some emoji (e.g. the ♀/♂ gender
+        // signs) with ink wider than their advance; sharing a run, or not clipping, lets that ink
+        // overlap the next glyph. A VS16 (hasVs16) forces emoji presentation even when the user
+        // font has the base text glyph (so missingGlyph would be false) — it must count as emoji.
+        final boolean emoji = hasVs16 || (missingGlyph && isEmojiCodepoint(codePoint));
         // For a present glyph use the real measured width (so non-monospace and
         // wide glyphs are scaled to their cell); for a missing one the user font's
         // measure is meaningless (often the .notdef/tofu advance, sometimes 0), so
         // use the expected cell width — the real width comes from the fallback font.
         // Line-draw glyphs use the exact cell width so they aren't scaled.
-        final float measuredCodePointWidth = (missingGlyph || lineDraw) ? (codePointWcWidth * mFontWidth)
+        final float measuredCodePointWidth = (missingGlyph || lineDraw || emoji) ? (codePointWcWidth * mFontWidth)
           : (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint]
           : mTextPaint.measureText(line, currentCharIndex, charsForCodePoint);
         final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
@@ -218,7 +224,7 @@ final class TerminalRenderer {
             int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun,
               lastRunStartIndex, charsSinceLastRun, measuredWidthForRun,
-              cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor, lastRunLineDraw);
+              cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor, lastRunLineDraw, lastRunEmoji);
           }
           measuredWidthForRun = 0.f;
           lastRunStyle = style;
@@ -257,7 +263,7 @@ final class TerminalRenderer {
       final int charsSinceLastRun = currentCharIndex - lastRunStartIndex;
       int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
       drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
-        measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor, lastRunLineDraw);
+        measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor, lastRunLineDraw, lastRunEmoji);
 
       // Inline image (Sixel) cells: drawTextRun skips them, so draw their bitmap
       // tiles here over the (blank) cells. Only when images exist on screen.
@@ -426,7 +432,7 @@ final class TerminalRenderer {
   private void drawTextRun(Canvas canvas, char[] text, int[] palette, float y, int startColumn, int runWidthColumns,
                            int startCharIndex, int runWidthChars, float mes, int cursor, int cursorStyle,
                            long textStyle, boolean reverseVideo, boolean forceUnderline, boolean fallbackFont,
-                           int underlineColor, boolean lineDraw) {
+                           int underlineColor, boolean lineDraw, boolean emoji) {
     // Inline image cells are drawn separately (drawImageCells); skip them here so
     // their packed image id isn't misread as colours.
     if (TextStyle.isImage(textStyle)) return;
@@ -460,18 +466,16 @@ final class TerminalRenderer {
       backColor = tmp;
     }
 
-    // For runs drawn with the fallback font, switch the typeface now and measure
-    // with it so the scale-to-fit below uses the fallback glyphs' real advances.
-    // (Measuring against the user font, whose glyph the run lacks, would mis-scale
-    // it.) The typeface is restored at the end of the method.
-    if (fallbackFont) {
-      // Emoji (incl. ZWJ clusters / skin-tone) must use the system font, which has the colour
-      // emoji font and shapes the cluster into one glyph; the bundled symbol font (monochrome
-      // Unifont) can't and would render blank. Other missing glyphs use the symbol fallback.
+    // Runs drawn with a non-user typeface: switch it now and re-measure so the scale-to-fit below
+    // uses the real glyph advances. Emoji runs (incl. VS16 emoji-presentation, ZWJ clusters and
+    // skin-tone) use the system font's colour emoji; other missing glyphs use the bundled symbol
+    // font. The typeface is restored at the end of the method.
+    final boolean nonUserTypeface = fallbackFont || emoji;
+    if (nonUserTypeface) {
       char fc = text[startCharIndex];
       int firstCp = (Character.isHighSurrogate(fc) && startCharIndex + 1 < text.length)
         ? Character.toCodePoint(fc, text[startCharIndex + 1]) : fc;
-      mTextPaint.setTypeface(isEmojiCodepoint(firstCp) ? Typeface.DEFAULT : sFallbackTypeface);
+      mTextPaint.setTypeface((emoji || isEmojiCodepoint(firstCp)) ? Typeface.DEFAULT : sFallbackTypeface);
       float fallbackMeasured = mTextPaint.measureText(text, startCharIndex, runWidthChars);
       if (fallbackMeasured > 0f) mes = fallbackMeasured;
     }
@@ -559,7 +563,7 @@ final class TerminalRenderer {
       // painted gap-free by us instead of using the (often misaligned) font glyph.
       if (lineDraw) {
         drawLineDrawRun(canvas, text, startCharIndex, runWidthChars, startColumn, y, foreColor, bold);
-      } else if (fallbackFont) {
+      } else if (nonUserTypeface) {
         // Confine the (often over-wide) fallback/emoji glyph ink to this run's cells so it can't
         // bleed over the neighbouring glyph. Each emoji is its own run (see the 'emoji' flag).
         canvas.save();
@@ -577,7 +581,7 @@ final class TerminalRenderer {
       }
     }
 
-    if (fallbackFont) mTextPaint.setTypeface(mTypeface);
+    if (nonUserTypeface) mTextPaint.setTypeface(mTypeface);
     if (savedMatrix) canvas.restore();
   }
 
