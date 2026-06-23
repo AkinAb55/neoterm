@@ -4,6 +4,7 @@ import android.os.SystemClock
 import io.neoterm.App
 import io.neoterm.component.config.NeoTermPath
 import java.io.File
+import java.util.Locale
 
 /**
  * Fake `/proc` (és néhány `/proc/sys`) tartalom a proot guest számára — a
@@ -230,7 +231,10 @@ unevictable_pgs_stranded 0
     val up = upMs / 1000.0
     val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
     val idle = up * cores * 0.93
-    return "%.2f %.2f\n".format(up, idle)
+    // FONTOS: Locale.ROOT → tizedespont. A default (pl. magyar) locale vesszőt adna
+    // ("0,32"), amit a /proc/uptime-ot olvasó eszközök (uptime, top, free, dmesg)
+    // nem tudnak számként értelmezni → "Cannot get system uptime".
+    return String.format(Locale.ROOT, "%.2f %.2f\n", up, idle)
   }
 
   /**
