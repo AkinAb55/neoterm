@@ -572,11 +572,13 @@ final class TerminalRenderer {
     int charIndex = startCharIndex;
     int column = startColumn;
     while (charIndex < end) {
-      final int codePoint = text[charIndex]; // canDraw range is BMP, never a surrogate
+      final char c = text[charIndex];
+      final boolean highSurrogate = Character.isHighSurrogate(c); // Legacy Computing is astral
+      final int codePoint = highSurrogate ? Character.toCodePoint(c, text[charIndex + 1]) : c;
       final int cellLeft = Math.round(column * mFontWidth);
       final int cellW = Math.round((column + 1) * mFontWidth) - cellLeft;
       LineBlockCharacters.draw(canvas, mLinePaint, cellLeft, cellTop, cellW, cellH, codePoint, bold);
-      charIndex++;
+      charIndex += highSurrogate ? 2 : 1;
       column++;
       while (charIndex < end && WcWidth.width(text, charIndex) <= 0) {
         charIndex += Character.isHighSurrogate(text[charIndex]) ? 2 : 1;

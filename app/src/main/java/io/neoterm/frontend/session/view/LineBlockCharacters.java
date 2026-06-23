@@ -25,9 +25,11 @@ final class LineBlockCharacters {
 
   private LineBlockCharacters() {}
 
-  /** Whether {@link #draw} can render this code point (the two solid-shape blocks). */
+  /** Whether {@link #draw} can render this code point (Box/Block, Braille, Legacy Computing). */
   static boolean canDraw(int ucs4) {
-    return (0x2500 <= ucs4 && ucs4 <= 0x259F) || (0x2800 <= ucs4 && ucs4 <= 0x28FF);
+    return (0x2500 <= ucs4 && ucs4 <= 0x259F)
+      || (0x2800 <= ucs4 && ucs4 <= 0x28FF)
+      || (0x1FB00 <= ucs4 && ucs4 <= 0x1FB8B);
   }
 
   // Line types, packed two bits per side. Order matches Konsole's enum.
@@ -59,6 +61,10 @@ final class LineBlockCharacters {
    * caller). {@code bold} thickens the strokes.
    */
   static void draw(Canvas canvas, Paint paint, int x, int y, int w, int h, int chr, boolean bold) {
+    if (chr >= 0x1FB00) {
+      drawLegacy(canvas, paint, x, y, w, h, chr - 0x1FB00 + 0x100);
+      return;
+    }
     if (chr >= 0x2800) {
       drawBraille(canvas, paint, x, y, w, h, chr - 0x2800);
       return;
@@ -503,6 +509,118 @@ final class LineBlockCharacters {
     paint.setColor((color & 0x00FFFFFF) | (alpha << 24));
     canvas.drawRect(x, y, x + w, y + h, paint);
     paint.setColor(color);
+  }
+
+  // -- Legacy Computing symbols (U+1FB00..U+1FB8B) ----------------------------
+  // Sextants, smooth mosaics, eighth blocks. {@code code} is the offset from
+  // U+1FB00 plus 0x100 (matching Konsole's drawLegacyCharacter indexing).
+
+  /** Smooth-mosaic vertex strings (U+1FB3C..U+1FB6F); digits index the 13 mosaic points. */
+  private static final String[] MOSAICS = {
+    "014",   "018",   "024",   "028",   "034",  "027;8", "02;8",  "017;8",
+    "01;8",  "07;8",  "01:8",  "498",   "098",  "4:8",   "0:8",   "4;8",
+    "037:8", "03:8",  "03798", "0398",  "0378", "0298",  "13;84", "13;8",
+    "23;84", "23;8",  "3;84",  "237",   "23;",  "137",   "13;",   "037",
+    "13;:",  "03;94", "03;9",  "03;:4",
+    "03;:",  "03;4",  "7;:",   "3;:",   "7;9",  "3;9",   "7;8",   "23;9",
+    "0<3;8", "03<;8", "03;<8", "03;8<", "03<",  "3;<",   "<;8",   "0<8",
+  };
+
+  private static void addR(Path p, double l, double t, double width, double height) {
+    p.addRect((float) l, (float) t, (float) (l + width), (float) (t + height), Path.Direction.CW);
+  }
+
+  private static void drawLegacy(Canvas canvas, Paint paint, int x, int y, int w, int h, int code) {
+    paint.setStyle(Paint.Style.FILL);
+    final Path path = new Path();
+
+    if (code >= 0x13C && code <= 0x16F) {
+      // Smooth mosaic terminal graphic characters: a polygon over 13 fixed points.
+      final double[][] pts = new double[13][2];
+      for (int i = 0; i < 12; i++) {
+        pts[i][0] = x + (i >> 2) * w / 2.0;
+        pts[i][1] = y + (3 - (i & 3)) * h / 3.0;
+      }
+      pts[12][0] = x + w / 2.0;
+      pts[12][1] = y + h / 2.0;
+      final String s = MOSAICS[code - 0x13C];
+      for (int i = 0; i < s.length(); i++) {
+        final int idx = s.charAt(i) - '0';
+        if (i == 0) path.moveTo((float) pts[idx][0], (float) pts[idx][1]);
+        else path.lineTo((float) pts[idx][0], (float) pts[idx][1]);
+      }
+      path.close();
+      canvas.drawPath(path, paint);
+      return;
+    }
+    if (code >= 0x170 && code <= 0x175) { // vertical eighths
+      addR(path, x + (code - 0x16F) * w / 8.0, y, w / 8.0, h);
+      canvas.drawPath(path, paint);
+      return;
+    }
+    if (code >= 0x176 && code <= 0x17B) { // horizontal eighths
+      addR(path, x, y + (code - 0x175) * h / 8.0, w, h / 8.0);
+      canvas.drawPath(path, paint);
+      return;
+    }
+    if (code >= 0x17C && code <= 0x17F) { // corner (L-shaped) eighths
+      double y1 = y, y2 = y;
+      if (code == 0x17C || code == 0x17F) y1 += 7 * h / 8.0;
+      else y2 += h / 8.0;
+      double x1 = x;
+      if (code > 0x17D) x1 += 7 * w / 8.0;
+      addR(path, x, y1, w, h / 8.0);
+      addR(path, x1, y2, w / 8.0, 7 * h / 8.0);
+      canvas.drawPath(path, paint);
+      return;
+    }
+    if (code == 0x180) { // horizontal eighths 1 & 8
+      addR(path, x, y, w, h / 8.0);
+      addR(path, x, y + 7 * h / 8.0, w, h / 8.0);
+      canvas.drawPath(path, paint);
+      return;
+    }
+    if (code == 0x181) { // horizontal eighths 1,3,5,8
+      addR(path, x, y, w, h / 8.0);
+      addR(path, x, y + 2 * h / 8.0, w, h / 8.0);
+      addR(path, x, y + 4 * h / 8.0, w, h / 8.0);
+      addR(path, x, y + 7 * h / 8.0, w, h / 8.0);
+      canvas.drawPath(path, paint);
+      return;
+    }
+    if (code >= 0x182 && code <= 0x186) { // upper 2,3,5,6,7 eighths
+      final int[] hs = {2, 3, 5, 6, 7};
+      addR(path, x, y, w, hs[code - 0x182] * h / 8.0);
+      canvas.drawPath(path, paint);
+      return;
+    }
+    if (code >= 0x187 && code <= 0x18B) { // right 2,3,5,6,7 eighths
+      final int[] hs = {2, 3, 5, 6, 7};
+      final int e = hs[code - 0x187];
+      addR(path, x + (8 - e) * w / 8.0, y, e * w / 8.0, h);
+      canvas.drawPath(path, paint);
+      return;
+    }
+
+    // Sextants: the 2×3 block grid. The unified glyphs (full/empty/half blocks that
+    // coincide with Block Elements) are skipped in Unicode, so reindex to a packed
+    // 6-bit value, exactly as Konsole does.
+    if (code >= 0x128) code += 1;
+    if (code >= 0x114) code += 1;
+    code += 1;
+
+    if (code <= 0x13F) {
+      final double thirdH = h / 3.0;
+      final double halfW = w / 2.0;
+      final double cx = x + halfW;
+      if ((code & 0x01) != 0) addR(path, x, y, halfW, thirdH);                  // upper-left
+      if ((code & 0x02) != 0) addR(path, cx, y, halfW, thirdH);                 // upper-right
+      if ((code & 0x04) != 0) addR(path, x, y + thirdH, halfW, thirdH);         // mid-left
+      if ((code & 0x08) != 0) addR(path, cx, y + thirdH, halfW, thirdH);        // mid-right
+      if ((code & 0x10) != 0) addR(path, x, y + 2 * thirdH, halfW, thirdH);     // lower-left
+      if ((code & 0x20) != 0) addR(path, cx, y + 2 * thirdH, halfW, thirdH);    // lower-right
+      canvas.drawPath(path, paint);
+    }
   }
 
   // -- Braille (U+2800..U+28FF): 2×4 dot matrix -------------------------------
