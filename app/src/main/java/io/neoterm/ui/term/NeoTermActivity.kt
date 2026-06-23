@@ -18,6 +18,9 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.ColorUtils
 import androidx.core.view.OnApplyWindowInsetsListener
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.viewpager2.widget.ViewPager2
 import io.neoterm.BuildConfig
 import io.neoterm.R
@@ -139,12 +142,10 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
     val fullscreen = NeoPreference.isFullScreenEnabled()
-    if (fullscreen) {
-      window.setFlags(
-        WindowManager.LayoutParams.FLAG_FULLSCREEN,
-        WindowManager.LayoutParams.FLAG_FULLSCREEN
-      )
-    }
+    // Full screen is applied via the window insets controller (see applyImmersiveMode), which
+    // hides both the status AND navigation bars and is re-asserted in onWindowFocusChanged so it
+    // sticks. The deprecated FLAG_FULLSCREEN only hid the status bar and didn't take effect until
+    // a relayout (e.g. returning from recents).
 
     setContentView(R.layout.ui_main)
 
@@ -177,6 +178,8 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     updateOffscreenPageLimit()
     ViewCompat.setOnApplyWindowInsetsListener(viewPager, createWindowInsetsListener())
     viewPager.registerOnPageChangeCallback(pageChangeCallback)
+
+    applyImmersiveMode(fullscreen)
 
     val serviceIntent = Intent(this, NeoTermService::class.java)
     startService(serviceIntent)
@@ -556,6 +559,9 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     val tab = selectedTab
     tab?.onWindowFocusChanged(hasFocus)
     if (hasFocus) {
+      // The system reveals the bars again on every focus regain (keyboard, recents, dialogs),
+      // so re-assert full screen here to keep them hidden.
+      if (NeoPreference.isFullScreenEnabled()) applyImmersiveMode(true)
       raiseKeyboardForSelectedTab()
       // Re-measure + redraw the active terminal whenever the window regains
       // focus. This is exactly what makes returning from recents recover a
@@ -1025,7 +1031,25 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       tab.onFullScreenModeChanged(fullScreen)
     }
     NeoPreference.store(R.string.key_ui_fullscreen, fullScreen)
-    this@NeoTermActivity.recreate()
+    // Apply immediately (no activity recreate needed) so the toggle takes effect at once.
+    applyImmersiveMode(fullScreen)
+  }
+
+  /**
+   * Hide or show the system bars (status AND navigation) for full screen mode, via the window
+   * insets controller. Uses the transient-by-swipe behaviour so the user can still swipe the bars
+   * in temporarily. Re-asserted from onWindowFocusChanged because the system reveals the bars again
+   * whenever the window loses and regains focus (keyboard, recents, dialogs).
+   */
+  private fun applyImmersiveMode(fullScreen: Boolean) {
+    val controller = WindowCompat.getInsetsController(window, window.decorView)
+    controller.systemBarsBehavior =
+      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    if (fullScreen) {
+      controller.hide(WindowInsetsCompat.Type.systemBars())
+    } else {
+      controller.show(WindowInsetsCompat.Type.systemBars())
+    }
   }
 
   private fun showProfileDialog() {
