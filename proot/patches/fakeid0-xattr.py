@@ -434,4 +434,100 @@ if 'uknl_modem_call' not in s:
     s = s.replace(anchor_case, new_case, 1)
     wr(EN, s)
 
+# ---- extension/hidden_files/hidden_files.c: inject the active /dev/ttyUSB*
+#      entries at the EOF of a getdents on /dev, so glob (ls /dev/ttyUSB*) and
+#      enumeration find the virtual hotplug ports. Reuses this extension's
+#      linux_dirent64 + readlink_proc_pid_fd; only acts on the /dev directory. ----
+HF = ROOT + "/extension/hidden_files/hidden_files.c"; s = rd(HF)
+if 'uknl_maybe_inject_ttyusb' not in s:
+    must('#include "path/path.h"' in s, "hidden_files path.h include")
+    s = s.replace('#include "path/path.h"',
+                  '#include "path/path.h"\n'
+                  '#include <sys/socket.h>\n#include <sys/un.h>\n#include <sys/time.h>\n'
+                  '#include <unistd.h>\n#include <string.h>\n#include <stddef.h>\n'
+                  '#include <stdbool.h>\n', 1)
+    helpers = (
+        '/* NeoTerm: one request/reply to the app-side usb-serial server. */\n'
+        'static bool uknl_query(const char *req, char *resp, size_t resp_sz)\n'
+        '{\n'
+        '\tint s = socket(AF_UNIX, SOCK_STREAM, 0);\n'
+        '\tif (s < 0)\n\t\treturn false;\n'
+        '\tstruct timeval tv = { .tv_sec = 1, .tv_usec = 0 };\n'
+        '\tsetsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);\n'
+        '\tsetsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);\n'
+        '\tstruct sockaddr_un a;\n\tmemset(&a, 0, sizeof a);\n\ta.sun_family = AF_UNIX;\n'
+        '\tconst char *name = "io.neoterm.ttyusb";\n'
+        '\ta.sun_path[0] = \'\\0\';\n'
+        '\tstrncpy(a.sun_path + 1, name, sizeof(a.sun_path) - 2);\n'
+        '\tsocklen_t len = sizeof(a.sun_family) + 1 + strlen(name);\n'
+        '\tif (connect(s, (struct sockaddr *) &a, len) < 0) {\n\t\tclose(s);\n\t\treturn false;\n\t}\n'
+        '\tsize_t rl = strlen(req);\n'
+        '\tbool ok = write(s, req, rl) == (ssize_t) rl;\n'
+        '\tssize_t n = ok ? read(s, resp, resp_sz - 1) : -1;\n'
+        '\tclose(s);\n'
+        '\tif (n <= 0)\n\t\treturn false;\n'
+        '\tresp[n] = \'\\0\';\n'
+        '\twhile (n > 0 && (resp[n - 1] == \'\\n\' || resp[n - 1] == \'\\r\'))\n\t\tresp[--n] = \'\\0\';\n'
+        '\treturn true;\n}\n\n'
+        '/* per-(pid,fd) "already injected at EOF" flags */\n'
+        '#define UKNL_MAXSET 64\n'
+        'static struct { int pid; int fd; } uknl_inj[UKNL_MAXSET];\n'
+        'static int uknl_inj_n = 0;\n'
+        'static bool uknl_inj_has(int pid, int fd)\n{\n'
+        '\tfor (int i = 0; i < uknl_inj_n; i++)\n\t\tif (uknl_inj[i].pid == pid && uknl_inj[i].fd == fd) return true;\n'
+        '\treturn false;\n}\n'
+        'static void uknl_inj_add(int pid, int fd)\n{\n'
+        '\tif (uknl_inj_has(pid, fd)) return;\n'
+        '\tif (uknl_inj_n < UKNL_MAXSET) { uknl_inj[uknl_inj_n].pid = pid; uknl_inj[uknl_inj_n].fd = fd; uknl_inj_n++; }\n}\n'
+        'static void uknl_inj_del(int pid, int fd)\n{\n'
+        '\tfor (int i = 0; i < uknl_inj_n; i++)\n\t\tif (uknl_inj[i].pid == pid && uknl_inj[i].fd == fd) { uknl_inj[i] = uknl_inj[--uknl_inj_n]; return; }\n}\n\n'
+        'static size_t uknl_put_dirent64(char *buf, size_t avail, const char *name,\n'
+        '\t\tunsigned long long ino, long long off)\n{\n'
+        '\tsize_t nl = strlen(name);\n'
+        '\tsize_t reclen = (offsetof(struct linux_dirent64, d_name) + nl + 1 + 7) & ~(size_t) 7;\n'
+        '\tif (reclen > avail) return 0;\n'
+        '\tstruct linux_dirent64 *d = (struct linux_dirent64 *) buf;\n'
+        '\td->d_ino = ino;\n\td->d_off = off;\n\td->d_reclen = (unsigned short) reclen;\n'
+        '\td->d_type = 2; /* DT_CHR */\n'
+        '\tmemcpy(d->d_name, name, nl + 1);\n'
+        '\tfor (size_t i = offsetof(struct linux_dirent64, d_name) + nl + 1; i < reclen; i++) buf[i] = 0;\n'
+        '\treturn reclen;\n}\n\n'
+        '/* Append the active ttyUSB ports at the EOF of a getdents64 on /dev. */\n'
+        'static bool uknl_maybe_inject_ttyusb(Tracee *tracee, int res)\n{\n'
+        '\tif (get_sysnum(tracee, ORIGINAL) != PR_getdents64)\n\t\treturn false;\n'
+        '\tint fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);\n'
+        '\tchar path[PATH_MAX];\n'
+        '\tif (readlink_proc_pid_fd(tracee->pid, fd, path) < 0)\n\t\treturn false;\n'
+        '\tif (strcmp(path, "/dev") != 0)\n\t\treturn false;\n'
+        '\tif (res > 0) { uknl_inj_del(tracee->pid, fd); return false; }\n'
+        '\tif (res != 0)\n\t\treturn false;\n'
+        '\tif (uknl_inj_has(tracee->pid, fd))\n\t\treturn false;\n'
+        '\tchar list[256];\n'
+        '\tif (!uknl_query("LIST\\n", list, sizeof list)) return false;\n'
+        '\tif (list[0] == \'\\0\' || list[0] == \'-\') { uknl_inj_add(tracee->pid, fd); return false; }\n'
+        '\tword_t buf_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);\n'
+        '\tunsigned int count = peek_reg(tracee, ORIGINAL, SYSARG_3);\n'
+        '\tchar out[1024];\n\tsize_t off = 0;\n\tunsigned long long ino = 0x7574620000ULL;\n'
+        '\tchar *save = NULL;\n'
+        '\tfor (char *tok = strtok_r(list, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {\n'
+        '\t\tif (tok[0] == \'\\0\') continue;\n'
+        '\t\tsize_t r = uknl_put_dirent64(out + off, sizeof(out) - off, tok, ino++, (long long)(0x7f000000 + off));\n'
+        '\t\tif (r == 0) break;\n\t\toff += r;\n\t}\n'
+        '\tif (off == 0 || off > count) { uknl_inj_add(tracee->pid, fd); return false; }\n'
+        '\tif (write_data(tracee, buf_addr, out, off) < 0) return false;\n'
+        '\tpoke_reg(tracee, SYSARG_RESULT, off);\n'
+        '\tuknl_inj_add(tracee->pid, fd);\n'
+        '\treturn true;\n}\n\n')
+    anchor_hf = 'static int handle_getdents(Tracee *tracee)\n{'
+    must(anchor_hf in s, "hidden_files handle_getdents anchor")
+    s = s.replace(anchor_hf, helpers + anchor_hf, 1)
+    anchor_res = ('        unsigned int res = peek_reg(tracee, CURRENT, SYSARG_RESULT);\n'
+                  '        if (res <= 0) {')
+    must(anchor_res in s, "hidden_files res anchor")
+    s = s.replace(anchor_res,
+                  '        unsigned int res = peek_reg(tracee, CURRENT, SYSARG_RESULT);\n'
+                  '        if (uknl_maybe_inject_ttyusb(tracee, (int) res))\n            return 0;\n'
+                  '        if (res <= 0) {', 1)
+    wr(HF, s)
+
 print("ALL PATCHES APPLIED OK")
