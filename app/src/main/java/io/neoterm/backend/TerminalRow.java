@@ -97,6 +97,24 @@ public final class TerminalRow {
   }
 
   /**
+   * Display width of the cell whose first {@code char} is at {@code charIndex}, treating a width-1
+   * base immediately followed by VS16 (U+FE0F) as emoji-presentation width 2. This matches the
+   * cursor advance done by {@link TerminalEmulator#emitCodePoint} (promoteVs16) and the renderer,
+   * so a VS16 emoji occupies a genuine 2-column cell with no phantom blank in its second half.
+   */
+  private int cellWidth(int charIndex) {
+    char c = mText[charIndex];
+    boolean high = Character.isHighSurrogate(c);
+    int codePoint = high ? Character.toCodePoint(c, mText[charIndex + 1]) : c;
+    int w = WcWidth.width(codePoint);
+    if (w == 1) {
+      int next = charIndex + (high ? 2 : 1);
+      if (next < mSpaceUsed && mText[next] == '\uFE0F') return 2; // VS16 -> emoji presentation
+    }
+    return w;
+  }
+
+  /**
    * Note that the column may end of second half of wide character.
    */
   public int findStartOfColumn(int column) {
@@ -108,8 +126,8 @@ public final class TerminalRow {
       int newCharIndex = currentCharIndex;
       char c = mText[newCharIndex++]; // cci=1, cci=2
       boolean isHigh = Character.isHighSurrogate(c);
-      int codePoint = isHigh ? Character.toCodePoint(c, mText[newCharIndex++]) : c;
-      int wcwidth = WcWidth.width(codePoint); // 1, 2
+      if (isHigh) newCharIndex++;
+      int wcwidth = cellWidth(currentCharIndex); // 1, 2 (VS16-aware)
       if (wcwidth > 0) {
         currentColumn += wcwidth;
         if (currentColumn == column) {
@@ -139,9 +157,10 @@ public final class TerminalRow {
 
   private boolean wideDisplayCharacterStartingAt(int column) {
     for (int currentCharIndex = 0, currentColumn = 0; currentCharIndex < mSpaceUsed; ) {
+      int startIndex = currentCharIndex;
       char c = mText[currentCharIndex++];
-      int codePoint = Character.isHighSurrogate(c) ? Character.toCodePoint(c, mText[currentCharIndex++]) : c;
-      int wcwidth = WcWidth.width(codePoint);
+      if (Character.isHighSurrogate(c)) currentCharIndex++;
+      int wcwidth = cellWidth(startIndex); // VS16-aware
       if (wcwidth > 0) {
         if (currentColumn == column && wcwidth == 2) return true;
         currentColumn += wcwidth;
@@ -230,7 +249,9 @@ public final class TerminalRow {
 
     char[] text = mText;
     final int oldStartOfColumnIndex = findStartOfColumn(columnToSet);
-    final int oldCodePointDisplayWidth = WcWidth.width(text, oldStartOfColumnIndex);
+    // VS16-aware so overwriting an existing emoji-presentation cell removes both its columns.
+    final int oldCodePointDisplayWidth = oldStartOfColumnIndex < mSpaceUsed
+      ? cellWidth(oldStartOfColumnIndex) : WcWidth.width(text, oldStartOfColumnIndex);
 
     // Get the number of elements in the mText array this column uses now
     int oldCharactersUsedForColumn;
