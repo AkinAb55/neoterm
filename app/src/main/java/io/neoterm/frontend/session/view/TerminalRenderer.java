@@ -72,6 +72,10 @@ final class TerminalRenderer {
   private final Paint mUnderlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
   private final android.graphics.Path mUnderlinePath = new android.graphics.Path();
 
+  // Paint for box-drawing/block/Braille glyphs rendered by LineBlockCharacters
+  // (kept separate so it doesn't disturb the text paint's state mid-run).
+  private final Paint mLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
   /** Whether the cursor is drawn as a hollow outline (set per render() call when unfocused). */
   private boolean mCursorHollow = false;
   /** Whether blinking text is currently in its visible half-cycle (set per render() call). */
@@ -159,6 +163,7 @@ final class TerminalRenderer {
       int lastRunStartIndex = 0;
       boolean lastRunFontWidthMismatch = false;
       boolean lastRunMissingGlyph = false;
+      boolean lastRunLineDraw = false;
       int currentCharIndex = 0;
       float measuredWidthForRun = 0.f;
 
@@ -185,17 +190,21 @@ final class TerminalRenderer {
         // A custom (user) font has no system fallback chain, so glyphs it lacks
         // would render as tofu/blank. Detect those and draw the run with a
         // fallback typeface (which does fall back to the system fonts).
-        final boolean missingGlyph = codePointWcWidth > 0 && !fontHasGlyph(codePoint);
+        // Box-drawing / Block / Braille glyphs are drawn by us (LineBlockCharacters)
+        // into the exact cell, gap-free, instead of using the font glyph.
+        final boolean lineDraw = codePointWcWidth > 0 && LineBlockCharacters.canDraw(codePoint);
+        final boolean missingGlyph = !lineDraw && codePointWcWidth > 0 && !fontHasGlyph(codePoint);
         // For a present glyph use the real measured width (so non-monospace and
         // wide glyphs are scaled to their cell); for a missing one the user font's
         // measure is meaningless (often the .notdef/tofu advance, sometimes 0), so
         // use the expected cell width — the real width comes from the fallback font.
-        final float measuredCodePointWidth = missingGlyph ? (codePointWcWidth * mFontWidth)
+        // Line-draw glyphs use the exact cell width so they aren't scaled.
+        final float measuredCodePointWidth = (missingGlyph || lineDraw) ? (codePointWcWidth * mFontWidth)
           : (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint]
           : mTextPaint.measureText(line, currentCharIndex, charsForCodePoint);
         final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
 
-        if (style != lastRunStyle || insideCursor != lastRunInsideCursor || insideUrl != lastRunUrl || underlineColor != lastRunUnderlineColor || fontWidthMismatch || lastRunFontWidthMismatch || missingGlyph != lastRunMissingGlyph) {
+        if (style != lastRunStyle || insideCursor != lastRunInsideCursor || insideUrl != lastRunUrl || underlineColor != lastRunUnderlineColor || fontWidthMismatch || lastRunFontWidthMismatch || missingGlyph != lastRunMissingGlyph || lineDraw != lastRunLineDraw) {
           if (column == 0) {
             // Skip first column as there is nothing to draw, just record the current style.
           } else {
@@ -204,7 +213,7 @@ final class TerminalRenderer {
             int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun,
               lastRunStartIndex, charsSinceLastRun, measuredWidthForRun,
-              cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor);
+              cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor, lastRunLineDraw);
           }
           measuredWidthForRun = 0.f;
           lastRunStyle = style;
@@ -215,6 +224,7 @@ final class TerminalRenderer {
           lastRunStartIndex = currentCharIndex;
           lastRunFontWidthMismatch = fontWidthMismatch;
           lastRunMissingGlyph = missingGlyph;
+          lastRunLineDraw = lineDraw;
         }
         measuredWidthForRun += measuredCodePointWidth;
         column += codePointWcWidth;
@@ -230,7 +240,7 @@ final class TerminalRenderer {
       final int charsSinceLastRun = currentCharIndex - lastRunStartIndex;
       int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
       drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
-        measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor);
+        measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor, lastRunLineDraw);
 
       // Inline image (Sixel) cells: drawTextRun skips them, so draw their bitmap
       // tiles here over the (blank) cells. Only when images exist on screen.
@@ -399,7 +409,7 @@ final class TerminalRenderer {
   private void drawTextRun(Canvas canvas, char[] text, int[] palette, float y, int startColumn, int runWidthColumns,
                            int startCharIndex, int runWidthChars, float mes, int cursor, int cursorStyle,
                            long textStyle, boolean reverseVideo, boolean forceUnderline, boolean fallbackFont,
-                           int underlineColor) {
+                           int underlineColor, boolean lineDraw) {
     // Inline image cells are drawn separately (drawImageCells); skip them here so
     // their packed image id isn't misread as colours.
     if (TextStyle.isImage(textStyle)) return;
@@ -526,8 +536,13 @@ final class TerminalRenderer {
 
       // The text alignment is the default Paint.Align.LEFT. For fallback runs the
       // typeface was switched (and the run measured) above; it is restored below so
-      // it is reset even for invisible runs.
-      canvas.drawText(text, startCharIndex, runWidthChars, left, y - mFontLineSpacingAndAscent, mTextPaint);
+      // it is reset even for invisible runs. Box-drawing/Block/Braille runs are
+      // painted gap-free by us instead of using the (often misaligned) font glyph.
+      if (lineDraw) {
+        drawLineDrawRun(canvas, text, startCharIndex, runWidthChars, startColumn, y, foreColor, bold);
+      } else {
+        canvas.drawText(text, startCharIndex, runWidthChars, left, y - mFontLineSpacingAndAscent, mTextPaint);
+      }
 
       if (customUnderline) {
         int ulColor = underlineColor != 0 ? underlineColor : foreColor;
@@ -538,6 +553,35 @@ final class TerminalRenderer {
 
     if (fallbackFont) mTextPaint.setTypeface(mTypeface);
     if (savedMatrix) canvas.restore();
+  }
+
+  /**
+   * Paint a run of Box-drawing / Block / Braille cells with {@link LineBlockCharacters},
+   * each into its exact (gap-free, pixel-snapped) cell rectangle so adjacent frame and
+   * bar segments join seamlessly. Cells are width-1 single-char BMP code points; any
+   * trailing combining marks are skipped defensively.
+   */
+  private void drawLineDrawRun(Canvas canvas, char[] text, int startCharIndex, int runWidthChars,
+                               int startColumn, float y, int color, boolean bold) {
+    final int cellTop = Math.round(y - mFontLineSpacingAndAscent + mFontAscent);
+    final int cellBottom = Math.round(y);
+    final int cellH = cellBottom - cellTop;
+    mLinePaint.setColor(color);
+
+    final int end = startCharIndex + runWidthChars;
+    int charIndex = startCharIndex;
+    int column = startColumn;
+    while (charIndex < end) {
+      final int codePoint = text[charIndex]; // canDraw range is BMP, never a surrogate
+      final int cellLeft = Math.round(column * mFontWidth);
+      final int cellW = Math.round((column + 1) * mFontWidth) - cellLeft;
+      LineBlockCharacters.draw(canvas, mLinePaint, cellLeft, cellTop, cellW, cellH, codePoint, bold);
+      charIndex++;
+      column++;
+      while (charIndex < end && WcWidth.width(text, charIndex) <= 0) {
+        charIndex += Character.isHighSurrogate(text[charIndex]) ? 2 : 1;
+      }
+    }
   }
 
   /** Draw a double/curly/dotted/dashed underline across [left,right] near the cell bottom. */
