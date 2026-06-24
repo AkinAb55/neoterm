@@ -20,6 +20,7 @@ import com.hoho.android.usbserial.driver.UsbSerialPort
 import io.neoterm.backend.Pty
 import io.neoterm.component.config.NeoPreference
 import io.neoterm.component.config.NeoTermPath
+import io.neoterm.setup.proot.Distro
 import io.neoterm.setup.proot.Kmsg
 import io.neoterm.utils.NLog
 import java.io.File
@@ -157,6 +158,7 @@ object UsbSerialBridge {
     slot.port = port
     slot.conn = conn
     slot.dtr = false; slot.rts = false; slot.lastParams = null; slot.running = true
+    clearStaleLocks(slot.ttyName)   // a previous holder may have left a live-PID lock
     startPump(slot, slot.pfd!!)
     writeSysfs(slot, device)
     val product = runCatching { device.productName }.getOrNull()?.takeIf { it.isNotBlank() } ?: ""
@@ -197,7 +199,30 @@ object UsbSerialBridge {
     slot.lastParams = null
     slot.dtr = false
     slot.rts = false
+    clearStaleLocks(slot.ttyName)   // the dead PTY's lock must not block the next open
     Kmsg.log("usb-serial: $msg")
+  }
+
+  /**
+   * Remove leftover UUCP lock files (LCK..ttyUSB<n>) for this port. A serial
+   * program that does not exit on unplug (e.g. a stuck `screen`) keeps its lock
+   * with a still-live PID, so the next minicom/picocom refuses the port with
+   * "Device is locked" — the stale-PID heuristic does not fire. After detach the
+   * old holder's PTY is dead and its lock is meaningless, so we clear it when a
+   * slot goes up or down. The bridge is global (any distro session may hold the
+   * port), so sweep every installed distro's lock dir; /var/lock is usually a
+   * symlink to /run/lock (we only touch real files), the var/lock attempt covers
+   * distros that keep it as a real directory.
+   */
+  private fun clearStaleLocks(ttyName: String) {
+    var cleared = false
+    for (d in Distro.values()) {
+      for (sub in arrayOf("run/lock", "var/lock")) {
+        if (runCatching { File("${d.rootfsPath()}/$sub/LCK..$ttyName").delete() }.getOrDefault(false))
+          cleared = true
+      }
+    }
+    if (cleared) Kmsg.log("usb-serial: cleared stale lock for $ttyName")
   }
 
   // ── control server: open-redirect + enumeration + modem ─────────────────
