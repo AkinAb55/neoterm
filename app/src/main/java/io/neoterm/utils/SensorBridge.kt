@@ -112,6 +112,7 @@ object SensorBridge {
   private val ptySlave = ConcurrentHashMap<Int, String>()                // type -> /dev/pts/N
   private val pumping = ConcurrentHashMap<Int, Boolean>()                // type -> streaming?
   private val enabledIdx = ConcurrentHashMap<Int, IntArray>()            // type -> enabled chans
+  private val lastEnableLog = ConcurrentHashMap<Int, String>()           // type -> last polled enable (diag)
   private val observers = ArrayList<FileObserver>()
 
   private val listener = object : SensorEventListener {
@@ -309,9 +310,13 @@ object SensorBridge {
    *  and start/stop the scan-record pump for this device. */
   private fun onBufferToggle(type: Int) {
     val dir = devDirs[type] ?: return
-    val on = arrayOf("buffer", "buffer0").any {
-      runCatching { File(File(dir, it), "enable").readText().trim() }.getOrNull() == "1"
-    }
+    val en0 = runCatching { File(File(dir, "buffer"), "enable").readText().trim() }.getOrNull()
+    val en1 = runCatching { File(File(dir, "buffer0"), "enable").readText().trim() }.getOrNull()
+    // diagnostic: log whenever the polled enable value changes for this device
+    val raw = "${en0 ?: "-"}/${en1 ?: "-"}"
+    if (lastEnableLog.put(type, raw) != raw)
+      Kmsg.log("sensors: iio:device${devIndex[type]} enable=[$raw]")
+    val on = en0 == "1" || en1 == "1"
     if (on) {
       val chans = channelNames(type)
       val se = File(dir, "scan_elements")
