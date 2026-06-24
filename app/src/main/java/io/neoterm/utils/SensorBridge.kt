@@ -297,7 +297,10 @@ object SensorBridge {
     Thread({
       while (started) {
         try { Thread.sleep(100) } catch (e: InterruptedException) { break }
-        for (type in BUFFERED) if (ptySlave.containsKey(type)) onBufferToggle(type)
+        // Poll EVERY buffered device's enable (not only opened ones): the enable
+        // write lands in our host file regardless, and onBufferToggle creates the
+        // PTY itself if needed.
+        for (type in BUFFERED) onBufferToggle(type)
       }
     }, "iio-buffer-poll").apply { isDaemon = true; start() }
   }
@@ -361,6 +364,7 @@ object SensorBridge {
     runCatching { Os.fcntlInt(pfd.fileDescriptor, OsConstants.F_SETFL, OsConstants.O_NONBLOCK) }
     ptyMaster[type] = pfd
     ptySlave[type] = slave
+    Kmsg.log("sensors: iio:device${devIndex[type]} stream opened ($slave)")
     return slave
   }
 
