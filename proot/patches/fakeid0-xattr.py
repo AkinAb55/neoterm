@@ -531,4 +531,39 @@ if 'uknl_maybe_inject_ttyusb' not in s:
                   '        if (res <= 0) {', 1)
     wr(HF, s)
 
+# ---- flock(2) on a devpts node is denied by Android SELinux (EACCES), which
+#      breaks serial tools that open the port with exclusive locking (pyserial
+#      exclusive=True / modern esptool). Trap flock and fake success for
+#      /dev/pts/* fds only; non-pts flock (dpkg locks, etc.) is untouched. ----
+SC = ROOT + "/syscall/seccomp.c"; s = rd(SC)
+if 'PR_flock' not in s:
+    sc_anchor = '\t{ PR_fchdir,\t\tFILTER_SYSEXIT },'
+    must(sc_anchor in s, "seccomp fchdir anchor")
+    s = s.replace(sc_anchor, sc_anchor + '\n\t{ PR_flock,\t\tFILTER_SYSEXIT },', 1)
+    wr(SC, s)
+
+EF = ROOT + "/syscall/enter.c"; s = rd(EF)
+if 'NeoTerm: Android SELinux denies flock' not in s:
+    fl_anchor = '\tcase PR_ioctl: {'
+    must(fl_anchor in s, "enter.c ioctl anchor (flock)")
+    fl_case = (
+        '\t/* NeoTerm: Android SELinux denies flock(2) on a devpts node (EACCES),\n'
+        '\t * breaking serial tools that lock the port exclusively (pyserial\n'
+        '\t * exclusive=True / esptool). Fake success for /dev/pts/* fds only. */\n'
+        '\tcase PR_flock: {\n'
+        '\t\tchar lk[64], pp[PATH_MAX];\n'
+        '\t\tsnprintf(lk, sizeof(lk), "/proc/%d/fd/%d", tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));\n'
+        '\t\tssize_t pn = readlink(lk, pp, sizeof(pp) - 1);\n'
+        '\t\tif (pn > 0) {\n'
+        '\t\t\tpp[pn] = \'\\0\';\n'
+        '\t\t\tif (strncmp(pp, "/dev/pts/", 9) == 0) {\n'
+        '\t\t\t\tpoke_reg(tracee, SYSARG_RESULT, 0);\n'
+        '\t\t\t\tset_sysnum(tracee, PR_void);\n'
+        '\t\t\t}\n'
+        '\t\t}\n'
+        '\t\tbreak;\n'
+        '\t}\n\n')
+    s = s.replace(fl_anchor, fl_case + fl_anchor, 1)
+    wr(EF, s)
+
 print("ALL PATCHES APPLIED OK")
