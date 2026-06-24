@@ -316,13 +316,13 @@ object SensorBridge {
     val raw = "${en0 ?: "-"}/${en1 ?: "-"}"
     if (lastEnableLog.put(type, raw) != raw)
       Kmsg.log("sensors: iio:device${devIndex[type]} enable=[$raw]")
-    val on = en0 == "1" || en1 == "1"
+    val on = flagOn(en0) || flagOn(en1)
     if (on) {
       val chans = channelNames(type)
       val se = File(dir, "scan_elements")
       val en = ArrayList<Int>()
       chans.forEachIndexed { i, ch ->
-        if (runCatching { File(se, "${ch}_en").readText().trim() }.getOrNull() == "1") en.add(i)
+        if (flagOn(runCatching { File(se, "${ch}_en").readText() }.getOrNull())) en.add(i)
       }
       if (en.isEmpty()) en.addAll(chans.indices)   // none flagged → stream all
       enabledIdx[type] = en.toIntArray()
@@ -338,6 +338,11 @@ object SensorBridge {
       Kmsg.log("sensors: iio:device${devIndex[type]} buffer disabled")
     }
   }
+
+  /** A sysfs flag is "on" if its first non-whitespace char is '1'. libiio writes
+   *  the enable/_en values with trailing bytes (e.g. NUL) that trim() leaves, so a
+   *  plain == "1" comparison fails — match leniently. */
+  private fun flagOn(s: String?): Boolean = s?.firstOrNull { !it.isWhitespace() } == '1'
 
   /** Re-register a sensor at a new delay (faster while its buffer streams). */
   private fun setRate(type: Int, delay: Int) {
