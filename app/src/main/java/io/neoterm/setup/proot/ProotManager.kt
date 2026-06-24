@@ -222,9 +222,9 @@ object ProotManager {
     // SELinux blocks the real one) — ls / pyserial enumerate the ports there.
     io.neoterm.setup.usbserial.UsbSerialBridge.sysfsBind()?.let { bind(args, it, "/sys/class/tty") }
 
-    // Sensors + battery: bind the fake /sys/class/power_supply and
-    // /sys/bus/iio/devices trees (Android SELinux blocks the real /sys readdir),
-    // so upower/acpi/iio_info and IIO-aware tools see the device sensors.
+    // Sensors + battery: bind the fake /sys/class/power_supply and /sys/bus/iio
+    // trees (Android SELinux blocks the real /sys readdir), so upower/acpi/iio_info
+    // and IIO-aware tools see the device sensors.
     io.neoterm.utils.SensorBridge.sysfsBinds().forEach { (host, guest) -> bind(args, host, guest) }
 
     // Fake /proc fájlok (proot-distro sysdata mintájára): az Android korlátozott

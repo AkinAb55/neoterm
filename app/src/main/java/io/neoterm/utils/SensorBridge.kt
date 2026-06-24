@@ -64,7 +64,11 @@ object SensorBridge {
   private const val SCAN_TYPE = "le:s32/32>>0"
 
   private val psDir = File("${NeoTermPath.PROOT_ROOT_PATH}/sys-power-supply")
+  // Bound onto /sys/bus/iio (the PARENT), not just .../devices: libiio's context
+  // creation also touches /sys/bus/iio, and the real Android one is SELinux-denied
+  // (EACCES) — shadowing the whole subtree keeps libiio from escaping the bind.
   private val iioDir = File("${NeoTermPath.PROOT_ROOT_PATH}/sys-bus-iio")
+  private val iioDevDir = File(iioDir, "devices")
   private val batDir = File(psDir, "BAT0")
   private val acDir = File(psDir, "AC0")
   private val usbDir = File(psDir, "USB")
@@ -121,7 +125,8 @@ object SensorBridge {
     if (!NeoPreference.isSensorsEnabled()) return emptyList()
     val out = ArrayList<Pair<String, String>>()
     if (psDir.isDirectory || psDir.mkdirs()) out.add(psDir.absolutePath to "/sys/class/power_supply")
-    if (iioDir.isDirectory || iioDir.mkdirs()) out.add(iioDir.absolutePath to "/sys/bus/iio/devices")
+    iioDevDir.mkdirs()
+    if (iioDir.isDirectory || iioDir.mkdirs()) out.add(iioDir.absolutePath to "/sys/bus/iio")
     return out
   }
 
@@ -131,7 +136,7 @@ object SensorBridge {
     if (!NeoPreference.isSensorsEnabled()) return
     appContext = context.applicationContext
     started = true
-    psDir.mkdirs(); iioDir.mkdirs()
+    psDir.mkdirs(); iioDevDir.mkdirs()
     registerBattery()
     registerSensors()
     startIioServer()
@@ -173,7 +178,7 @@ object SensorBridge {
     var idx = 0
     for (type in SUPPORTED) {
       val s = sm.getDefaultSensor(type) ?: continue
-      val dir = File(iioDir, "iio:device$idx").apply { mkdirs() }
+      val dir = File(iioDevDir, "iio:device$idx").apply { mkdirs() }
       devDirs[type] = dir
       devIndex[type] = idx
       typeByIndex[idx] = type
