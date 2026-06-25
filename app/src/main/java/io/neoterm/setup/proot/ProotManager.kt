@@ -155,10 +155,24 @@ object ProotManager {
     // Gondoskodunk róla, hogy a login shell betöltse a ~/.bashrc-t (lásd lent).
     ensureLoginSourcesBashrc(distro)
 
+    // Guest-oldali kompat-shimek (systemctl/dmesg/journalctl/loginctl) a
+    // rootfs /usr/local/bin-jébe — minden indításkor frissítve.
+    ProotShims.install(rootfs)
+
     val args = ArrayList<String>(48)
     args.add("proot")
     args.add("--kill-on-exit")     // a teljes process-fa meghal a tracee után
     args.add("--link2symlink")     // hardlinkek → symlinkek (apt/dpkg kompat)
+    // Emulate System V IPC (shmget/semget/msgget) in user space. Android kernels
+    // disable SysV IPC, so apps that use it fail with ENOSYS ("Function not
+    // implemented") — e.g. PostgreSQL's postmaster interlock segment. The Termux
+    // proot fork implements this; harmless for apps that don't use SysV IPC.
+    args.add("--sysvipc")
+    // Enable the hidden_files extension (-H). It hides ".proot." files (we have
+    // none — ownership is in xattrs), and crucially it carries our getdents
+    // injection that makes the virtual /dev/ttyUSB* hotplug ports show up in
+    // directory listings (ls /dev/ttyUSB*, pyserial's /dev/ttyUSB* glob).
+    args.add("-H")
     args.add("-0")                 // fake root: a guest uid/gid 0-t lát
     args.add("-r"); args.add(rootfs)
 
@@ -166,6 +180,14 @@ object ProotManager {
     bind(args, "/dev")
     bind(args, "/proc")
     bind(args, "/sys")
+    // Hide Android's SELinux from the guest. Android mounts selinuxfs at
+    // /sys/fs/selinux, so the distro's SELinux-aware tools (su / PAM, runuser,
+    // login, sudo, cron, sshd) think SELinux is enabled and abort in libselinux's
+    // AVC ("avc_context_to_sid_raw: Assertion `avc_running' failed"). Masking it
+    // with an empty dir (no `enforce`) makes is_selinux_enabled() false, so they
+    // skip SELinux entirely. Bound after /sys so it overrides.
+    val selinuxMask = File("${NeoTermPath.PROOT_ROOT_PATH}/selinux-mask").apply { mkdirs() }
+    bind(args, selinuxMask.absolutePath, "/sys/fs/selinux")
     bind(args, "/dev/pts")
     bind(args, "/proc/self/fd", "/dev/fd")
     bind(args, "/proc/self/fd/0", "/dev/stdin")
@@ -176,6 +198,34 @@ object ProotManager {
     val shmDir = File("${NeoTermPath.PROOT_ROOT_PATH}/shm").apply { mkdirs() }
     bind(args, shmDir.absolutePath, "/dev/shm")
     bind(args, "/dev/urandom", "/dev/random")
+    // Writable /dev/kmsg buffer: Android blocks the real kernel ring buffer, so
+    // bind a regular file the guest can write to and our dmesg shim reads back.
+    // The proot patch forces O_APPEND on this path (kernel-ring-buffer semantics).
+    val kmsgBuf = File("${NeoTermPath.PROOT_ROOT_PATH}/sysdata").apply { mkdirs() }.let { File(it, "kmsg") }
+    runCatching {
+      if (!kmsgBuf.exists()) {
+        kmsgBuf.writeText("")
+      } else if (kmsgBuf.length() > 256 * 1024) {
+        // O_APPEND-del a puffer nőne; induláskor sapkázzuk az utolsó ~64 KB-ra.
+        val all = kmsgBuf.readBytes()
+        kmsgBuf.writeBytes(all.copyOfRange((all.size - 64 * 1024).coerceAtLeast(0), all.size))
+      }
+    }
+    bind(args, kmsgBuf.absolutePath, "/dev/kmsg")
+
+    // USB-serial: /dev/ttyUSB* are VIRTUAL hotplug ports, not static binds — the
+    // proot open-redirect (enter.c) maps them to the live PTY at open time. Just
+    // make sure the app-side control/redirect server is up before the guest opens
+    // them. A device can be (un)plugged any time during the session.
+    io.neoterm.setup.usbserial.UsbSerialBridge.ensureReady()
+    // Bind a writable fake /sys/class/tty so the guest can readdir it (Android
+    // SELinux blocks the real one) — ls / pyserial enumerate the ports there.
+    io.neoterm.setup.usbserial.UsbSerialBridge.sysfsBind()?.let { bind(args, it, "/sys/class/tty") }
+
+    // Sensors + battery: bind the fake /sys/class/power_supply and /sys/bus/iio
+    // trees (Android SELinux blocks the real /sys readdir), so upower/acpi/iio_info
+    // and IIO-aware tools see the device sensors.
+    io.neoterm.utils.SensorBridge.sysfsBinds().forEach { (host, guest) -> bind(args, host, guest) }
 
     // Fake /proc fájlok (proot-distro sysdata mintájára): az Android korlátozott
     // /proc-ja miatt a ps/top/uptime/free hibára futna ("Unable to get system
@@ -224,6 +274,18 @@ object ProotManager {
     // then the source module is loaded and RECORD_AUDIO has been requested.
     if (NeoPreference.isMicrophoneEnabled()) {
       args.add("PULSE_SOURCE=neoterm_mic")
+    }
+    // Camera: NeoTerm's Android-side MJPEG bridge (CameraBridge). Only exported when the user
+    // enabled the camera in Settings — then the bridge serves the stream and CAMERA was
+    // requested. URL-aware apps (ffmpeg/OpenCV/mpv) read it; it is not a /dev/video0 device.
+    if (NeoPreference.isCameraEnabled()) {
+      args.add("NEOTERM_CAMERA_URL=http://127.0.0.1:4715/video.mjpeg")
+    }
+    // GPS: NeoTerm provides a built-in gpsd on 127.0.0.1:2947 (GpsBridge speaks the gpsd client
+    // protocol), so distro clients (cgps, gpspipe, …) work with no gpsd installed — they default
+    // to localhost:2947, no env needed. Export a hint for scripts when enabled.
+    if (NeoPreference.isGpsEnabled()) {
+      args.add("NEOTERM_GPSD=127.0.0.1:2947")
     }
     args.add("XDG_RUNTIME_DIR=/tmp")
     // Firefox's content sandbox can't work under proot (ptrace + no user

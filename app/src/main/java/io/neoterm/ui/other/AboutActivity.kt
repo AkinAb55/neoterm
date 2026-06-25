@@ -183,6 +183,10 @@ class AboutActivity : AppCompatActivity() {
       openUrl("https://github.com/9hm2/NeoTerm-pr")
     }
 
+    findViewById<View>(R.id.about_recommended_keyboard_view).setOnClickListener {
+      openUrl("https://github.com/9hm2/pcKeyboard")
+    }
+
     findViewById<View>(R.id.about_keyboard_shortcuts_view).setOnClickListener {
       AlertDialog.Builder(this)
         .setTitle(R.string.keyboard_shortcuts_title)
@@ -225,15 +229,14 @@ class AboutActivity : AppCompatActivity() {
   }
 
   private fun startUpdate(info: UpdateManager.UpdateInfo) {
-    if (!UpdateManager.canInstall(this)) {
-      AlertDialog.Builder(this)
-        .setMessage(R.string.update_need_install_permission)
-        .setPositiveButton(R.string.update_open_settings) { _, _ -> UpdateManager.requestInstallPermission(this) }
-        .setNegativeButton(android.R.string.cancel, null)
-        .show()
-      return
-    }
+    // Downloading the APK needs no special permission — only the final install does. Start the
+    // download right away so the button always works, and (if not yet granted) send the user to
+    // allow install-from-unknown-sources meanwhile; the system installer re-prompts at install
+    // time too if it's still missing.
     UpdateManager.downloadAndInstall(this, info)
+    if (!UpdateManager.canInstall(this)) {
+      UpdateManager.requestInstallPermission(this)
+    }
   }
 
   private fun resetApp() {

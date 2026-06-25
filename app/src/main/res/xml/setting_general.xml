@@ -37,11 +37,52 @@
     android:summary="@string/pref_general_volume_as_control_desc"
     android:title="@string/pref_general_volume_as_control"/>
 
+  <ListPreference
+    android:defaultValue="block"
+    android:entries="@array/pref_general_cursor_style_entries"
+    android:entryValues="@array/pref_general_cursor_style_values"
+    android:key="@string/key_general_cursor_style"
+    android:summary="@string/pref_general_cursor_style_desc"
+    android:title="@string/pref_general_cursor_style"/>
+
   <CheckBoxPreference
     android:defaultValue="false"
     android:key="@string/key_general_microphone"
     android:summary="@string/pref_general_microphone_desc"
     android:title="@string/pref_general_microphone"/>
+
+  <CheckBoxPreference
+    android:defaultValue="false"
+    android:key="@string/key_general_camera"
+    android:summary="@string/pref_general_camera_desc"
+    android:title="@string/pref_general_camera"/>
+
+  <ListPreference
+    android:defaultValue="1280x720"
+    android:dependency="@string/key_general_camera"
+    android:entries="@array/pref_general_camera_resolution_entries"
+    android:entryValues="@array/pref_general_camera_resolution_values"
+    android:key="@string/key_general_camera_resolution"
+    android:summary="@string/pref_general_camera_resolution_desc"
+    android:title="@string/pref_general_camera_resolution"/>
+
+  <CheckBoxPreference
+    android:defaultValue="false"
+    android:key="@string/key_general_gps"
+    android:summary="@string/pref_general_gps_desc"
+    android:title="@string/pref_general_gps"/>
+
+  <CheckBoxPreference
+    android:defaultValue="false"
+    android:key="@string/key_general_usb_serial"
+    android:summary="@string/pref_general_usb_serial_desc"
+    android:title="@string/pref_general_usb_serial"/>
+
+  <CheckBoxPreference
+    android:defaultValue="false"
+    android:key="@string/key_general_sensors"
+    android:summary="@string/pref_general_sensors_desc"
+    android:title="@string/pref_general_sensors"/>
 
   <CheckBoxPreference
     android:defaultValue="false"

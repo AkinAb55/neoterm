@@ -175,7 +175,8 @@ public final class TerminalEmulator {
    */
   private static final int DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT = 1 << 7;
   /**
-   * DECSET 1004 - NOT implemented.
+   * DECSET 1004 - when set, the terminal reports focus in/out as CSI I / CSI O (see
+   * {@link #isFocusEventsEnabled()}; the view sends the reports on focus change).
    */
   private static final int DECSET_BIT_SEND_FOCUS_EVENTS = 1 << 8;
   /**
@@ -204,6 +205,9 @@ public final class TerminalEmulator {
   private int mCursorRow, mCursorCol;
 
   private int mCursorStyle = CURSOR_STYLE_BLOCK;
+
+  /** Whether the cursor should blink (DECSCUSR; default on). The view drives the animation. */
+  private boolean mCursorBlinkingEnabled = true;
 
   /**
    * The number of character rows and columns in the terminal screen.
@@ -239,6 +243,13 @@ public final class TerminalEmulator {
    * Holds the arguments of the current escape sequence.
    */
   private final int[] mArgs = new int[MAX_ESCAPE_PARAMETERS];
+
+  /**
+   * Whether {@link #mArgs}[i] was separated from the previous argument by a colon (ISO 8613-6
+   * sub-parameter) rather than a semicolon. Lets SGR tell {@code 4:3} (curly underline) apart from
+   * {@code 4;3} (underline then italic), and parse the colon colour forms ({@code 38:2:…}).
+   */
+  private final boolean[] mArgsColon = new boolean[MAX_ESCAPE_PARAMETERS];
 
   /**
    * Holds OSC and device control arguments, which can be strings.
@@ -316,6 +327,12 @@ public final class TerminalEmulator {
    */
   private int mEffect;
 
+  /** Extended underline style (SGR 4:x): one of TextStyle.UNDERLINE_*; 0 = plain single. */
+  private int mUnderlineStyle;
+
+  /** Active underline colour (SGR 58, ARGB; 0 = none -> underline uses the text colour). */
+  private int mUnderlineColor;
+
   /** The currently-open OSC 8 hyperlink target (applied to written cells), or null. */
   private String mCurrentHyperlink;
 
@@ -328,6 +345,8 @@ public final class TerminalEmulator {
   private byte mUtf8ToFollow, mUtf8Index;
   private final byte[] mUtf8InputBuffer = new byte[4];
   private int mLastEmittedCodePoint = -1;
+  /** Count of consecutive regional-indicator code points emitted, so flags pair up (see emitCodePoint). */
+  private int mRegionalIndicatorCount = 0;
 
   public final TerminalColors mColors = new TerminalColors();
 
@@ -475,6 +494,23 @@ public final class TerminalEmulator {
     return mCursorStyle;
   }
 
+  /** Set the cursor shape (the user's default; apps can still override it via DECSCUSR). */
+  public void setCursorStyle(int style) {
+    if (style == CURSOR_STYLE_BLOCK || style == CURSOR_STYLE_UNDERLINE || style == CURSOR_STYLE_BAR) {
+      mCursorStyle = style;
+    }
+  }
+
+  /** Whether the cursor should blink (DECSCUSR steady/blinking variants). */
+  public boolean isCursorBlinkingEnabled() {
+    return mCursorBlinkingEnabled;
+  }
+
+  /** DECSET 1004: whether the app wants CSI I / CSI O focus-in / focus-out reports. */
+  public boolean isFocusEventsEnabled() {
+    return isDecsetInternalBitSet(DECSET_BIT_SEND_FOCUS_EVENTS);
+  }
+
   public boolean isReverseVideo() {
     return isDecsetInternalBitSet(DECSET_BIT_REVERSE_VIDEO);
   }
@@ -585,6 +621,16 @@ public final class TerminalEmulator {
   }
 
   public void processCodePoint(int b) {
+    // While accumulating an OSC string, C0 control bytes are part of the string payload, not
+    // commands to execute. Running them (e.g. LF -> doLinefeed, CR -> column reset) corrupts the
+    // cursor: Claude Code emits an OSC 99 desktop-notification whose multi-line body carries raw
+    // CR/LF, and those leaked line feeds scroll the screen and push the cursor ~2 rows down on
+    // every turn completion, only resyncing on a full redraw (Ctrl+L / app resume). BEL and ST
+    // terminate the string and CAN/SUB abort it, so let those fall through; absorb the rest.
+    if (mEscapeState == ESC_OSC && b < 0x20 && b != 0 && b != 7 && b != 24 && b != 26 && b != 27) {
+      doOsc(b);
+      return;
+    }
     switch (b) {
       case 0: // Null character (NUL, ^@). Do nothing.
         break;
@@ -895,6 +941,8 @@ public final class TerminalEmulator {
                     mCursorStyle = CURSOR_STYLE_BAR;
                     break;
                 }
+                // Even args (2/4/6) are steady; odd args and 0 (the default) blink.
+                mCursorBlinkingEnabled = !(arg == 2 || arg == 4 || arg == 6);
                 break;
               case 't':
               case 'u':
@@ -1430,6 +1478,7 @@ public final class TerminalEmulator {
     mEscapeState = ESC;
     mArgIndex = 0;
     Arrays.fill(mArgs, -1);
+    Arrays.fill(mArgsColon, false);
   }
 
   private void doLinefeed() {
@@ -1662,6 +1711,11 @@ public final class TerminalEmulator {
           case 2: // Erase all of the display - all lines are erased, changed to single-width, and the cursorColor does not
             // move..
             blockClear(0, 0, mColumns, mRows);
+            break;
+          case 3: // Erase the scrollback / saved lines (xterm extension). `clear` sends this so the
+            // transcript doesn't linger after clearing (it also fixes a vertical drift on resize
+            // when a large transcript stayed behind a blank screen).
+            mScreen.clearTranscript();
             break;
           default:
             unknownSequence(b);
@@ -1927,6 +1981,8 @@ public final class TerminalEmulator {
         mForeColor = TextStyle.COLOR_INDEX_FOREGROUND;
         mBackColor = TextStyle.COLOR_INDEX_BACKGROUND;
         mEffect = 0;
+        mUnderlineStyle = 0;
+        mUnderlineColor = 0;
       } else if (code == 1) {
         mEffect |= TextStyle.CHARACTER_ATTRIBUTE_BOLD;
       } else if (code == 2) {
@@ -1934,7 +1990,16 @@ public final class TerminalEmulator {
       } else if (code == 3) {
         mEffect |= TextStyle.CHARACTER_ATTRIBUTE_ITALIC;
       } else if (code == 4) {
-        mEffect |= TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
+        // SGR 4, optionally with an ISO 8613-6 colon sub-parameter selecting the underline style:
+        // 4:0 none, 4:1 single, 4:2 double, 4:3 curly, 4:4 dotted, 4:5 dashed. Plain "4" = single.
+        int sub = (i + 1 <= mArgIndex && mArgsColon[i + 1]) ? Math.max(0, mArgs[++i]) : 1;
+        if (sub == 0) {
+          mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
+          mUnderlineStyle = 0;
+        } else {
+          mEffect |= TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
+          mUnderlineStyle = (sub >= 1 && sub <= 5) ? sub : TextStyle.UNDERLINE_SINGLE;
+        }
       } else if (code == 5) {
         mEffect |= TextStyle.CHARACTER_ATTRIBUTE_BLINK;
       } else if (code == 7) {
@@ -1953,6 +2018,7 @@ public final class TerminalEmulator {
         mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_ITALIC;
       } else if (code == 24) { // underline: none
         mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
+        mUnderlineStyle = 0;
       } else if (code == 25) { // blink: none
         mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_BLINK;
       } else if (code == 27) { // image: positive
@@ -1963,45 +2029,43 @@ public final class TerminalEmulator {
         mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_STRIKETHROUGH;
       } else if (code >= 30 && code <= 37) {
         mForeColor = code - 30;
-      } else if (code == 38 || code == 48) {
-        // Extended set foregroundColor(38)/backgroundColor (48) color.
-        // This is followed by either "2;$R;$G;$B" to set a 24-bit color or
-        // "5;$INDEX" to set an indexed color.
-        if (i + 2 > mArgIndex) continue;
-        int firstArg = mArgs[i + 1];
+      } else if (code == 38 || code == 48 || code == 58) {
+        // Extended colour: 38=foreground, 48=background, 58=underline. Followed by the legacy
+        // semicolon form "2;r;g;b" / "5;index", or the ISO 8613-6 colon form "2:cs:r:g:b" /
+        // "2:r:g:b" / "5:index" (an extra colour-space field may precede r/g/b). 58's colour is
+        // parsed and consumed but not stored per-cell yet, so it doesn't change drawing.
+        if (i + 1 > mArgIndex) continue;
+        final boolean colon = mArgsColon[i + 1];
+        final int firstArg = mArgs[i + 1];
+        int groupEnd = i + 1;
+        if (colon) while (groupEnd + 1 <= mArgIndex && mArgsColon[groupEnd + 1]) groupEnd++;
         if (firstArg == 2) {
-          if (i + 4 > mArgIndex) {
-            Log.w(EmulatorDebug.LOG_TAG, "Too few CSI" + code + ";2 RGB arguments");
-          } else {
-            int red = mArgs[i + 2], green = mArgs[i + 3], blue = mArgs[i + 4];
-            if (red < 0 || green < 0 || blue < 0 || red > 255 || green > 255 || blue > 255) {
-              finishSequenceAndLogError("Invalid RGB: " + red + "," + green + "," + blue);
-            } else {
+          // Colon form with a 5-element group ("2:cs:r:g:b") carries a colour-space id before rgb.
+          int rIdx = colon ? ((groupEnd - i >= 5) ? i + 3 : i + 2) : i + 2;
+          int last = colon ? groupEnd : i + 4;
+          if (rIdx + 2 <= mArgIndex) {
+            int red = mArgs[rIdx], green = mArgs[rIdx + 1], blue = mArgs[rIdx + 2];
+            if (red >= 0 && green >= 0 && blue >= 0 && red <= 255 && green <= 255 && blue <= 255) {
               int argbColor = 0xff000000 | (red << 16) | (green << 8) | blue;
-              if (code == 38) {
-                mForeColor = argbColor;
-              } else {
-                mBackColor = argbColor;
-              }
+              if (code == 38) mForeColor = argbColor;
+              else if (code == 48) mBackColor = argbColor;
+              else mUnderlineColor = argbColor; // 58
             }
-            i += 4; // "2;P_r;P_g;P_r"
           }
+          i = Math.min(mArgIndex, last);
         } else if (firstArg == 5) {
-          int color = mArgs[i + 2];
-          i += 2; // "5;P_s"
+          int color = (i + 2 <= mArgIndex) ? mArgs[i + 2] : -1;
           if (color >= 0 && color < TextStyle.NUM_INDEXED_COLORS) {
-            if (code == 38) {
-              mForeColor = color;
-            } else {
-              mBackColor = color;
-            }
-          } else {
-            if (LOG_ESCAPE_SEQUENCES)
-              Log.w(EmulatorDebug.LOG_TAG, "Invalid color index: " + color);
+            if (code == 38) mForeColor = color;
+            else if (code == 48) mBackColor = color;
+            else mUnderlineColor = mColors.mCurrentColors[color]; // 58: store the resolved ARGB
           }
+          i = Math.min(mArgIndex, colon ? groupEnd : i + 2);
         } else {
-          finishSequenceAndLogError("Invalid ISO-8613-3 SGR first argument: " + firstArg);
+          i = Math.min(mArgIndex, groupEnd);
         }
+      } else if (code == 59) { // Default underline colour.
+        mUnderlineColor = 0;
       } else if (code == 39) { // Set default foregroundColor color.
         mForeColor = TextStyle.COLOR_INDEX_FOREGROUND;
       } else if (code >= 40 && code <= 47) { // Set backgroundColor color.
@@ -2219,7 +2283,7 @@ public final class TerminalEmulator {
   }
 
   private long getStyle() {
-    return TextStyle.encode(mForeColor, mBackColor, mEffect);
+    return TextStyle.encode(mForeColor, mBackColor, mEffect) | TextStyle.encodeUnderlineStyle(mUnderlineStyle);
   }
 
   /**
@@ -2289,9 +2353,10 @@ public final class TerminalEmulator {
         mArgs[mArgIndex] = value;
       }
       continueSequence(mEscapeState);
-    } else if (b == ';') {
+    } else if (b == ';' || b == ':') {
       if (mArgIndex < mArgs.length) {
         mArgIndex++;
+        if (mArgIndex < mArgsColon.length) mArgsColon[mArgIndex] = (b == ':');
       }
       continueSequence(mEscapeState);
     } else {
@@ -2379,6 +2444,7 @@ public final class TerminalEmulator {
    * @param codePoint The code point of the character to display
    */
   private void emitCodePoint(int codePoint) {
+    final int prevCodePoint = mLastEmittedCodePoint;
     mLastEmittedCodePoint = codePoint;
     if (mUseLineDrawingUsesG0 ? mUseLineDrawingG0 : mUseLineDrawingG1) {
       // http://www.vt100.net/docs/vt102-ug/table5-15.html.
@@ -2486,7 +2552,21 @@ public final class TerminalEmulator {
     }
 
     final boolean autoWrap = isDecsetInternalBitSet(DECSET_BIT_AUTOWRAP);
-    final int displayWidth = WcWidth.width(codePoint);
+    int displayWidth = WcWidth.width(codePoint);
+
+    // Grapheme clustering: emoji code points that join the previous cell are laid out width 0 so a
+    // multi-code-point emoji occupies one cluster (cell) instead of spilling into extra columns and
+    // overlapping the next glyph. The renderer applies the same rule (WcWidth.joinsPreviousGrapheme)
+    // when it re-derives widths, so the two stay in sync.
+    final boolean isRegionalIndicator = codePoint >= 0x1F1E6 && codePoint <= 0x1F1FF;
+    if (displayWidth > 0 && WcWidth.joinsPreviousGrapheme(prevCodePoint, codePoint)) {
+      displayWidth = 0;
+    } else if (isRegionalIndicator && (mRegionalIndicatorCount & 1) == 1) {
+      // Second regional indicator of a pair forms one flag with the first -> width 0.
+      displayWidth = 0;
+    }
+    // Track runs of regional indicators so flags pair up (reset by any other code point).
+    mRegionalIndicatorCount = isRegionalIndicator ? mRegionalIndicatorCount + 1 : 0;
     // VS16 (U+FE0F) after a width-1 base makes it emoji-presentation, which apps
     // count as width 2. Promote: append the selector to the base cell (combining,
     // below) and consume one extra column so the cursor stays in sync.
@@ -2523,6 +2603,10 @@ public final class TerminalEmulator {
     // Carry the active OSC 8 hyperlink onto the written cell (setChar cleared it).
     if (mCurrentHyperlink != null) {
       mScreen.setHyperlink(writeColumn, mCursorRow, mCurrentHyperlink);
+    }
+    // Likewise carry the active underline colour (SGR 58) onto the cell.
+    if (mUnderlineColor != 0) {
+      mScreen.setUnderlineColorAt(writeColumn, mCursorRow, mUnderlineColor);
     }
 
     if (autoWrap && displayWidth > 0)
@@ -2581,6 +2665,9 @@ public final class TerminalEmulator {
    */
   public void reset() {
     mCursorStyle = CURSOR_STYLE_BLOCK;
+    mCursorBlinkingEnabled = true;
+    mUnderlineStyle = 0;
+    mUnderlineColor = 0;
     mArgIndex = 0;
     mContinueSequence = false;
     mEscapeState = ESC_NONE;

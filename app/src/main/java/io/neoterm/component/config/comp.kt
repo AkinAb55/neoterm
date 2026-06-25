@@ -313,6 +313,56 @@ object NeoPreference {
     )
   }
 
+  fun isCameraEnabled(): Boolean {
+    return loadBoolean(
+      R.string.key_general_camera,
+      DefaultValues.enableCamera
+    )
+  }
+
+  /** Requested camera capture resolution as "WIDTHxHEIGHT"; the bridge maps it to the closest
+   *  size the camera actually supports. */
+  fun getCameraResolution(): String {
+    return loadString(R.string.key_general_camera_resolution, DefaultValues.cameraResolution)
+  }
+
+  fun isGpsEnabled(): Boolean {
+    return loadBoolean(
+      R.string.key_general_gps,
+      DefaultValues.enableGps
+    )
+  }
+
+  /** When on, known USB-serial chips (FTDI/CP210x/CH34x/PL2303/CDC-ACM) are
+   *  driven app-side by usb-serial-for-android and exposed to the distro as
+   *  /dev/ttyUSB*. Runtime toggle — takes effect on the next device attach. */
+  fun isUsbSerialEnabled(): Boolean {
+    return loadBoolean(
+      R.string.key_general_usb_serial,
+      DefaultValues.enableUsbSerial
+    )
+  }
+
+  /** When on, the device battery and motion/environment sensors are exposed to
+   *  the distro as a fake /sys/class/power_supply and /sys/bus/iio/devices tree,
+   *  so upower/acpi/iio_info and IIO-aware tools work. Runtime toggle. */
+  fun isSensorsEnabled(): Boolean {
+    return loadBoolean(
+      R.string.key_general_sensors,
+      DefaultValues.enableSensors
+    )
+  }
+
+  /** The user's default cursor shape: 0 = block, 1 = underline, 2 = bar (TerminalEmulator
+   *  CURSOR_STYLE_*). Apps can still override it at runtime via DECSCUSR. */
+  fun getCursorStyle(): Int {
+    return when (loadString(R.string.key_general_cursor_style, DefaultValues.cursorStyle)) {
+      "underline" -> 1
+      "bar" -> 2
+      else -> 0
+    }
+  }
+
   fun isOscNotificationEnabled(): Boolean {
     return loadBoolean(
       R.string.key_general_osc_notification,

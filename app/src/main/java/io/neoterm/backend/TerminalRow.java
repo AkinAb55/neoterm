@@ -43,6 +43,12 @@ public final class TerminalRow {
   private String[] mHyperlink;
 
   /**
+   * Per-column underline colour (ARGB; 0 = none, so the underline uses the text colour). Lazily
+   * allocated like {@link #mHyperlink}; set from SGR 58 and cleared (to 0) when a cell is rewritten.
+   */
+  private int[] mUnderlineColor;
+
+  /**
    * Construct a blank row (containing only whitespace, ' ') with a specified style.
    */
   public TerminalRow(int columns, long style) {
@@ -81,11 +87,31 @@ public final class TerminalRow {
       // (so OSC 8 hyperlinks survive scrolling/insert).
       String link = line.getHyperlink(sourceX1);
       if (link != null) setHyperlink(destinationX, link);
+      int ucolor = line.getUnderlineColor(sourceX1);
+      if (ucolor != 0) setUnderlineColor(destinationX, ucolor);
     }
   }
 
   public int getSpaceUsed() {
     return mSpaceUsed;
+  }
+
+  /**
+   * Display width of the cell whose first {@code char} is at {@code charIndex}, treating a width-1
+   * base immediately followed by VS16 (U+FE0F) as emoji-presentation width 2. This matches the
+   * cursor advance done by {@link TerminalEmulator#emitCodePoint} (promoteVs16) and the renderer,
+   * so a VS16 emoji occupies a genuine 2-column cell with no phantom blank in its second half.
+   */
+  private int cellWidth(int charIndex) {
+    char c = mText[charIndex];
+    boolean high = Character.isHighSurrogate(c);
+    int codePoint = high ? Character.toCodePoint(c, mText[charIndex + 1]) : c;
+    int w = WcWidth.width(codePoint);
+    if (w == 1) {
+      int next = charIndex + (high ? 2 : 1);
+      if (next < mSpaceUsed && mText[next] == '\uFE0F') return 2; // VS16 -> emoji presentation
+    }
+    return w;
   }
 
   /**
@@ -100,8 +126,8 @@ public final class TerminalRow {
       int newCharIndex = currentCharIndex;
       char c = mText[newCharIndex++]; // cci=1, cci=2
       boolean isHigh = Character.isHighSurrogate(c);
-      int codePoint = isHigh ? Character.toCodePoint(c, mText[newCharIndex++]) : c;
-      int wcwidth = WcWidth.width(codePoint); // 1, 2
+      if (isHigh) newCharIndex++;
+      int wcwidth = cellWidth(currentCharIndex); // 1, 2 (VS16-aware)
       if (wcwidth > 0) {
         currentColumn += wcwidth;
         if (currentColumn == column) {
@@ -131,9 +157,10 @@ public final class TerminalRow {
 
   private boolean wideDisplayCharacterStartingAt(int column) {
     for (int currentCharIndex = 0, currentColumn = 0; currentCharIndex < mSpaceUsed; ) {
+      int startIndex = currentCharIndex;
       char c = mText[currentCharIndex++];
-      int codePoint = Character.isHighSurrogate(c) ? Character.toCodePoint(c, mText[currentCharIndex++]) : c;
-      int wcwidth = WcWidth.width(codePoint);
+      if (Character.isHighSurrogate(c)) currentCharIndex++;
+      int wcwidth = cellWidth(startIndex); // VS16-aware
       if (wcwidth > 0) {
         if (currentColumn == column && wcwidth == 2) return true;
         currentColumn += wcwidth;
@@ -149,6 +176,23 @@ public final class TerminalRow {
     mSpaceUsed = (short) mColumns;
     mHasNonOneWidthOrSurrogateChars = false;
     mHyperlink = null;
+    mUnderlineColor = null;
+  }
+
+  /** Underline colour (ARGB) at the given column, or 0 if none (use the text colour). */
+  public int getUnderlineColor(int column) {
+    return (mUnderlineColor == null || column < 0 || column >= mColumns) ? 0 : mUnderlineColor[column];
+  }
+
+  /** Set (or clear, when color is 0) the underline colour at the given column. */
+  public void setUnderlineColor(int column, int color) {
+    if (column < 0 || column >= mColumns) return;
+    if (color == 0) {
+      if (mUnderlineColor != null) mUnderlineColor[column] = 0;
+      return;
+    }
+    if (mUnderlineColor == null) mUnderlineColor = new int[mColumns];
+    mUnderlineColor[column] = color;
   }
 
   /** OSC 8 hyperlink target at the given column, or null. */
@@ -173,6 +217,8 @@ public final class TerminalRow {
     // Overwriting a cell drops any hyperlink it carried; the emulator re-applies
     // the active OSC 8 link (if any) right after writing the character.
     if (mHyperlink != null) mHyperlink[columnToSet] = null;
+    // Likewise drop the cell's underline colour; the emulator re-applies the active one.
+    if (mUnderlineColor != null) mUnderlineColor[columnToSet] = 0;
 
     final int newCodePointDisplayWidth = WcWidth.width(codePoint);
 
@@ -203,7 +249,9 @@ public final class TerminalRow {
 
     char[] text = mText;
     final int oldStartOfColumnIndex = findStartOfColumn(columnToSet);
-    final int oldCodePointDisplayWidth = WcWidth.width(text, oldStartOfColumnIndex);
+    // VS16-aware so overwriting an existing emoji-presentation cell removes both its columns.
+    final int oldCodePointDisplayWidth = oldStartOfColumnIndex < mSpaceUsed
+      ? cellWidth(oldStartOfColumnIndex) : WcWidth.width(text, oldStartOfColumnIndex);
 
     // Get the number of elements in the mText array this column uses now
     int oldCharactersUsedForColumn;

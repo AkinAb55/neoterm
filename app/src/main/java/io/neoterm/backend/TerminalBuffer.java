@@ -94,6 +94,11 @@ public final class TerminalBuffer {
     return mActiveTranscriptRows;
   }
 
+  /** Drop the scrollback transcript (CSI 3 J), keeping the visible screen. */
+  public void clearTranscript() {
+    mActiveTranscriptRows = 0;
+  }
+
   public int getActiveRows() {
     return mActiveTranscriptRows + mScreenRows;
   }
@@ -161,8 +166,15 @@ public final class TerminalBuffer {
           }
         }
       } else if (shiftDownOfTopRow < 0) {
-        // Negative shift down = expanding. Only move screen up if there is transcript to show:
-        int actualShift = Math.max(shiftDownOfTopRow, -mActiveTranscriptRows);
+        // Expanding. Pull history back from the transcript only when there's content anchored at
+        // the bottom (so a bottom UI like a status box stays put across a resize). If the bottom
+        // is blank -- e.g. just after a screen clear, with the prompt near the top -- adding
+        // transcript rows would push that content DOWN; a transient resize on every keyboard/
+        // recents round-trip then drifts it down a row at a time. So add blank rows at the bottom
+        // instead, keeping the content where it is.
+        int rb = externalToInternalRow(mScreenRows - 1);
+        boolean bottomBlank = (mLines[rb] == null || mLines[rb].isBlank());
+        int actualShift = bottomBlank ? 0 : Math.max(shiftDownOfTopRow, -mActiveTranscriptRows);
         if (shiftDownOfTopRow != actualShift) {
           // The new lines revealed by the resizing are not all from the transcript. Blank the below ones.
           for (int i = 0; i < actualShift - shiftDownOfTopRow; i++)
@@ -244,13 +256,17 @@ public final class TerminalBuffer {
 
         int currentOldCol = 0;
         long styleAtCol = 0;
+        int underlineColorAtCol = 0;
         for (int i = 0; i < lastNonSpaceIndex; i++) {
           // Note that looping over java character, not cells.
           char c = oldLine.mText[i];
           int codePoint = (Character.isHighSurrogate(c)) ? Character.toCodePoint(c, oldLine.mText[++i]) : c;
           int displayWidth = WcWidth.width(codePoint);
           // Use the last style if this is a zero-width character:
-          if (displayWidth > 0) styleAtCol = oldLine.getStyle(currentOldCol);
+          if (displayWidth > 0) {
+            styleAtCol = oldLine.getStyle(currentOldCol);
+            underlineColorAtCol = oldLine.getUnderlineColor(currentOldCol);
+          }
 
           // Line wrap as necessary:
           if (currentOutputExternalColumn + displayWidth > mColumns) {
@@ -267,6 +283,8 @@ public final class TerminalBuffer {
           int offsetDueToCombiningChar = ((displayWidth <= 0 && currentOutputExternalColumn > 0) ? 1 : 0);
           int outputColumn = currentOutputExternalColumn - offsetDueToCombiningChar;
           setChar(outputColumn, currentOutputExternalRow, codePoint, styleAtCol);
+          // Carry the underline colour across the reflow (setChar cleared it).
+          if (underlineColorAtCol != 0) setUnderlineColorAt(outputColumn, currentOutputExternalRow, underlineColorAtCol);
 
           if (displayWidth > 0) {
             if (oldCursorRow == externalOldRow && oldCursorColumn == currentOldCol) {
@@ -409,6 +427,12 @@ public final class TerminalBuffer {
   public void setHyperlink(int column, int row, String uri) {
     if (row >= mScreenRows || column >= mColumns || column < 0) return;
     allocateFullLineIfNecessary(externalToInternalRow(row)).setHyperlink(column, uri);
+  }
+
+  /** Apply (or clear, when color is 0) the underline colour at a cell. */
+  public void setUnderlineColorAt(int column, int row, int color) {
+    if (row >= mScreenRows || column >= mColumns || column < 0) return;
+    allocateFullLineIfNecessary(externalToInternalRow(row)).setUnderlineColor(column, color);
   }
 
   /** The OSC 8 hyperlink target at a cell, or null. */

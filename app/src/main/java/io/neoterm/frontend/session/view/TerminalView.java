@@ -58,7 +58,127 @@ public final class TerminalView extends View {
 
   TerminalRenderer mRenderer;
 
+  /**
+   * Drives repaints off the display's frame clock (vsync, ~60 Hz or the panel's native rate)
+   * rather than only when output arrives. After each emulator update the view keeps refreshing
+   * for a short tail window, so the screen always converges to the latest buffer state within a
+   * frame even if an individual repaint was coalesced away or suppressed (e.g. during DEC 2026
+   * synchronized output) -- a stale frame can't get stuck. Idles when no updates arrive so it
+   * doesn't burn power on a quiet terminal.
+   */
+  private boolean mViewAttached = false;
+  private boolean mRefreshScheduled = false;
+  private long mLastScreenUpdateUptime = 0;
+  /** Keep ticking this long after the last emulator update, then idle until the next one. */
+  private static final long REFRESH_TAIL_MILLIS = 250;
+  private final Choreographer.FrameCallback mRefreshFrameCallback = new Choreographer.FrameCallback() {
+    @Override
+    public void doFrame(long frameTimeNanos) {
+      if (!mViewAttached) {
+        mRefreshScheduled = false;
+        return;
+      }
+      // Animation callbacks run before this frame's draw pass, so this invalidate is served on
+      // the same vsync (no extra latency).
+      invalidate();
+      if (android.os.SystemClock.uptimeMillis() - mLastScreenUpdateUptime < REFRESH_TAIL_MILLIS) {
+        Choreographer.getInstance().postFrameCallback(this);
+      } else {
+        mRefreshScheduled = false;
+      }
+    }
+  };
+
+  /** Mark the screen dirty and ensure the vsync refresh loop is running. */
+  private void scheduleRefresh() {
+    mLastScreenUpdateUptime = android.os.SystemClock.uptimeMillis();
+    if (mRefreshScheduled || !mViewAttached) return;
+    mRefreshScheduled = true;
+    Choreographer.getInstance().postFrameCallback(mRefreshFrameCallback);
+  }
+
+  @Override
+  protected void onAttachedToWindow() {
+    super.onAttachedToWindow();
+    mViewAttached = true;
+    restartCursorBlink();
+  }
+
+  @Override
+  protected void onDetachedFromWindow() {
+    mViewAttached = false;
+    mRefreshScheduled = false;
+    Choreographer.getInstance().removeFrameCallback(mRefreshFrameCallback);
+    removeCallbacks(mCursorBlinkRunnable);
+    removeCallbacks(mTextBlinkRunnable);
+    mTextBlinkScheduled = false;
+    super.onDetachedFromWindow();
+  }
+
+  @Override
+  protected void onFocusChanged(boolean gainFocus, int direction, android.graphics.Rect previouslyFocusedRect) {
+    super.onFocusChanged(gainFocus, direction, previouslyFocusedRect);
+    // Cursor only blinks while focused; show it solid otherwise (like a typical terminal).
+    mCursorBlinkOn = true;
+    restartCursorBlink();
+    invalidate();
+    // DECSET 1004: report focus in/out to apps that asked for it (vim, tmux, …).
+    if (mEmulator != null && mTermSession != null && mEmulator.isFocusEventsEnabled()) {
+      mTermSession.write(gainFocus ? "\033[I" : "\033[O");
+    }
+  }
+
+  /** Time the cursor stays on / off while blinking. */
+  private static final long CURSOR_BLINK_MS = 500;
+  /** Current blink phase: when false the cursor is hidden for this half-cycle. */
+  private boolean mCursorBlinkOn = true;
+  private final Runnable mCursorBlinkRunnable = new Runnable() {
+    @Override
+    public void run() {
+      if (!mViewAttached || mEmulator == null) return;
+      // Blink only when focused, the cursor is shown, and DECSCUSR asked for a blinking style.
+      boolean blink = isFocused() && mEmulator.isShowingCursor() && mEmulator.isCursorBlinkingEnabled();
+      if (blink) {
+        mCursorBlinkOn = !mCursorBlinkOn;
+        invalidate();
+      } else if (!mCursorBlinkOn) {
+        mCursorBlinkOn = true;
+        invalidate();
+      }
+      postDelayed(this, CURSOR_BLINK_MS);
+    }
+  };
+
+  /** Reset the cursor to solid and restart the blink timer (e.g. on focus or output activity). */
+  private void restartCursorBlink() {
+    removeCallbacks(mCursorBlinkRunnable);
+    mCursorBlinkOn = true;
+    if (mViewAttached) postDelayed(mCursorBlinkRunnable, CURSOR_BLINK_MS);
+  }
+
+  /** Text blink (SGR 5) half-period. */
+  private static final long TEXT_BLINK_MS = 600;
+  private boolean mTextBlinkOn = true;
+  private boolean mTextBlinkScheduled = false;
+  private final Runnable mTextBlinkRunnable = new Runnable() {
+    @Override
+    public void run() {
+      mTextBlinkScheduled = false;
+      mTextBlinkOn = !mTextBlinkOn;
+      invalidate(); // onDraw re-arms the timer while blinking content is still present
+    }
+  };
+
   TerminalViewClient mClient;
+
+  /**
+   * Vertical pan, in pixels, applied so the soft keyboard does not force a PTY resize. When the
+   * keyboard covers the bottom of the view we keep the terminal's row/column count fixed (see
+   * {@link #updateSize}) and instead shift the rendered content up by this amount, so the cursor
+   * and bottom rows stay visible above the keyboard. This avoids reflowing the screen on every
+   * keyboard toggle, which strands the bottom UI of main-buffer apps (e.g. a CLI status box).
+   */
+  private int mKeyboardPanPx = 0;
 
   /**
    * The top row of text to display. Ranges from -activeTranscriptRows to 0.
@@ -66,6 +186,11 @@ public final class TerminalView extends View {
   int mTopRow;
 
   boolean mIsSelectingText = false, mIsDraggingLeftSelection, mInitialTextSelection;
+  /** Per-gesture latch for the pager-vs-terminal touch decision: once a drag is
+   *  classified (horizontal -> let the ViewPager2 page; vertical -> terminal
+   *  scroll) we stick with it. Reset on ACTION_DOWN. */
+  private boolean mGestureDecided = false;
+  private boolean mGestureHorizontal = false;
   /** True while the current touch gesture is dragging a selection handle. */
   private boolean mIsDraggingHandle = false;
   int mSelX1 = -1, mSelX2 = -1, mSelY1 = -1, mSelY2 = -1;
@@ -120,16 +245,11 @@ public final class TerminalView extends View {
   float mScaleFactor = 1.f;
   /* final */ GestureAndScaleRecognizer mGestureRecognizer;
 
-  // ---- Horizontal tab-swipe (drag to page between tabs, with live feedback) ----
-  private static final int SWIPE_UNDECIDED = 0, SWIPE_VERTICAL = 1, SWIPE_HORIZONTAL = 2;
-  /** Direction this gesture committed to, so a started vertical scroll never
-   *  turns into a tab-swipe (or vice versa) mid-gesture. */
-  private int mSwipeMode = SWIPE_UNDECIDED;
-  /** Accumulated finger travel for the current gesture (translation space:
-   *  rightwards positive). */
-  private float mSwipeTotalX, mSwipeTotalY;
-  /** True while actively dragging the content sideways for a tab-swipe. */
-  private boolean mTabSwiping;
+  // Horizontal tab paging is now owned by the enclosing ViewPager2 (so adjacent
+  // tabs are live during the swipe). The TerminalView no longer translates
+  // itself sideways; instead it tells the pager to keep its hands off vertical
+  // scrolls / text selection / pinch via requestDisallowInterceptTouchEvent (see
+  // onTouchEvent), and lets clearly-horizontal drags fall through to the pager.
 
   /**
    * Keep track of where mouse touch event started which we report as mouse scroll.
@@ -170,7 +290,39 @@ public final class TerminalView extends View {
     commonInit(context);
   }
 
+  /** Loaded once: the bundled broad-coverage symbol font used to draw glyphs the
+   *  user font (and the system's subsetted fallback) lack. {@code null} until the
+   *  first load attempt; the load is attempted only once. */
+  private static Typeface sFallbackTypeface;
+  private static boolean sFallbackLoaded = false;
+
+  /**
+   * Load assets/symbol_fallback.ttf (a subset of GNU Unifont covering the symbol,
+   * technical, box-drawing, arrow and dingbat blocks) once and hand it to
+   * {@link TerminalRenderer} as the tofu fallback. Android's own MONOSPACE
+   * fallback chain uses subsetted Noto symbol fonts that omit many of these
+   * glyphs, so without this a TUI's symbols (e.g. Claude's "⏵⏵" auto-accept
+   * marker) render as empty boxes.
+   */
+  private static void ensureFallbackTypeface(Context context) {
+    if (sFallbackLoaded) return;
+    sFallbackLoaded = true;
+    try {
+      sFallbackTypeface = Typeface.createFromAsset(context.getApplicationContext().getAssets(), "symbol_fallback.ttf");
+      TerminalRenderer.setFallbackTypeface(sFallbackTypeface);
+    } catch (Exception e) {
+      Log.w("NeoTerm", "Could not load symbol fallback font, using system MONOSPACE", e);
+    }
+  }
+
   private void commonInit(Context context) {
+    ensureFallbackTypeface(context);
+    // Don't draw the platform's default focus highlight: when the terminal gains focus in
+    // non-touch mode (e.g. right after an Enter key press, which switches the view tree out of
+    // touch mode), Android would otherwise overlay a translucent highlight across the whole view,
+    // making it look "lit up"/selected. The terminal draws its own cursor, so the system highlight
+    // is unwanted. (minSdk 26 -> setDefaultFocusHighlightEnabled is always available.)
+    setDefaultFocusHighlightEnabled(false);
     mGestureRecognizer = new GestureAndScaleRecognizer(context, new GestureAndScaleRecognizer.Listener() {
 
       private boolean scrolledWithFinger;
@@ -234,27 +386,22 @@ public final class TerminalView extends View {
           return true;
         }
 
-        // Decide once per gesture whether this is a sideways tab-swipe or a normal
-        // vertical scroll, then stick with that for the rest of the gesture.
-        mSwipeTotalX += -distanceX; // translation space: moving the finger right is +
-        mSwipeTotalY += distanceY;
-        if (mSwipeMode == SWIPE_UNDECIDED) {
-          if (Math.abs(mSwipeTotalX) > dpToPx(16) && Math.abs(mSwipeTotalX) > Math.abs(mSwipeTotalY) * 1.4f) {
-            mSwipeMode = SWIPE_HORIZONTAL;
-          } else if (Math.abs(mSwipeTotalY) > dpToPx(8)) {
-            mSwipeMode = SWIPE_VERTICAL;
-          }
+        // Classify the drag once: a clearly-horizontal drag is handed to the
+        // enclosing ViewPager2 (page tabs); anything else (vertical) stays with
+        // the terminal. We already disallowed parent intercept on ACTION_DOWN, so
+        // long-press/selection/pinch are safe; here we only RELEASE to the pager
+        // for a horizontal drag.
+        if (!mGestureDecided) {
+          mGestureDecided = true;
+          mGestureHorizontal = Math.abs(distanceX) > Math.abs(distanceY);
+          if (mGestureHorizontal) allowParentIntercept();
         }
-
-        if (mSwipeMode == SWIPE_HORIZONTAL) {
-          mTabSwiping = true;
-          // Follow the finger 1:1 (clamped to one screen width) so it's obvious
-          // how far you've dragged toward the half-screen commit point.
-          float w = Math.max(1, getWidth());
-          setTranslationX(Math.max(-w, Math.min(w, mSwipeTotalX)));
+        if (mGestureHorizontal) {
+          // The pager owns this gesture now (it will intercept the next move).
           return true;
         }
 
+        disallowParentIntercept();
         scrolledWithFinger = true;
         scrollByPixels(e, distanceY);
         return true;
@@ -263,6 +410,9 @@ public final class TerminalView extends View {
       @Override
       public boolean onScale(float focusX, float focusY, float scale) {
         if (mEmulator == null || mIsSelectingText) return true;
+        // A pinch is a two-finger terminal gesture (font zoom): keep the pager
+        // from hijacking it as a horizontal page swipe.
+        disallowParentIntercept();
         mScaleFactor *= scale;
         // 这里一般是改变文字大小
         mScaleFactor = mClient.onScale(mScaleFactor);
@@ -273,11 +423,6 @@ public final class TerminalView extends View {
       public boolean onFling(final MotionEvent e2, float velocityX, float velocityY) {
         // While selecting, flinging is driven manually from onTouchEvent.
         if (mEmulator == null || mIsSelectingText) return true;
-
-        // A horizontal tab-swipe is finalized on touch-up (finalizeTabSwipe),
-        // using the drag distance + release velocity — so don't also start a
-        // vertical fling for it here.
-        if (mTabSwiping || mSwipeMode == SWIPE_HORIZONTAL) return true;
 
         startFling(e2, velocityY);
         return true;
@@ -366,6 +511,15 @@ public final class TerminalView extends View {
    *
    * @param session The {@link TerminalSession} this view will be displaying.
    */
+  /** The user's default cursor shape (CURSOR_STYLE_*), or -1 to leave the emulator default. */
+  private int mDefaultCursorStyle = -1;
+
+  /** Set the default cursor shape; applied to the emulator now (if attached) and on attach. */
+  public void setCursorStyle(int style) {
+    mDefaultCursorStyle = style;
+    if (mEmulator != null && style >= 0) mEmulator.setCursorStyle(style);
+  }
+
   public boolean attachSession(TerminalSession session) {
     if (session == mTermSession) return false;
     mTopRow = 0;
@@ -375,6 +529,8 @@ public final class TerminalView extends View {
     mCombiningAccent = 0;
 
     updateSize();
+    // Apply the user's default cursor shape to the freshly attached emulator.
+    if (mEmulator != null && mDefaultCursorStyle >= 0) mEmulator.setCursorStyle(mDefaultCursorStyle);
 
     // Wait with enabling the scrollbar until we have a terminal to get scroll position from.
     setVerticalScrollBarEnabled(true);
@@ -596,7 +752,9 @@ public final class TerminalView extends View {
     }
 
     mEmulator.clearScrollCounter();
-    invalidate();
+    scheduleRefresh();
+    // Keep the cursor solid while output is flowing; it resumes blinking once things go idle.
+    restartCursorBlink();
 
     // Basic accessibility service
     String contentText = mEmulator.getScreen()
@@ -752,9 +910,26 @@ public final class TerminalView extends View {
   @TargetApi(23)
   public boolean onTouchEvent(MotionEvent ev) {
     if (mEmulator == null) return true;
+    // Map touch coordinates into the (keyboard-)panned content space, so taps/selection land on
+    // the same rows the renderer drew. A single offset here covers every downstream getY() use
+    // (gesture detector, selection, hit-testing).
+    if (mKeyboardPanPx != 0) ev.offsetLocation(0, mKeyboardPanPx);
     final int action = ev.getAction();
 
+    // Claim the gesture up front (touch only) so a long-press/selection/vertical
+    // scroll/pinch can't be stolen by the enclosing ViewPager2 on a tiny finger
+    // wobble. The first onScroll releases it back to the pager only for a
+    // clearly-horizontal drag (mGestureHorizontal).
+    if (action == MotionEvent.ACTION_DOWN && !ev.isFromSource(InputDevice.SOURCE_MOUSE)) {
+      mGestureDecided = false;
+      mGestureHorizontal = false;
+      disallowParentIntercept();
+    }
+
     if (mIsSelectingText) {
+      // The whole gesture belongs to text selection / its scroll: keep the pager
+      // from intercepting any part of it as a page swipe.
+      disallowParentIntercept();
       switch (action) {
         case MotionEvent.ACTION_UP:
         case MotionEvent.ACTION_CANCEL:
@@ -857,46 +1032,27 @@ public final class TerminalView extends View {
       }
     }
 
-    // Horizontal tab-swipe bookkeeping (the sideways translation itself is driven
-    // by onScroll). Reset on down and decide/animate on up.
-    if (!ev.isFromSource(InputDevice.SOURCE_MOUSE)) {
-      switch (action) {
-        case MotionEvent.ACTION_DOWN:
-          mSwipeMode = SWIPE_UNDECIDED;
-          mSwipeTotalX = mSwipeTotalY = 0;
-          mTabSwiping = false;
-          animate().cancel();
-          if (getTranslationX() != 0) setTranslationX(0);
-          break;
-        case MotionEvent.ACTION_UP:
-        case MotionEvent.ACTION_CANCEL:
-          if (mTabSwiping) finalizeTabSwipe();
-          break;
-      }
-    }
-
     mGestureRecognizer.onTouchEvent(ev);
     return true;
   }
 
   /**
-   * Decide whether a finished horizontal drag pages to an adjacent tab. It commits
-   * only on a deliberate drag of about a third of the screen width, so accidental
-   * sideways movement never switches tabs. The content always animates back to
-   * rest; on a commit the tab switch swaps in the new session underneath.
+   * Ask the enclosing scrolling container (the ViewPager2's internal
+   * RecyclerView) not to intercept the rest of this gesture, so a vertical
+   * terminal scroll / text selection / pinch is not stolen and turned into a
+   * horizontal page swipe. A clearly-horizontal drag never calls this, so the
+   * pager is still free to page between live tabs.
    */
-  private void finalizeTabSwipe() {
-    final float w = Math.max(1, getWidth());
-    final boolean doSwitch = mClient != null && Math.abs(mSwipeTotalX) >= w * 0.33f;
+  private void disallowParentIntercept() {
+    ViewParent parent = getParent();
+    if (parent != null) parent.requestDisallowInterceptTouchEvent(true);
+  }
 
-    mTabSwiping = false;
-    mSwipeMode = SWIPE_UNDECIDED;
-
-    animate().translationX(0).setDuration(160).withEndAction(() -> setTranslationX(0)).start();
-    if (doSwitch) {
-      // Dragged right -> previous tab; dragged left -> next tab.
-      mClient.onSwipe(mSwipeTotalX < 0);
-    }
+  /** Hand the gesture back to the enclosing ViewPager2 (used once a drag is
+   *  classified as a horizontal page swipe). */
+  private void allowParentIntercept() {
+    ViewParent parent = getParent();
+    if (parent != null) parent.requestDisallowInterceptTouchEvent(false);
   }
 
   /**
@@ -1356,11 +1512,27 @@ public final class TerminalView extends View {
   }
 
   /**
+   * Set the keyboard pan (px). Called by the host activity when the soft keyboard overlaps the
+   * view. We deliberately do NOT resize here: the value is stored and the next layout pass
+   * ({@link #onSizeChanged} -> {@link #updateSize}) recomputes rows against the un-panned height,
+   * keeping the row count constant across the keyboard toggle. Only a repaint is needed to apply
+   * the new content offset.
+   */
+  public void setKeyboardPan(int panPx) {
+    if (panPx < 0) panPx = 0;
+    if (panPx == mKeyboardPanPx) return;
+    mKeyboardPanPx = panPx;
+    invalidate();
+  }
+
+  /**
    * Check if the terminal size in rows and columns should be updated.
    */
   public void updateSize() {
     int viewWidth = getWidth();
-    int viewHeight = getHeight();
+    // Add back the keyboard pan so the row count is computed against the full (un-covered) height:
+    // the keyboard pans the content instead of resizing the terminal.
+    int viewHeight = getHeight() + mKeyboardPanPx;
     if (viewWidth == 0 || viewHeight == 0 || mTermSession == null) return;
 
     // Set to 80 and 24 if you want to enable vttest.
@@ -1388,7 +1560,22 @@ public final class TerminalView extends View {
     if (mEmulator == null) {
       canvas.drawColor(0XFF000000);
     } else {
-      mRenderer.render(mEmulator, canvas, mTopRow, mSelY1, mSelY2, mSelX1, mSelX2);
+      // Pan the content up when the keyboard covers the bottom (see mKeyboardPanPx). Wrapped in
+      // save/restore so the offset doesn't leak into foreground drawing (e.g. scrollbars).
+      int saveCount = -1;
+      if (mKeyboardPanPx != 0) {
+        saveCount = canvas.save();
+        canvas.translate(0, -mKeyboardPanPx);
+      }
+      mRenderer.render(mEmulator, canvas, mTopRow, mSelY1, mSelY2, mSelX1, mSelX2, mCursorBlinkOn, mTextBlinkOn, isFocused());
+      // Run the text-blink timer only while blinking content is actually on screen.
+      if (mRenderer.hasBlinkingCells()) {
+        if (!mTextBlinkScheduled) { mTextBlinkScheduled = true; postDelayed(mTextBlinkRunnable, TEXT_BLINK_MS); }
+      } else if (mTextBlinkScheduled) {
+        mTextBlinkScheduled = false;
+        removeCallbacks(mTextBlinkRunnable);
+        mTextBlinkOn = true;
+      }
 
       if (mIsSelectingText) {
         final int gripHandleWidth = mLeftSelectionHandle.getIntrinsicWidth();
@@ -1404,6 +1591,8 @@ public final class TerminalView extends View {
         mRightSelectionHandle.setBounds(left, top, left + gripHandleWidth, top + mRightSelectionHandle.getIntrinsicHeight());
         mRightSelectionHandle.draw(canvas);
       }
+
+      if (saveCount != -1) canvas.restoreToCount(saveCount);
     }
   }
 

@@ -44,10 +44,50 @@ final class TerminalRenderer {
 
   private final float[] asciiMeasures = new float[127];
 
+  /**
+   * Fallback typeface used to draw glyphs the user-selected font lacks, so they
+   * don't render as tofu. Installed at startup with the bundled broad-coverage
+   * symbol font (assets/symbol_fallback.ttf) via
+   * {@link #setFallbackTypeface(Typeface)}. Until then it degrades to the system
+   * MONOSPACE — whose fallback chain uses *subsetted* Noto symbol fonts that
+   * themselves omit many glyphs (e.g. the media-control triangles U+23F4..FA used
+   * by TUIs), which is exactly the tofu the bundled font fixes.
+   */
+  private static Typeface sFallbackTypeface = Typeface.MONOSPACE;
+
+  /** Install the bundled symbol fallback font (see {@link #sFallbackTypeface}). */
+  static void setFallbackTypeface(Typeface typeface) {
+    if (typeface != null) sFallbackTypeface = typeface;
+  }
+  /** Per-code-point cache of whether the user font has the glyph (1) or needs
+   *  the fallback (0); -1 = unknown. Keeps the per-frame check cheap. */
+  private final android.util.SparseIntArray mGlyphCache = new android.util.SparseIntArray();
+
   // Reusable objects for drawing inline image (Sixel) cell tiles.
   private final Rect mImageSrc = new Rect();
   private final RectF mImageDst = new RectF();
   private final Paint mImagePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+
+  // Reusable objects for drawing extended underline styles (double/curly/dotted/dashed).
+  private final Paint mUnderlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+  private final android.graphics.Path mUnderlinePath = new android.graphics.Path();
+
+  // Paint for box-drawing/block/Braille glyphs rendered by LineBlockCharacters
+  // (kept separate so it doesn't disturb the text paint's state mid-run).
+  private final Paint mLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+  /** Whether the cursor is drawn as a hollow outline (set per render() call when unfocused). */
+  private boolean mCursorHollow = false;
+  /** Whether blinking text is currently in its visible half-cycle (set per render() call). */
+  private boolean mTextBlinkVisible = true;
+  /** Set during a render pass if any cell carried the BLINK attribute (presence, not phase). */
+  private boolean mHasBlinkingCells = false;
+
+  /** Whether the last render saw any blinking cell — the view uses this to run the blink timer
+   *  only while blinking content is on screen. */
+  boolean hasBlinkingCells() {
+    return mHasBlinkingCells;
+  }
 
   public TerminalRenderer(int textSize, Typeface typeface) {
     mTextSize = textSize;
@@ -73,13 +113,19 @@ final class TerminalRenderer {
    * Render the terminal to a canvas with at a specified row scroll, and an optional rectangular selection.
    */
   public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
-                           int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
+                           int selectionY1, int selectionY2, int selectionX1, int selectionX2,
+                           boolean cursorBlinkOn, boolean textBlinkOn, boolean cursorFocused) {
+    mTextBlinkVisible = textBlinkOn;
+    mHasBlinkingCells = false;
+    mCursorHollow = !cursorFocused;
     final boolean reverseVideo = mEmulator.isReverseVideo();
     final int endRow = topRow + mEmulator.mRows;
     final int columns = mEmulator.mColumns;
     final int cursorCol = mEmulator.getCursorCol();
     final int cursorRow = mEmulator.getCursorRow();
-    final boolean cursorVisible = mEmulator.isShowingCursor();
+    // Shown when the emulator says so AND (focused: the blink phase is on; unfocused: always,
+    // as a hollow outline).
+    final boolean cursorVisible = mEmulator.isShowingCursor() && (cursorFocused ? cursorBlinkOn : true);
     final TerminalBuffer screen = mEmulator.getScreen();
     final int[] palette = mEmulator.mColors.mCurrentColors;
     final int cursorShape = mEmulator.getCursorStyle();
@@ -112,9 +158,13 @@ final class TerminalRenderer {
       long lastRunStyle = 0;
       boolean lastRunInsideCursor = false;
       boolean lastRunUrl = false;
+      int lastRunUnderlineColor = 0;
       int lastRunStartColumn = -1;
       int lastRunStartIndex = 0;
       boolean lastRunFontWidthMismatch = false;
+      boolean lastRunMissingGlyph = false;
+      boolean lastRunLineDraw = false;
+      boolean lastRunEmoji = false;
       int currentCharIndex = 0;
       float measuredWidthForRun = 0.f;
 
@@ -125,23 +175,47 @@ final class TerminalRenderer {
         final int codePoint = charIsHighsurrogate ? Character.toCodePoint(charAtIndex, line[currentCharIndex + 1]) : charAtIndex;
         int codePointWcWidth = WcWidth.width(codePoint);
         // VS16 (U+FE0F) right after a width-1 base makes it emoji-presentation,
-        // width 2 — match the emulator's cursor model (see emitCodePoint).
-        if (codePointWcWidth == 1 && followedByVs16(line, currentCharIndex + charsForCodePoint, charsUsedInLine)) {
+        // width 2 — match the emulator's cursor model (see emitCodePoint). It also
+        // means Android renders the cell with the colour emoji font, so it must be
+        // treated as an emoji below even when the user font has the base text glyph.
+        final boolean hasVs16 = codePointWcWidth == 1
+          && followedByVs16(line, currentCharIndex + charsForCodePoint, charsUsedInLine);
+        if (hasVs16) {
           codePointWcWidth = 2;
         }
         final boolean insideCursor = (column >= selx1 && column <= selx2) || (cursorX == column || (codePointWcWidth == 2 && cursorX == column + 1));
         final boolean insideUrl = rowUrlMask != null && column < rowUrlMask.length && rowUrlMask[column];
         final long style = lineObject.getStyle(column);
+        final int underlineColor = lineObject.getUnderlineColor(column);
 
         // Check if the measured text width for this code point is not the same as that expected by wcwidth().
         // This could happen for some fonts which are not truly monospace, or for more exotic characters such as
         // smileys which android font renders as wide.
         // If this is detected, we draw this code point scaled to match what wcwidth() expects.
-        final float measuredCodePointWidth = (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint] : mTextPaint.measureText(line,
-          currentCharIndex, charsForCodePoint);
+        // A custom (user) font has no system fallback chain, so glyphs it lacks
+        // would render as tofu/blank. Detect those and draw the run with a
+        // fallback typeface (which does fall back to the system fonts).
+        // Box-drawing / Block / Braille glyphs are drawn by us (LineBlockCharacters)
+        // into the exact cell, gap-free, instead of using the font glyph.
+        final boolean lineDraw = codePointWcWidth > 0 && LineBlockCharacters.canDraw(codePoint);
+        final boolean missingGlyph = !lineDraw && codePointWcWidth > 0 && !fontHasGlyph(codePoint);
+        // Colour emoji (drawn via the system emoji font) get their own run, drawn with the emoji
+        // typeface and clipped to their own cell box. Noto draws some emoji (e.g. the ♀/♂ gender
+        // signs) with ink wider than their advance; sharing a run, or not clipping, lets that ink
+        // overlap the next glyph. A VS16 (hasVs16) forces emoji presentation even when the user
+        // font has the base text glyph (so missingGlyph would be false) — it must count as emoji.
+        final boolean emoji = hasVs16 || (missingGlyph && isEmojiCodepoint(codePoint));
+        // For a present glyph use the real measured width (so non-monospace and
+        // wide glyphs are scaled to their cell); for a missing one the user font's
+        // measure is meaningless (often the .notdef/tofu advance, sometimes 0), so
+        // use the expected cell width — the real width comes from the fallback font.
+        // Line-draw glyphs use the exact cell width so they aren't scaled.
+        final float measuredCodePointWidth = (missingGlyph || lineDraw || emoji) ? (codePointWcWidth * mFontWidth)
+          : (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint]
+          : mTextPaint.measureText(line, currentCharIndex, charsForCodePoint);
         final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
 
-        if (style != lastRunStyle || insideCursor != lastRunInsideCursor || insideUrl != lastRunUrl || fontWidthMismatch || lastRunFontWidthMismatch) {
+        if (style != lastRunStyle || insideCursor != lastRunInsideCursor || insideUrl != lastRunUrl || underlineColor != lastRunUnderlineColor || fontWidthMismatch || lastRunFontWidthMismatch || missingGlyph != lastRunMissingGlyph || lineDraw != lastRunLineDraw || emoji || lastRunEmoji) {
           if (column == 0) {
             // Skip first column as there is nothing to draw, just record the current style.
           } else {
@@ -150,23 +224,38 @@ final class TerminalRenderer {
             int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun,
               lastRunStartIndex, charsSinceLastRun, measuredWidthForRun,
-              cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl);
+              cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor, lastRunLineDraw, lastRunEmoji);
           }
           measuredWidthForRun = 0.f;
           lastRunStyle = style;
           lastRunInsideCursor = insideCursor;
           lastRunUrl = insideUrl;
+          lastRunUnderlineColor = underlineColor;
           lastRunStartColumn = column;
           lastRunStartIndex = currentCharIndex;
           lastRunFontWidthMismatch = fontWidthMismatch;
+          lastRunMissingGlyph = missingGlyph;
+          lastRunLineDraw = lineDraw;
+          lastRunEmoji = emoji;
         }
         measuredWidthForRun += measuredCodePointWidth;
         column += codePointWcWidth;
         currentCharIndex += charsForCodePoint;
-        while (currentCharIndex < charsUsedInLine && WcWidth.width(line, currentCharIndex) <= 0) {
-          // Eat combining chars so that they are treated as part of the last non-combining code point,
-          // instead of e.g. being considered inside the cursorColor in the next run.
-          currentCharIndex += Character.isHighSurrogate(line[currentCharIndex]) ? 2 : 1;
+        // Eat combining chars AND grapheme-joined code points (ZWJ emoji, skin-tone modifiers) so
+        // they belong to the preceding cell's run and are drawn as one shaped cluster, matching how
+        // the emulator stored them width-0 (same WcWidth.joinsPreviousGrapheme rule, or the cluster
+        // would be split and overlap the next glyph).
+        int prevClusterCp = codePoint;
+        while (currentCharIndex < charsUsedInLine) {
+          final char nc = line[currentCharIndex];
+          final boolean ncHigh = Character.isHighSurrogate(nc);
+          final int ncCp = ncHigh ? Character.toCodePoint(nc, line[currentCharIndex + 1]) : nc;
+          if (WcWidth.width(ncCp) <= 0 || WcWidth.joinsPreviousGrapheme(prevClusterCp, ncCp)) {
+            currentCharIndex += ncHigh ? 2 : 1;
+            prevClusterCp = ncCp;
+          } else {
+            break;
+          }
         }
       }
 
@@ -174,7 +263,7 @@ final class TerminalRenderer {
       final int charsSinceLastRun = currentCharIndex - lastRunStartIndex;
       int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
       drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
-        measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl);
+        measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo, lastRunUrl, lastRunMissingGlyph, lastRunUnderlineColor, lastRunLineDraw, lastRunEmoji);
 
       // Inline image (Sixel) cells: drawTextRun skips them, so draw their bitmap
       // tiles here over the (blank) cells. Only when images exist on screen.
@@ -189,6 +278,26 @@ final class TerminalRenderer {
    * points attached to the preceding cell) contains a VS16 (U+FE0F). Scans only
    * the run of zero-width code points, mirroring how the render loop eats them.
    */
+  /**
+   * Whether the user-selected font can render {@code codePoint}. ASCII is always
+   * present; other code points are probed once via {@link Paint#hasGlyph} and
+   * cached. When false, the run is drawn with {@link #sFallbackTypeface} so the
+   * glyph falls back to the bundled symbol font instead of rendering as tofu.
+   */
+  private boolean fontHasGlyph(int codePoint) {
+    if (codePoint < 0x80) return true;
+    int cached = mGlyphCache.get(codePoint, -1);
+    if (cached != -1) return cached == 1;
+    boolean has;
+    try {
+      has = mTextPaint.hasGlyph(new String(Character.toChars(codePoint)));
+    } catch (Exception e) {
+      has = true; // On any error, assume present (draw with the user font).
+    }
+    mGlyphCache.put(codePoint, has ? 1 : 0);
+    return has;
+  }
+
   private static boolean followedByVs16(char[] line, int index, int charsUsed) {
     int i = index;
     while (i < charsUsed && WcWidth.width(line, i) <= 0) {
@@ -322,14 +431,17 @@ final class TerminalRenderer {
 
   private void drawTextRun(Canvas canvas, char[] text, int[] palette, float y, int startColumn, int runWidthColumns,
                            int startCharIndex, int runWidthChars, float mes, int cursor, int cursorStyle,
-                           long textStyle, boolean reverseVideo, boolean forceUnderline) {
+                           long textStyle, boolean reverseVideo, boolean forceUnderline, boolean fallbackFont,
+                           int underlineColor, boolean lineDraw, boolean emoji) {
     // Inline image cells are drawn separately (drawImageCells); skip them here so
     // their packed image id isn't misread as colours.
     if (TextStyle.isImage(textStyle)) return;
     int foreColor = TextStyle.decodeForeColor(textStyle);
     final int effect = TextStyle.decodeEffect(textStyle);
     int backColor = TextStyle.decodeBackColor(textStyle);
-    final boolean bold = (effect & (TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_BLINK)) != 0;
+    final boolean bold = (effect & TextStyle.CHARACTER_ATTRIBUTE_BOLD) != 0;
+    final boolean blink = (effect & TextStyle.CHARACTER_ATTRIBUTE_BLINK) != 0;
+    if (blink) mHasBlinkingCells = true;
     // URLs are underlined so the user can see they are tappable.
     final boolean underline = forceUnderline || (effect & TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE) != 0;
     final boolean italic = (effect & TextStyle.CHARACTER_ATTRIBUTE_ITALIC) != 0;
@@ -354,6 +466,20 @@ final class TerminalRenderer {
       backColor = tmp;
     }
 
+    // Runs drawn with a non-user typeface: switch it now and re-measure so the scale-to-fit below
+    // uses the real glyph advances. Emoji runs (incl. VS16 emoji-presentation, ZWJ clusters and
+    // skin-tone) use the system font's colour emoji; other missing glyphs use the bundled symbol
+    // font. The typeface is restored at the end of the method.
+    final boolean nonUserTypeface = fallbackFont || emoji;
+    if (nonUserTypeface) {
+      char fc = text[startCharIndex];
+      int firstCp = (Character.isHighSurrogate(fc) && startCharIndex + 1 < text.length)
+        ? Character.toCodePoint(fc, text[startCharIndex + 1]) : fc;
+      mTextPaint.setTypeface((emoji || isEmojiCodepoint(firstCp)) ? Typeface.DEFAULT : sFallbackTypeface);
+      float fallbackMeasured = mTextPaint.measureText(text, startCharIndex, runWidthChars);
+      if (fallbackMeasured > 0f) mes = fallbackMeasured;
+    }
+
     float left = startColumn * mFontWidth;
     float right = left + runWidthColumns * mFontWidth;
 
@@ -366,6 +492,8 @@ final class TerminalRenderer {
       right *= mes / runWidthColumns;
       savedMatrix = true;
     }
+    // Cell box for clipping the glyph (captured before the bar-cursor shrinks `right`).
+    final float clipLeft = left, clipRight = right;
 
     if (backColor != palette[TextStyle.COLOR_INDEX_BACKGROUND]) {
       // Only draw non-default backgroundColor.
@@ -378,13 +506,34 @@ final class TerminalRenderer {
       float cursorHeight = mFontLineSpacingAndAscent - mFontAscent;
       if (cursorStyle == TerminalEmulator.CURSOR_STYLE_UNDERLINE) cursorHeight /= 4.;
       else if (cursorStyle == TerminalEmulator.CURSOR_STYLE_BAR) right -= ((right - left) * 3) / 4.;
-      canvas.drawRect(left, y - cursorHeight, right, y, mTextPaint);
+      if (mCursorHollow) {
+        // Unfocused: draw the cursor as a hollow outline so it's clearly "not active".
+        float w = Math.max(1f, mFontLineSpacing * 0.06f);
+        mTextPaint.setStyle(Paint.Style.STROKE);
+        mTextPaint.setStrokeWidth(w);
+        canvas.drawRect(left + w / 2f, y - cursorHeight + w / 2f, right - w / 2f, y - w / 2f, mTextPaint);
+        mTextPaint.setStyle(Paint.Style.FILL);
+      } else {
+        canvas.drawRect(left, y - cursorHeight, right, y, mTextPaint);
+      }
       savedLastDrawnLineX = left;
       savedLastDrawnLineY = y;
     }
 
-    if ((effect & TextStyle.CHARACTER_ATTRIBUTE_INVISIBLE) == 0) {
-      if (dim) {
+    // Blinking text is hidden during the "off" half of the blink phase (the cell's background
+    // still shows). The cursor cell is never hidden so it stays usable.
+    final boolean blinkHidden = blink && !mTextBlinkVisible && cursor == 0;
+    if ((effect & TextStyle.CHARACTER_ATTRIBUTE_INVISIBLE) == 0 && !blinkHidden) {
+      // A block cursor fills the whole cell with the cursor colour and the glyph is painted on
+      // top of it. Draw that glyph in the cell's background colour (reverse video under the
+      // cursor) so it stays readable -- otherwise a glyph whose colour happens to match the
+      // cursor colour would vanish under the block. Bar/underline cursors don't cover the glyph.
+      // Only a filled block cursor covers the glyph; a hollow outline leaves it normal.
+      final boolean blockCursorOverGlyph =
+        cursor != 0 && cursorStyle == TerminalEmulator.CURSOR_STYLE_BLOCK && !mCursorHollow;
+      if (blockCursorOverGlyph) foreColor = backColor;
+
+      if (dim && !blockCursorOverGlyph) {
         int red = (0xFF & (foreColor >> 16));
         int green = (0xFF & (foreColor >> 8));
         int blue = (0xFF & foreColor);
@@ -396,17 +545,130 @@ final class TerminalRenderer {
         foreColor = 0xFF000000 + (red << 16) + (green << 8) + blue;
       }
 
+      // Plain single underline in the text colour is drawn by Paint; a non-single shape OR a
+      // distinct underline colour (SGR 58) is drawn manually below, since Paint's built-in
+      // underline can only use the text colour. (forceUnderline, e.g. URLs, stays single.)
+      final int underlineStyle = underline ? TextStyle.decodeUnderlineStyle(textStyle) : 0;
+      final boolean customUnderline = underline && (underlineStyle >= TextStyle.UNDERLINE_DOUBLE || underlineColor != 0);
+
       mTextPaint.setFakeBoldText(bold);
-      mTextPaint.setUnderlineText(underline);
+      mTextPaint.setUnderlineText(underline && !customUnderline);
       mTextPaint.setTextSkewX(italic ? -0.35f : 0.f);
       mTextPaint.setStrikeThruText(strikeThrough);
       mTextPaint.setColor(foreColor);
 
-      // The text alignment is the default Paint.Align.LEFT.
-      canvas.drawText(text, startCharIndex, runWidthChars, left, y - mFontLineSpacingAndAscent, mTextPaint);
+      // The text alignment is the default Paint.Align.LEFT. For fallback runs the
+      // typeface was switched (and the run measured) above; it is restored below so
+      // it is reset even for invisible runs. Box-drawing/Block/Braille runs are
+      // painted gap-free by us instead of using the (often misaligned) font glyph.
+      if (lineDraw) {
+        drawLineDrawRun(canvas, text, startCharIndex, runWidthChars, startColumn, y, foreColor, bold);
+      } else if (nonUserTypeface) {
+        // Confine the (often over-wide) fallback/emoji glyph ink to this run's cells so it can't
+        // bleed over the neighbouring glyph. Each emoji is its own run (see the 'emoji' flag).
+        canvas.save();
+        canvas.clipRect(clipLeft, y - mFontLineSpacingAndAscent + mFontAscent, clipRight, y);
+        canvas.drawText(text, startCharIndex, runWidthChars, left, y - mFontLineSpacingAndAscent, mTextPaint);
+        canvas.restore();
+      } else {
+        canvas.drawText(text, startCharIndex, runWidthChars, left, y - mFontLineSpacingAndAscent, mTextPaint);
+      }
+
+      if (customUnderline) {
+        int ulColor = underlineColor != 0 ? underlineColor : foreColor;
+        drawExtendedUnderline(canvas, left, right, y, ulColor,
+          underlineStyle == 0 ? TextStyle.UNDERLINE_SINGLE : underlineStyle);
+      }
     }
 
+    if (nonUserTypeface) mTextPaint.setTypeface(mTypeface);
     if (savedMatrix) canvas.restore();
+  }
+
+  /**
+   * Paint a run of Box-drawing / Block / Braille cells with {@link LineBlockCharacters},
+   * each into its exact (gap-free, pixel-snapped) cell rectangle so adjacent frame and
+   * bar segments join seamlessly. Cells are width-1 single-char BMP code points; any
+   * trailing combining marks are skipped defensively.
+   */
+  private void drawLineDrawRun(Canvas canvas, char[] text, int startCharIndex, int runWidthChars,
+                               int startColumn, float y, int color, boolean bold) {
+    final int cellTop = Math.round(y - mFontLineSpacingAndAscent + mFontAscent);
+    final int cellBottom = Math.round(y);
+    final int cellH = cellBottom - cellTop;
+    mLinePaint.setColor(color);
+
+    final int end = startCharIndex + runWidthChars;
+    int charIndex = startCharIndex;
+    int column = startColumn;
+    while (charIndex < end) {
+      final char c = text[charIndex];
+      final boolean highSurrogate = Character.isHighSurrogate(c); // Legacy Computing is astral
+      final int codePoint = highSurrogate ? Character.toCodePoint(c, text[charIndex + 1]) : c;
+      final int cellLeft = Math.round(column * mFontWidth);
+      final int cellW = Math.round((column + 1) * mFontWidth) - cellLeft;
+      LineBlockCharacters.draw(canvas, mLinePaint, cellLeft, cellTop, cellW, cellH, codePoint, bold);
+      charIndex += highSurrogate ? 2 : 1;
+      column++;
+      while (charIndex < end && WcWidth.width(text, charIndex) <= 0) {
+        charIndex += Character.isHighSurrogate(text[charIndex]) ? 2 : 1;
+      }
+    }
+  }
+
+  /** Draw a double/curly/dotted/dashed underline across [left,right] near the cell bottom. */
+  private void drawExtendedUnderline(Canvas canvas, float left, float right, float y, int color, int style) {
+    final float thickness = Math.max(1f, mFontLineSpacing * 0.06f);
+    final float baseline = y - mFontLineSpacingAndAscent;
+    float lineY = baseline + mFontLineSpacing * 0.12f;
+    if (lineY > y - thickness) lineY = y - thickness;
+
+    mUnderlinePaint.setColor(color);
+    mUnderlinePaint.setStyle(Paint.Style.STROKE);
+    mUnderlinePaint.setStrokeWidth(thickness);
+    mUnderlinePaint.setPathEffect(null);
+
+    switch (style) {
+      case TextStyle.UNDERLINE_DOUBLE: {
+        float gap = thickness + 1.5f;
+        canvas.drawLine(left, lineY, right, lineY, mUnderlinePaint);
+        canvas.drawLine(left, lineY - gap, right, lineY - gap, mUnderlinePaint);
+        break;
+      }
+      case TextStyle.UNDERLINE_CURLY: {
+        float amp = Math.max(1f, mFontLineSpacing * 0.06f);
+        float period = Math.max(4f, mFontWidth * 0.5f);
+        float midY = lineY - amp;
+        mUnderlinePath.rewind();
+        mUnderlinePath.moveTo(left, midY);
+        boolean up = true;
+        for (float x = left; x < right; x += period) {
+          float nx = Math.min(x + period, right);
+          mUnderlinePath.quadTo((x + nx) / 2f, midY + (up ? -amp : amp), nx, midY);
+          up = !up;
+        }
+        canvas.drawPath(mUnderlinePath, mUnderlinePaint);
+        break;
+      }
+      case TextStyle.UNDERLINE_DOTTED:
+        mUnderlinePaint.setPathEffect(new android.graphics.DashPathEffect(new float[]{thickness, thickness * 2f}, 0f));
+        canvas.drawLine(left, lineY, right, lineY, mUnderlinePaint);
+        mUnderlinePaint.setPathEffect(null);
+        break;
+      case TextStyle.UNDERLINE_DASHED:
+        mUnderlinePaint.setPathEffect(new android.graphics.DashPathEffect(new float[]{mFontWidth * 0.5f, mFontWidth * 0.3f}, 0f));
+        canvas.drawLine(left, lineY, right, lineY, mUnderlinePaint);
+        mUnderlinePaint.setPathEffect(null);
+        break;
+      default:
+        canvas.drawLine(left, lineY, right, lineY, mUnderlinePaint);
+    }
+  }
+
+  /** Emoji code points that should render with the system colour-emoji font, not the symbol
+   *  fallback: the supplementary emoji blocks plus Misc Symbols / Dingbats. */
+  private static boolean isEmojiCodepoint(int cp) {
+    return cp >= 0x1F000 || (cp >= 0x2600 && cp <= 0x27BF);
   }
 
   float getCursorX() {

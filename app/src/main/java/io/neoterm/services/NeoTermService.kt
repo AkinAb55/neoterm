@@ -49,6 +49,13 @@ class NeoTermService : Service() {
   @Volatile
   private var stopping = false
 
+  // Periodikusan frissíti a fake /proc/uptime-ot, hogy a guest uptime-ja
+  // „ketyegjen" (a fake statikus fájl-bind, magától nem változna). Csak amíg a
+  // service él (azaz fut terminál) — idle-ben nincs költsége.
+  @Volatile
+  private var uptimeTickerRunning = false
+  private var uptimeThread: Thread? = null
+
   // The embedded X server runs in its own process (com.termux.x11.NeoX11Service).
   // We keep it alive by binding it with BIND_IMPORTANT, so it needs no
   // notification of its own — its status is shown in this service's notification.
@@ -63,6 +70,7 @@ class NeoTermService : Service() {
     super.onCreate()
     createNotificationChannel()
     startForeground(NOTIFICATION_ID, createNotification())
+    startUptimeTicker()
     // Wake lock on by default (keep the CPU running). Don't pop the battery-
     // optimization dialog at startup — that's only prompted on a manual acquire.
     acquireLock(promptBatteryOpt = false)
@@ -73,6 +81,15 @@ class NeoTermService : Service() {
       // Start the Android-side PulseAudio with the app, so terminal apps (not
       // just X11) can play audio via PULSE_SERVER=127.0.0.1:4713.
       io.neoterm.utils.PulseAudioBridge.start(this)
+      // Camera: when enabled (+ CAMERA granted), serve the device camera as an
+      // MJPEG stream on NEOTERM_CAMERA_URL for distro apps.
+      io.neoterm.utils.CameraBridge.start(this)
+      // GPS: when enabled (+ location granted), run a built-in gpsd on
+      // 127.0.0.1:2947 serving the device GPS to the distro.
+      io.neoterm.utils.GpsBridge.start(this)
+      // Sensors + battery: expose them to the distro as a fake /sys
+      // (power_supply + IIO devices), so upower/acpi/iio_info work with no root.
+      io.neoterm.utils.SensorBridge.start(this)
       // USB host: detect plug-in/out and request permission via a
       // BroadcastReceiver (no manifest device_filter), serving granted devices.
       io.neoterm.utils.UsbBridge.register(this)
@@ -104,14 +121,36 @@ class NeoTermService : Service() {
     return Service.START_NOT_STICKY
   }
 
+  private fun startUptimeTicker() {
+    if (uptimeThread != null) return
+    uptimeTickerRunning = true
+    uptimeThread = Thread {
+      while (uptimeTickerRunning) {
+        io.neoterm.setup.proot.ProotSysData.refreshUptime()
+        try {
+          Thread.sleep(5000)
+        } catch (e: InterruptedException) {
+          break
+        }
+      }
+    }.apply { isDaemon = true; name = "uptime-ticker"; start() }
+  }
+
   override fun onDestroy() {
+    uptimeTickerRunning = false
+    uptimeThread?.interrupt()
+    uptimeThread = null
     stopForeground(true)
     runCatching {
       (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID)
     }
     stopX11Server()
     io.neoterm.utils.PulseAudioBridge.stop()
+    io.neoterm.utils.CameraBridge.stop()
+    io.neoterm.utils.GpsBridge.stop()
+    io.neoterm.utils.SensorBridge.stop()
     io.neoterm.utils.UsbBridge.unregister(this)
+    io.neoterm.setup.usbserial.UsbSerialBridge.stopAll()
 
     for (i in mTerminalSessions.indices)
       mTerminalSessions[i].finishIfRunning()
@@ -133,6 +172,7 @@ class NeoTermService : Service() {
         Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
       )
     }
+    if (!x11Running) io.neoterm.setup.proot.Kmsg.log("x11: embedded X server up (DISPLAY=:0)")
     x11Running = true
     updateNotification()
   }
@@ -142,6 +182,7 @@ class NeoTermService : Service() {
       runCatching { unbindService(x11Connection) }
       x11Bound = false
     }
+    if (x11Running) io.neoterm.setup.proot.Kmsg.log("x11: embedded X server down")
     x11Running = false
     updateNotification()
   }
@@ -162,6 +203,7 @@ class NeoTermService : Service() {
     val indexOfRemoved = mTerminalSessions.indexOf(sessionToRemove)
     if (indexOfRemoved >= 0) {
       mTerminalSessions.removeAt(indexOfRemoved)
+      io.neoterm.setup.proot.Kmsg.log("neoterm: terminal session ended (active: ${mTerminalSessions.size})")
       updateNotification()
       stopSelfIfNoSessions()
     }
@@ -230,6 +272,7 @@ class NeoTermService : Service() {
       NLog.d("createOrFindSession: creating new session")
       val session = Terminals.createSession(this, parameter)
       mTerminalSessions.add(session)
+      io.neoterm.setup.proot.Kmsg.log("neoterm: new terminal session (active: ${mTerminalSessions.size})")
       return session
     }
 

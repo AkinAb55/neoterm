@@ -1,7 +1,10 @@
 package io.neoterm.setup.proot
 
+import android.os.SystemClock
+import io.neoterm.App
 import io.neoterm.component.config.NeoTermPath
 import java.io.File
+import java.util.Locale
 
 /**
  * Fake `/proc` (és néhány `/proc/sys`) tartalom a proot guest számára — a
@@ -12,10 +15,17 @@ import java.io.File
  * (`ps`, `top`, `htop`, `uptime`, `free`, `vmstat`), hibára futnak — pl.
  * „Unable to get system boot time” (a `/proc/stat` `btime` sora miatt).
  *
- * Megoldás: statikus, valószerű tartalmú fake fájlokat írunk egy host-oldali
+ * Megoldás: valószerű tartalmú fake fájlokat írunk egy host-oldali
  * `sysdata/` könyvtárba, és proot `-b fake:/proc/...` bind-mounttal a guestbe
  * tesszük — DE csak azokra a célokra, amik a valóságban olvashatatlanok
  * (a stat esetén akkor is, ha hiányzik a `btime`).
+ *
+ * A SELinux miatt a valódi `/proc` többnyire zárt, de néhány érték kinyerhető
+ * Android API-ból `/proc` olvasása nélkül is: az `uptime` a tényleges
+ * eszköz-uptime ([SystemClock.elapsedRealtime]), a `/proc/stat` `btime` sora
+ * pedig a valódi boot-időbélyeg. Ezeket session-induláskor (minden
+ * [bindings] hívásnál) újragenráljuk, hogy a valósághoz közeli adatot adjanak
+ * — a load average-re viszont nincs Android API, az becsült marad.
  *
  * @author kiva
  */
@@ -26,7 +36,6 @@ object ProotSysData {
 
   private const val LOADAVG = "0.12 0.07 0.02 2/165 765\n"
   private const val OVERFLOW_ID = "65534\n"
-  private const val UPTIME = "124.08 932.80\n"
   private const val CAP_LAST_CAP = "40\n"
   private const val MAX_USER_WATCHES = "4096\n"
 
@@ -153,54 +162,107 @@ unevictable_pgs_stranded 0
 """.trimStart()
 
   /**
-   * Biztosítja a fake fájlokat, és visszaadja a szükséges proot bind-párokat
-   * (fakePath → realProcPath) azokra a `/proc` célokra, amik az adott eszközön
-   * olvashatatlanok (a `/proc/stat`-nál akkor is, ha hiányzik a `btime`).
+   * Biztosítja a fake fájlokat, és visszaadja a proot bind-párokat
+   * (fakePath → realProcPath). Androidon ezek a `/proc` célok szinte mindig
+   * SELinux-zártak, ezért feltétel nélkül bekötjük őket (proot-distro minta),
+   * hogy a `ps`/`top`/`uptime`/`free` mindig működjön. Az `uptime`/`btime`
+   * dinamikusan, a valós eszköz-uptime-ból generálódik; a CPU-terhelés és a
+   * load average statikus marad (a kernel nem adja ki, és nincs rá Android API).
    */
   fun bindings(): List<Pair<String, String>> {
     val dir = File("${NeoTermPath.PROOT_ROOT_PATH}/sysdata")
     dir.mkdirs()
 
-    // real /proc cél, sysdata fájlnév, tartalom
+    // real /proc cél, sysdata fájlnév, tartalom, dinamikus-e (minden indításnál újraírjuk)
     val entries = listOf(
-      Triple("/proc/loadavg", "loadavg", LOADAVG),
-      Triple("/proc/stat", "stat", STAT),
-      Triple("/proc/uptime", "uptime", UPTIME),
-      Triple("/proc/version", "version", VERSION),
-      Triple("/proc/vmstat", "vmstat", VMSTAT),
-      Triple("/proc/sys/kernel/cap_last_cap", "sysctl_entry_cap_last_cap", CAP_LAST_CAP),
-      Triple("/proc/sys/fs/inotify/max_user_watches", "sysctl_inotify_max_user_watches", MAX_USER_WATCHES),
-      Triple("/proc/sys/kernel/overflowuid", "sysctl_kernel_overflowuid", OVERFLOW_ID),
-      Triple("/proc/sys/kernel/overflowgid", "sysctl_kernel_overflowgid", OVERFLOW_ID)
+      Entry("/proc/loadavg", "loadavg", LOADAVG, dynamic = false),
+      Entry("/proc/stat", "stat", statContent(), dynamic = true),
+      Entry("/proc/uptime", "uptime", uptimeContent(), dynamic = true),
+      Entry("/proc/version", "version", VERSION, dynamic = false),
+      Entry("/proc/vmstat", "vmstat", VMSTAT, dynamic = false),
+      Entry("/proc/sys/kernel/cap_last_cap", "sysctl_entry_cap_last_cap", CAP_LAST_CAP, dynamic = false),
+      Entry("/proc/sys/fs/inotify/max_user_watches", "sysctl_inotify_max_user_watches", MAX_USER_WATCHES, dynamic = false),
+      Entry("/proc/sys/kernel/overflowuid", "sysctl_kernel_overflowuid", OVERFLOW_ID, dynamic = false),
+      Entry("/proc/sys/kernel/overflowgid", "sysctl_kernel_overflowgid", OVERFLOW_ID, dynamic = false)
     )
 
     val binds = ArrayList<Pair<String, String>>(entries.size)
-    for ((real, name, content) in entries) {
-      val fake = File(dir, name)
-      if (!fake.exists()) {
-        runCatching { fake.writeText(content) }
+    for (e in entries) {
+      val fake = File(dir, e.name)
+      // A dinamikus fájlokat (uptime, stat) minden session-indításnál frissítjük,
+      // hogy a valódi eszköz-uptime-ot / boot-időt tükrözzék; a statikusakat csak egyszer.
+      if (e.dynamic || !fake.exists()) {
+        runCatching { fake.writeText(e.content) }
       }
-      if (fake.exists() && needsFake(real)) {
-        binds.add(fake.absolutePath to real)
+      // Mindig bekötjük a fake-et (proot-distro minta). A valódi /proc ezen fájljai
+      // Androidon szinte mindig SELinux-zártak; a korábbi „olvasható-e a valódi?"
+      // feltétel az APP folyamatból mért, de a tényleges olvasó a proot-guest — ha
+      // a kettő eltér (pl. app látja a /proc/uptime-ot, a guest nem), a guest
+      // ENOENT-et kapott. A feltétlen bind ezt kizárja.
+      if (fake.exists()) {
+        binds.add(fake.absolutePath to e.real)
       }
     }
     return binds
   }
 
-  /** A valós /proc cél olvashatatlan/hiányos → fake kell. */
-  private fun needsFake(realPath: String): Boolean {
-    return try {
-      val content = File(realPath).readText()
-      if (content.isEmpty()) {
-        true
-      } else if (realPath == "/proc/stat") {
-        // ps "Unable to get system boot time" → hiányzik a btime sor.
-        !content.contains("btime")
-      } else {
-        false
-      }
-    } catch (e: Exception) {
-      true
-    }
+  private data class Entry(
+    val real: String,
+    val name: String,
+    val content: String,
+    val dynamic: Boolean
+  )
+
+  /**
+   * Újraírja a `/proc/uptime` fake-et az aktuális NeoTerm-futásidővel. A fake
+   * egy statikus fájl-bind, ezért magától nem „ketyeg"; periodikusan hívva (amíg
+   * fut terminál — lásd NeoTermService) a guest uptime-ja folyamatosan frissül.
+   * Olcsó: néhány bájt írása az app saját könyvtárába.
+   */
+  fun refreshUptime() {
+    val dir = File("${NeoTermPath.PROOT_ROOT_PATH}/sysdata")
+    if (!dir.isDirectory) return
+    runCatching { File(dir, "uptime").writeText(uptimeContent()) }
   }
+
+  /**
+   * `/proc/uptime` tartalom: a **NeoTerm futásideje** másodpercben (az app-folyamat
+   * indulása óta, [App.startElapsedRealtimeMs]). Így a guest „uptime"-ja az
+   * elindítása óta eltelt időt mutatja, és amikor az app teljesen leáll, a
+   * következő indításkor nulláról indul — szemben az eszköz-uptime-mal, ami
+   * megtévesztően nagy/független érték lenne. Ha az app-start valamiért nincs még
+   * beállítva, az eszköz-uptime a tartalék. A fájl statikus (proot bind), így a
+   * session indulásakor pontos, menet közben nem „ketyeg" tovább.
+   * Második mező: idle-idő közelítése (uptime × magszám).
+   */
+  private fun uptimeContent(): String {
+    val now = SystemClock.elapsedRealtime()
+    val appStart = App.startElapsedRealtimeMs
+    // app-runtime, ha az app-start érvényes (1..now); különben az eszköz-uptime.
+    val upMs = if (appStart in 1L..now) now - appStart else now
+    val up = upMs / 1000.0
+    val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+    val idle = up * cores * 0.93
+    // FONTOS: Locale.ROOT → tizedespont. A default (pl. magyar) locale vesszőt adna
+    // ("0,32"), amit a /proc/uptime-ot olvasó eszközök (uptime, top, free, dmesg)
+    // nem tudnak számként értelmezni → "Cannot get system uptime".
+    return String.format(Locale.ROOT, "%.2f %.2f\n", up, idle)
+  }
+
+  /**
+   * A `/proc/stat` `btime` (boot epoch) sora a NeoTerm indulásának falidejét adja,
+   * hogy egybevágjon az app-runtime alapú uptime-mal (`uptime`, `who -b`). Ha az
+   * app-start nincs beállítva, az eszköz boot-ideje a tartalék.
+   */
+  private fun statContent(): String {
+    val appStart = App.startElapsedRealtimeMs
+    val btimeMs = if (appStart > 0L) {
+      // falidő = most − (app óta eltelt) = az app indulásának falideje
+      System.currentTimeMillis() - (SystemClock.elapsedRealtime() - appStart)
+    } else {
+      System.currentTimeMillis() - SystemClock.elapsedRealtime()
+    }
+    return STAT.replace(Regex("(?m)^btime .*$"), "btime ${btimeMs / 1000}")
+  }
+
 }

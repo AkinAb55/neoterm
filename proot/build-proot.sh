@@ -20,6 +20,8 @@
 # Kimenet: $DL_DIR/proot — statikus aarch64 Android ELF (kb. 1-2 MB).
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 DL_DIR="${1:?usage: build-proot.sh <download_dir>}"
 mkdir -p "${DL_DIR}"
 
@@ -65,21 +67,23 @@ if [[ ! -x "${CC}" ]]; then
   exit 3
 fi
 
-# ─── 1) Tarball download ──────────────────────────────────────────────────
-# A TERMUX FORK-jából buildelünk, NEM az upstream proot-me-ből — utóbbi
-# Android-kernel seccomp-filterén SIGSYS-szel (signal 31) ölte a chrooted
-# processeket (a kernel a ptrace-syscallt blokkolja, az upstream nem tudja
-# kerülni). A Termux fork tartalmazza az ehhez szükséges kernel-hook
-# patcheket (`syscall/seccomp.c`-ben SECCOMP_MODE_FILTER fallback +
-# Android-kompat).
-PROOT_TARBALL="${DL_DIR}/proot-termux-master.tar.gz"
-TALLOC_TARBALL="${DL_DIR}/talloc-${TALLOC_VERSION}.tar.gz"
-
-if [[ ! -f "${PROOT_TARBALL}" ]]; then
-  PROOT_URL="https://github.com/termux/proot/archive/refs/heads/master.tar.gz"
-  echo "[build-proot] download Termux proot fork: ${PROOT_URL}"
-  curl -fL --retry 4 --retry-delay 2 -o "${PROOT_TARBALL}" "${PROOT_URL}"
+# ─── 1) Forrás: proot VENDORELVE a repóban, talloc tarball ────────────────
+# A proot forrást NEM töltjük le build-időben: a Termux fork egy pinnelt
+# másolata a repóban van (proot/vendor/proot, lásd VENDOR.md). Így a build
+# reprodukálható és offline. (A TERMUX forkból buildelünk, NEM az upstream
+# proot-me-ből — utóbbit az Android-kernel seccomp-filtere SIGSYS-szel
+# (signal 31) öli, mert a kernel blokkolja a ptrace-syscallt; a Termux fork
+# tartalmazza az ehhez kellő kernel-hook patcheket.)
+VENDOR_PROOT="${SCRIPT_DIR}/vendor/proot"
+if [[ ! -d "${VENDOR_PROOT}/src" ]]; then
+  echo "[build-proot] HIBA: nincs vendorelt proot forrás: ${VENDOR_PROOT}/src" >&2
+  echo "[build-proot] (lásd proot/vendor/proot/VENDOR.md — a forrást a repó tartalmazza)" >&2
+  exit 2
 fi
+
+# talloc: továbbra is tarball (a samba allocator dependency). Vendorelhető
+# ugyanígy, ha teljesen offline build kell — egyelőre letöltjük + cache-eljük.
+TALLOC_TARBALL="${DL_DIR}/talloc-${TALLOC_VERSION}.tar.gz"
 if [[ ! -f "${TALLOC_TARBALL}" ]]; then
   TALLOC_URL="https://www.samba.org/ftp/talloc/talloc-${TALLOC_VERSION}.tar.gz"
   echo "[build-proot] download talloc src: ${TALLOC_URL}"
@@ -89,11 +93,17 @@ fi
 WORK="${DL_DIR}/build"
 rm -rf "${WORK}"
 mkdir -p "${WORK}"
-( cd "${WORK}" && tar -xzf "${PROOT_TARBALL}" && tar -xzf "${TALLOC_TARBALL}" )
+# proot: a pristine vendor-fát egy friss munkamásolatba másoljuk, mert a build
+# in-place patcheli a forrást (sed a Makefile-on/stat.c-n + a python xattr-patch).
+# Így a vendor-fa érintetlen marad, és ismételt build sem kettőzi a patcheket.
+PROOT_DIR="${WORK}/proot-src"
+mkdir -p "${PROOT_DIR}"
+cp -a "${VENDOR_PROOT}/." "${PROOT_DIR}/"
+# talloc: tarball kibontás a WORK-be.
+( cd "${WORK}" && tar -xzf "${TALLOC_TARBALL}" )
 
-PROOT_DIR=$(find "${WORK}" -maxdepth 2 -type d -name "proot-*" | head -n1)
 TALLOC_DIR=$(find "${WORK}" -maxdepth 2 -type d -name "talloc-*" | head -n1)
-echo "[build-proot] proot src:  ${PROOT_DIR}"
+echo "[build-proot] proot src:  ${PROOT_DIR} (vendor: ${VENDOR_PROOT})"
 echo "[build-proot] talloc src: ${TALLOC_DIR}"
 
 # ─── 2) Build talloc statikusan (csak talloc.c, waf nélkül) ──────────────
@@ -307,6 +317,45 @@ sed -i.bak '/^OBJECTS += \\$/i OBJECTS += extension/python/python_stub.o' "${PRO
 # rodata-szegmenst gyárt, egyszerűen kivesszük a flaget — funkcionálisan azonos.
 sed -i.bak 's/,--rosegment//g' "${PROOT_MAKEFILE}"
 
+# ─── fake_id0 ownership fix (suid → euid) ─────────────────────────────────
+# A -0 fake-root módban a `stat` egy app-tulajdonú fájl tulajdonosát az
+# EMULÁLT MENTETT uid-dal (config->suid) írja felül. A programok viszont a
+# `st_uid == geteuid()` mintával ellenőrzik a tulajdont, azaz az EFFEKTÍV
+# uid (config->euid) ellen. Amikor egy privilege-drop euid != suid állapotot
+# hagy — pl. `su`/`runuser`/`pg_createcluster`, ami seteuid-del vált a cél-
+# userre, de a mentett uid 0 marad —, a check elhasal:
+#   FATAL: data directory "..." has wrong ownership   (PostgreSQL)
+# A `setpriv` azért működik, mert teljesen dropol (ruid=euid=suid). Mivel a
+# FATAL eleve csak akkor jön, ha st_uid != geteuid(), és st_uid == suid, ez
+# bizonyítja hogy suid != euid — így az effektív uid/gid jelentése a stat-ban
+# (mind a hagyományos stat, mind a modern statx ágon, amit a glibc ma használ)
+# konstrukció szerint helyreállítja az egyezést.
+FAKEID_STAT=$(find "${PROOT_SRC}" -path '*/fake_id0/stat.c' -type f 2>/dev/null | head -n1)
+if [[ -n "${FAKEID_STAT}" ]]; then
+  echo "[build-proot] patch fake_id0 stat ownership (suid->euid): ${FAKEID_STAT}"
+  sed -i.bak -e 's/config->suid/config->euid/g' -e 's/config->sgid/config->egid/g' "${FAKEID_STAT}"
+  grep -q 'config->euid' "${FAKEID_STAT}" || { echo "[build-proot] HIBA: fake_id0 stat patch nem alkalmazódott" >&2; exit 8; }
+else
+  echo "[build-proot] WARN: fake_id0/stat.c nem található — ownership-patch kihagyva" >&2
+fi
+
+# ─── fake_id0: xattr-backed PERSISTENT ownership (+ -DUSERLAND below) ──────
+# A fenti euid-fix csak az initdb-féle `st_uid == geteuid()` ellenőrzést oldja
+# meg (hívófüggő). A Debian root-wrapperek (pg_ctlcluster: „must not be owned
+# by root") rootként statolnak, és a faked tulajdon hívófüggősége miatt rootot
+# látnak. Ehhez PERZISZTENS, hívófüggetlen tulajdon kell. A USERLAND meta-mód
+# ezt megadja, de fájlonként `.proot-meta-file.*` kísérőfájllal teleszórja a
+# rootfs-t. Ez a patch a meta-tárolást egy `user.proot.meta` xattr-be teszi a
+# fájlra magára → nulla kísérőfájl, ugyanaz a perzisztencia. A statx-ágat is
+# kiegészíti (a modern glibc `stat()` azt hívja). A tárolási logikát host-on
+# verifikáltuk: patches/fakeid0-xattr-test/run.sh.
+if [[ -f "${SCRIPT_DIR}/patches/fakeid0-xattr.py" ]]; then
+  echo "[build-proot] patch fake_id0 -> xattr-backed persistent ownership"
+  python3 "${SCRIPT_DIR}/patches/fakeid0-xattr.py" "${PROOT_SRC}"
+else
+  echo "[build-proot] HIBA: patches/fakeid0-xattr.py nem található" >&2; exit 8
+fi
+
 echo "[build-proot] make -C ${PROOT_SRC} (NDK cross-compile)"
 # A Termux fork néhány extension-ja (ashmem_memfd, fake_id0) missing-include-okat
 # tartalmaz amik NDK clang 18+ strict-mode-on (-Werror=implicit-function-declaration)
@@ -319,7 +368,7 @@ make -C "${PROOT_SRC}" -j"$(nproc)" \
     OBJDUMP="${OBJDUMP}" \
     STRIP="${NDK_BIN}/llvm-strip" \
     HOST_CC="cc" \
-    CFLAGS="-O2 ${TALLOC_INCLUDE_FLAG} -DGIT_VERSION=\"v${PROOT_VERSION}\" -Wno-error=implicit-function-declaration -Wno-error=incompatible-function-pointer-types -Wno-error=int-conversion" \
+    CFLAGS="-O2 -DUSERLAND ${TALLOC_INCLUDE_FLAG} -DGIT_VERSION=\"v${PROOT_VERSION}\" -Wno-error=implicit-function-declaration -Wno-error=incompatible-function-pointer-types -Wno-error=int-conversion" \
     LDFLAGS="-L${TALLOC_OUT} -ltalloc -static-libgcc -Wl,-z,noexecstack" \
     proot
 
