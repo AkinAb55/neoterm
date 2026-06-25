@@ -12,6 +12,7 @@
 #else
 #include <linux/types.h>
 #include <linux/time64.h>
+#include <time.h>                     /* libc struct tm (gmtime_r target in vfs.c) */
 struct timezone { int tz_minuteswest; int tz_dsttime; };
 #endif
 extern struct timezone sys_tz;

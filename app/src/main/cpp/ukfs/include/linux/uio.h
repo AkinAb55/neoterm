@@ -5,7 +5,10 @@
 
 enum iter_type { ITER_UBUF, ITER_IOVEC, ITER_KVEC, ITER_BVEC };
 
+#ifndef __iovec_defined            /* libc (glibc/bionic <sys/uio.h>) may already define it */
+#define __iovec_defined 1
 struct iovec { void *iov_base; size_t iov_len; };
+#endif
 struct kvec { void *iov_base; size_t iov_len; };
 
 struct iov_iter {
