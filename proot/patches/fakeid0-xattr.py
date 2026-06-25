@@ -902,4 +902,40 @@ if 'uknl_fs_dispatch' not in s:
                   '\tswitch (syscall_number) {', 1)
     wr(EN, s)
 
+# ---- syscall/exit.c: capture the fd returned by a redirected openat so reads/
+#      getdents/lseek on it can be proxied (uknl_fs_open_exit lives in enter.c). ----
+EX = ROOT + "/syscall/exit.c"; s = rd(EX)
+if 'uknl_fs_open_exit' not in s:
+    must('void translate_syscall_exit(Tracee *tracee)\n{' in s, "exit.c translate_syscall_exit anchor (fs)")
+    s = s.replace('void translate_syscall_exit(Tracee *tracee)\n{',
+                  'extern void uknl_fs_open_exit(Tracee *tracee, word_t nr);\n\n'
+                  'void translate_syscall_exit(Tracee *tracee)\n{', 1)
+    ex_anchor = '\tsyscall_number = get_sysnum(tracee, ORIGINAL);'
+    must(ex_anchor in s, "exit.c get_sysnum anchor (fs)")
+    s = s.replace(ex_anchor, ex_anchor + '\n\tuknl_fs_open_exit(tracee, syscall_number);', 1)
+    wr(EX, s)
+
+# ---- syscall/seccomp.c: trap the fd-based FS syscalls (no path -> not in proot's
+#      default translation set) at sysexit, only when UK_FS is requested. openat is
+#      added too so the exit hook above runs to capture the fd. ----
+SC = ROOT + "/syscall/seccomp.c"; s = rd(SC)
+if 'uk_fs_sysnums' not in s:
+    sc_anchor = 'status = merge_filtered_sysnums(tracee->ctx, &filtered_sysnums, proot_sysnums);'
+    must(sc_anchor in s, "seccomp proot_sysnums merge anchor (fs)")
+    s = s.replace(sc_anchor, sc_anchor +
+                  '\n\t/* NeoTerm: trap fd-based FS syscalls (+ openat exit) when UK_FS is wanted. */\n'
+                  '\tif (status >= 0 && getenv("UK_FS")) {\n'
+                  '\t\tstatic const FilteredSysnum uk_fs_sysnums[] = {\n'
+                  '\t\t\t{ PR_openat,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_read,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_pread64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_lseek,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_close,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_getdents64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\tFILTERED_SYSNUM_END,\n'
+                  '\t\t};\n'
+                  '\t\tstatus = merge_filtered_sysnums(tracee->ctx, &filtered_sysnums, uk_fs_sysnums);\n'
+                  '\t}', 1)
+    wr(SC, s)
+
 print("ALL PATCHES APPLIED OK")
