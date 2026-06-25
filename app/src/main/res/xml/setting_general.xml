@@ -86,6 +86,12 @@
 
   <CheckBoxPreference
     android:defaultValue="false"
+    android:key="@string/key_general_usb_storage"
+    android:summary="@string/pref_general_usb_storage_desc"
+    android:title="@string/pref_general_usb_storage"/>
+
+  <CheckBoxPreference
+    android:defaultValue="false"
     android:key="@string/key_general_enable_word_based_ime"
     android:summary="@string/pref_general_enable_word_based_ime_desc"
     android:title="@string/pref_general_enable_word_based_ime"/>

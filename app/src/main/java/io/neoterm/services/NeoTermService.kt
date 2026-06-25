@@ -151,6 +151,7 @@ class NeoTermService : Service() {
     io.neoterm.utils.SensorBridge.stop()
     io.neoterm.utils.UsbBridge.unregister(this)
     io.neoterm.setup.usbserial.UsbSerialBridge.stopAll()
+    io.neoterm.setup.usbserial.BlockBridge.stopAll()
 
     for (i in mTerminalSessions.indices)
       mTerminalSessions[i].finishIfRunning()

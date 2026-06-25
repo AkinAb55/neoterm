@@ -22,6 +22,7 @@ object DefaultValues {
   const val enableGps = false
   const val enableUsbSerial = false
   const val enableSensors = false
+  const val enableUsbStorage = false
   const val cursorStyle = "block"
   const val enableWordBasedIme = false
 

@@ -14,6 +14,7 @@ import android.os.Build
 import android.system.Os
 import io.neoterm.component.config.NeoPreference
 import io.neoterm.setup.proot.Kmsg
+import io.neoterm.setup.usbserial.BlockBridge
 import io.neoterm.setup.usbserial.UsbSerialBridge
 import java.io.FileDescriptor
 
@@ -87,8 +88,13 @@ object UsbBridge {
     // A known USB-serial chip + the toggle on -> the app-side serial bridge owns
     // it (pty -> /dev/ttyUSB*), not the raw fd-server (avoids a double claim).
     val serial = NeoPreference.isUsbSerialEnabled() && UsbSerialBridge.isSerial(device)
+    val block = NeoPreference.isUsbStorageEnabled() && BlockBridge.isMassStorage(device)
     if (usb.hasPermission(device)) {
-      if (serial) UsbSerialBridge.attach(usb, device) else openAndStore(usb, device)
+      when {
+        serial -> UsbSerialBridge.attach(usb, device)
+        block -> BlockBridge.attach(usb, device)   // pendrive -> /dev/uksd0
+        else -> openAndStore(usb, device)
+      }
       return
     }
     val flags = PendingIntent.FLAG_UPDATE_CURRENT or
@@ -243,6 +249,7 @@ class UsbReceiver : BroadcastReceiver() {
         NLog.e("UsbBridge", "Detached ${device?.deviceName}")
         if (device != null) Kmsg.log(usbKmsgLine("USB disconnect,", device))
         UsbSerialBridge.onDetached(device)
+        BlockBridge.onDetached(device)
         UsbBridge.onDetached(device)
       }
     }

@@ -218,6 +218,10 @@ object ProotManager {
     // make sure the app-side control/redirect server is up before the guest opens
     // them. A device can be (un)plugged any time during the session.
     io.neoterm.setup.usbserial.UsbSerialBridge.ensureReady()
+    // USB storage: a pendrive is a VIRTUAL block device /dev/uksd0 — the proot
+    // block proxy (enter.c) routes its I/O to the app-side SCSI bridge. Bring the
+    // control server up; the device may be (un)plugged any time.
+    io.neoterm.setup.usbserial.BlockBridge.ensureReady()
     // Bind a writable fake /sys/class/tty so the guest can readdir it (Android
     // SELinux blocks the real one) — ls / pyserial enumerate the ports there.
     io.neoterm.setup.usbserial.UsbSerialBridge.sysfsBind()?.let { bind(args, it, "/sys/class/tty") }
