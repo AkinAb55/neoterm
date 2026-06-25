@@ -7,9 +7,11 @@ add_library(neoterm
 target_link_libraries(neoterm)
 
 # uKernel FS engine (real kernel FS drivers in userspace) — cross-compile
-# validation target. See src/main/cpp/ukfs/ukfs.cmake. ON by default so CI
-# exercises the port; pass -DUKFS_BUILD=OFF for a working APK while iterating.
-option(UKFS_BUILD "Build the uKernel FS engine" ON)
+# validation target. See src/main/cpp/ukfs/ukfs.cmake. OFF by default so the
+# normal app build stays green while the bionic port is iterated; enable the
+# cross-compile with:  -DUKFS_BUILD=ON  (gradle: android.defaultConfig.
+# externalNativeBuild.cmake.arguments "-DUKFS_BUILD=ON").
+option(UKFS_BUILD "Build the uKernel FS engine" OFF)
 if(UKFS_BUILD)
   include(${CMAKE_CURRENT_SOURCE_DIR}/src/main/cpp/ukfs/ukfs.cmake)
 endif()
