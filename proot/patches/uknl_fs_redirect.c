@@ -29,7 +29,8 @@ static void uk_dbg_line(const char *line);
 /* ---- persistent io.neoterm.fs connection (ukfsd holds one mount per conn) ---- */
 static int  g_ukfs_sock = -1;
 static char g_vmount[PATH_MAX];      /* guest mount point, e.g. "/mnt/usb" */
-static int  g_vmounted = 0;
+static int  g_vmounted = 0;          /* guest issued mount here; cleared only on umount */
+static int  g_ukfs_ready = 0;        /* 1 once ukfsd has actually mounted on g_ukfs_sock */
 
 static int ukfs_conn(void)
 {
@@ -51,8 +52,13 @@ static int ukfs_conn(void)
 	{ char l[64]; snprintf(l, sizeof l, "uk_fs: connected io.neoterm.fs fd=%d\n", s); uk_dbg_line(l); }
 	return s;
 }
-/* The mount lives in the connection; dropping it loses the mount. */
-static void ukfs_sdrop(void) { if (g_ukfs_sock >= 0) { close(g_ukfs_sock); g_ukfs_sock = -1; } g_vmounted = 0; }
+/* Drop the io.neoterm.fs connection. The mount lives in the connection, so the
+ * ukfsd-side mount is gone too -> clear g_ukfs_ready (next access re-mounts). Do
+ * NOT touch g_vmounted: the guest still has /dev/uksd0 mounted at g_vmount, and
+ * clearing it would disable ukfs_rel() and the dispatch guard, leaking every
+ * path op under the mount point to the host (empty dir). Only a real guest
+ * umount clears g_vmounted. */
+static void ukfs_sdrop(void) { if (g_ukfs_sock >= 0) { close(g_ukfs_sock); g_ukfs_sock = -1; } g_ukfs_ready = 0; }
 
 /* guest sees the block device at .../uksd0 (same convention as the block proxy) */
 static int ukfs_src_is_dev(const char *p)
@@ -78,9 +84,8 @@ static int ukfs_rel(const char *guest, char *out, size_t osz)
  * the mount(2) hook: on Android mount(2) is blocked by the parent seccomp and
  * handled via proot's SIGSYS path, and socket I/O from that context does not
  * deliver to ukfsd (the write is lost). The first path op under the mount point
- * (e.g. `ls`) runs on the normal syscall path, where socket I/O works. */
-static int g_ukfs_ready = 0;   /* 1 once ukfsd has actually mounted */
-
+ * (e.g. `ls`) runs on the normal syscall path, where socket I/O works.
+ * (g_ukfs_ready is declared up top, next to g_vmounted.) */
 static int ukfs_do_mount(void)
 {
 	ukfs_sdrop();   /* fresh connection for the mount */
@@ -437,7 +442,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v5-newline UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v6-vmount UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
