@@ -344,19 +344,32 @@ static size_t ukfs_emit_dents(struct ukfs_vfd *v, unsigned char *out, size_t cap
  * Returns true if the syscall was fully emulated (PR_void'd + result poked).
  * For openat it returns false after rewriting the path, so the (placeholder)
  * open proceeds and the fd is captured in uknl_fs_open_exit. */
+/* --- TEMP DEBUG (remove after diagnosis): append a line to the app's kmsg
+ * buffer (the host file bound at the guest /dev/kmsg), so it shows up in
+ * `dmesg`. proot's own stderr isn't visible in the guest terminal. --- */
+static void uk_dbg(Tracee *tracee, const char *line)
+{
+	char kp[PATH_MAX];
+	strcpy(kp, "/dev/kmsg");
+	Binding *b = get_binding(tracee, GUEST, kp);
+	if (!b) return;
+	int fd = open(b->host.path, O_WRONLY | O_APPEND | O_CLOEXEC);
+	if (fd >= 0) { (void) write(fd, line, strlen(line)); close(fd); }
+}
+
 static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 {
-	/* --- TEMP DEBUG (remove after diagnosis): trace every mount(2) to the
-	 * proot stderr (the guest PTY), so `mount /dev/uksd0 ...` prints what the
-	 * redirect actually sees. --- */
+	/* --- TEMP DEBUG: trace every mount(2) into dmesg. --- */
 	if (nr == PR_mount) {
 		word_t dsa = peek_reg(tracee, CURRENT, SYSARG_1);
 		char dbg[PATH_MAX] = {0};
 		if (dsa) read_string(tracee, dbg, dsa, sizeof dbg);
-		fprintf(stderr, "[uk_fs] PR_mount src='%s' UK_FS='%s' UK_BLOCK='%s' is_dev=%d\n",
-		        dbg, getenv("UK_FS") ? getenv("UK_FS") : "(null)",
-		        getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)", ukfs_src_is_dev(dbg));
-		fflush(stderr);
+		char line[PATH_MAX + 160];
+		snprintf(line, sizeof line,
+		         "uk_fs: PR_mount src='%s' UK_FS='%s' UK_BLOCK='%s' is_dev=%d\n",
+		         dbg, getenv("UK_FS") ? getenv("UK_FS") : "(null)",
+		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)", ukfs_src_is_dev(dbg));
+		uk_dbg(tracee, line);
 	}
 
 	if (!uk_fs_on()) return false;
