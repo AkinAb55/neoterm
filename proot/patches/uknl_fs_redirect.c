@@ -74,20 +74,32 @@ static int ukfs_rel(const char *guest, char *out, size_t osz)
 	return 1;
 }
 
-/* Tell ukfsd to MOUNT the block device and remember the guest mount point. */
-static int ukfs_mount_dev(const char *target)
+/* ukfsd is told to MOUNT lazily, on the first access under the vmount, NOT from
+ * the mount(2) hook: on Android mount(2) is blocked by the parent seccomp and
+ * handled via proot's SIGSYS path, and socket I/O from that context does not
+ * deliver to ukfsd (the write is lost). The first path op under the mount point
+ * (e.g. `ls`) runs on the normal syscall path, where socket I/O works. */
+static int g_ukfs_ready = 0;   /* 1 once ukfsd has actually mounted */
+
+static int ukfs_do_mount(void)
 {
-	ukfs_sdrop();   /* always reconnect fresh for a mount (avoid a stale cached fd) */
+	ukfs_sdrop();   /* fresh connection for the mount */
 	int s = ukfs_conn();
 	if (s < 0) { uk_dbg_line("uk_fs: ukfs_conn FAILED (cannot reach io.neoterm.fs)\n"); return -1; }
 	if (uksd_wn(s, "MOUNT auto uksd0\n", 16) < 0) { uk_dbg_line("uk_fs: MOUNT write failed\n"); ukfs_sdrop(); return -1; }
 	char line[64];
 	if (uksd_rl(s, line, sizeof line) < 0) { uk_dbg_line("uk_fs: MOUNT no reply\n"); ukfs_sdrop(); return -1; }
 	{ char l[128]; snprintf(l, sizeof l, "uk_fs: ukfsd MOUNT reply='%s'\n", line); uk_dbg_line(l); }
-	if (line[0] != 'O' || line[1] != 'K') return -1;
-	snprintf(g_vmount, sizeof g_vmount, "%s", target);
-	g_vmounted = 1;
-	return 0;
+	return (line[0] == 'O' && line[1] == 'K') ? 0 : -1;
+}
+
+/* Perform the deferred ukfsd mount on first access (idempotent). */
+static void ukfs_ensure_mounted(void)
+{
+	if (g_vmounted && !g_ukfs_ready && ukfs_do_mount() == 0) {
+		g_ukfs_ready = 1;
+		uk_dbg_line("uk_fs: lazy ukfsd mount OK\n");
+	}
 }
 
 /* STAT one path. Returns 0 (filled), -2 (ENOENT from ukfsd), -1 (socket error). */
@@ -393,9 +405,14 @@ static bool uknl_fs_mount_hook(Tracee *tracee)
 	if (!ukfs_src_is_dev(src)) return false;
 	char tgt[PATH_MAX];
 	if (get_sysarg_path(tracee, tgt, SYSARG_2) < 0) return false;
-	int rc = ukfs_mount_dev(tgt);
+	/* Register the vmount only — no socket I/O here (this may run in the SIGSYS
+	 * context where it wouldn't deliver). The ukfsd MOUNT happens lazily on the
+	 * first access under the mount point. */
+	snprintf(g_vmount, sizeof g_vmount, "%s", tgt);
+	g_vmounted = 1;
+	g_ukfs_ready = 0;
 	char l[PATH_MAX + 96];
-	snprintf(l, sizeof l, "uk_fs: MOUNT hook src='%s' tgt='%s' rc=%d\n", src, tgt, rc);
+	snprintf(l, sizeof l, "uk_fs: MOUNT hook src='%s' tgt='%s' (deferred)\n", src, tgt);
 	uk_dbg(tracee, l);
 	return true;
 }
@@ -427,8 +444,9 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 
 	if (!uk_fs_on()) return false;
 
-	/* mount(2): only a /dev/uksd0 source is ours; everything else falls through
-	 * to proot's normal mount emulation. */
+	/* mount(2) on the NORMAL path (non-Android, where mount isn't SIGSYS-blocked):
+	 * register the vmount and fake success. The actual ukfsd MOUNT is deferred to
+	 * first access, same as the apply_emulated_mount hook used on Android. */
 	if (nr == PR_mount) {
 		word_t sa = peek_reg(tracee, CURRENT, SYSARG_1);
 		char src[PATH_MAX];
@@ -437,13 +455,15 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		word_t ta = peek_reg(tracee, CURRENT, SYSARG_2);
 		char tgt[PATH_MAX];
 		if (!ta || read_string(tracee, tgt, ta, sizeof tgt) <= 0) return false;
-		int rc = ukfs_mount_dev(tgt);
-		poke_reg(tracee, SYSARG_RESULT, (word_t)(long)(rc == 0 ? 0 : -EIO));
+		snprintf(g_vmount, sizeof g_vmount, "%s", tgt);
+		g_vmounted = 1; g_ukfs_ready = 0;
+		poke_reg(tracee, SYSARG_RESULT, 0);
 		set_sysnum(tracee, PR_void);
 		return true;
 	}
 
 	if (!g_vmounted) return false;
+	ukfs_ensure_mounted();   /* perform the deferred ukfsd MOUNT on first access */
 
 	/* fd-based ops on a vfd (set up by a prior openat). */
 	if (nr == PR_read || nr == PR_pread64) {
