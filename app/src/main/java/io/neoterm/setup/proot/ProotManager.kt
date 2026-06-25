@@ -231,6 +231,10 @@ object ProotManager {
     // block proxy (enter.c) routes its I/O to the app-side SCSI bridge. Bring the
     // control server up; the device may be (un)plugged any time.
     io.neoterm.setup.usbserial.BlockBridge.ensureReady()
+    // USB storage filesystem: launch the ukfsd daemon (io.neoterm.fs), the real
+    // FS engine that mounts /dev/uksd0 (sectors over io.neoterm.block) and serves
+    // the proot VFS-redirect (UK_FS). Without it, mount(/dev/uksd0) does nothing.
+    io.neoterm.setup.usbserial.FsBridge.ensureReady()
     // Bind a writable fake /sys/class/tty so the guest can readdir it (Android
     // SELinux blocks the real one) — ls / pyserial enumerate the ports there.
     io.neoterm.setup.usbserial.UsbSerialBridge.sysfsBind()?.let { bind(args, it, "/sys/class/tty") }
@@ -379,7 +383,7 @@ object ProotManager {
     )
     // Only with the storage toggle on: proot then traps read/write/lseek/… for the
     // /dev/uksd0 block proxy (otherwise those syscalls aren't filtered at all).
-    if (NeoPreference.isUsbStorageEnabled()) env.add("UK_BLOCK=1")
+    if (NeoPreference.isUsbStorageEnabled()) { env.add("UK_BLOCK=1"); env.add("UK_FS=1") }
     return env.toTypedArray()
   }
 }

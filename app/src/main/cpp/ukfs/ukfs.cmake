@@ -61,7 +61,11 @@ target_include_directories(ukfs_engine PRIVATE ${UKFS_INC} ${UKFS_DIR}/linux/fs/
 target_compile_options(ukfs_engine PRIVATE ${UKFS_KCFLAGS} ${UKFS_FAT_DEFS})
 
 # --- ukfsd: io.neoterm.fs unix-socket server (the Android FS daemon) ---
+# Output as libukfsd.so (a PIE executable) so AGP packages it into
+# jniLibs/<abi>/ and Android extracts it, executable, to nativeLibraryDir —
+# the same deployment trick as libproot.so. FsBridge.kt launches it from there.
 add_executable(ukfsd ${UKFS_DIR}/shim/fs/ukfsd.c $<TARGET_OBJECTS:ukfs_engine>)
+set_target_properties(ukfsd PROPERTIES PREFIX "lib" OUTPUT_NAME "ukfsd" SUFFIX ".so")
 target_include_directories(ukfsd PRIVATE ${UKFS_INC} ${UKFS_DIR}/linux/fs/fat)
 target_compile_options(ukfsd PRIVATE ${UKFS_KCFLAGS} ${UKFS_FAT_DEFS})
 target_link_libraries(ukfsd dl)
