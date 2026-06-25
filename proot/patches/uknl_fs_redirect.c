@@ -86,7 +86,12 @@ static int ukfs_do_mount(void)
 	ukfs_sdrop();   /* fresh connection for the mount */
 	int s = ukfs_conn();
 	if (s < 0) { uk_dbg_line("uk_fs: ukfs_conn FAILED (cannot reach io.neoterm.fs)\n"); return -1; }
-	if (uksd_wn(s, "MOUNT auto uksd0\n", 16) < 0) { uk_dbg_line("uk_fs: MOUNT write failed\n"); ukfs_sdrop(); return -1; }
+	{
+		ssize_t wn = write(s, "MOUNT auto uksd0\n", 16);
+		char l[96]; snprintf(l, sizeof l, "uk_fs: write fd=%d -> %zd errno=%d\n", s, wn, (wn < 0 ? errno : 0));
+		uk_dbg_line(l);
+		if (wn != 16) { ukfs_sdrop(); return -1; }
+	}
 	char line[64];
 	if (uksd_rl(s, line, sizeof line) < 0) { uk_dbg_line("uk_fs: MOUNT no reply\n"); ukfs_sdrop(); return -1; }
 	{ char l[128]; snprintf(l, sizeof l, "uk_fs: ukfsd MOUNT reply='%s'\n", line); uk_dbg_line(l); }

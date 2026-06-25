@@ -64,6 +64,7 @@ static int read_line(int fd, char *buf, size_t cap)
 	for (;;) {
 		char c;
 		ssize_t r = read(fd, &c, 1);
+		if (i == 0) { fprintf(stderr, "ukfsd: first read(fd=%d) -> %zd errno=%d\n", fd, r, (r < 0 ? errno : 0)); fflush(stderr); }
 		if (r == 0) return -1;
 		if (r < 0) { if (errno == EINTR) continue; return -1; }
 		if (c == '\n') { buf[i] = '\0'; return (int)i; }
