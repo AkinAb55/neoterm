@@ -881,4 +881,25 @@ if 'uk_block_sysnums' not in s:
                   '\t}', 1)
     wr(SC, s)
 
+# ---- syscall/enter.c: USB-filesystem redirect (/dev/uksd0 mount -> ukfsd over
+#      io.neoterm.fs). The C lives in patches/uknl_fs_redirect.c (lintable on its
+#      own); we inject it verbatim just before translate_syscall_enter (after the
+#      block proxy, so it can reuse uksd_wn/uksd_rn/uksd_rl) and add a dispatch
+#      call right after the block dispatch in the syscall switch. ----
+import os
+EN = ROOT + "/syscall/enter.c"; s = rd(EN)
+if 'uknl_fs_dispatch' not in s:
+    fs_c = rd(os.path.join(os.path.dirname(os.path.abspath(__file__)), "uknl_fs_redirect.c"))
+    must('int translate_syscall_enter(Tracee *tracee)\n{' in s, "enter.c translate_syscall_enter anchor (fs)")
+    s = s.replace('int translate_syscall_enter(Tracee *tracee)\n{',
+                  fs_c + '\nint translate_syscall_enter(Tracee *tracee)\n{', 1)
+    blk_anchor = ('\tif (uknl_block_dispatch(tracee, syscall_number))\n\t\treturn 0;\n'
+                  '\tswitch (syscall_number) {')
+    must(blk_anchor in s, "enter.c block-dispatch anchor (fs)")
+    s = s.replace(blk_anchor,
+                  '\tif (uknl_block_dispatch(tracee, syscall_number))\n\t\treturn 0;\n'
+                  '\tif (uknl_fs_dispatch(tracee, syscall_number))\n\t\treturn 0;\n'
+                  '\tswitch (syscall_number) {', 1)
+    wr(EN, s)
+
 print("ALL PATCHES APPLIED OK")
