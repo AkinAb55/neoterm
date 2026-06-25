@@ -13,6 +13,7 @@
  */
 
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -36,8 +37,12 @@ int bsock_open(const char *name)
 	struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
 	a.sun_path[0] = '\0'; strncpy(a.sun_path + 1, name, sizeof(a.sun_path) - 2);
 	socklen_t len = (socklen_t)(sizeof(a.sun_family) + 1 + strlen(name));
-	if (connect(s, (struct sockaddr *) &a, len) < 0) { close(s); return -1; }
+	if (connect(s, (struct sockaddr *) &a, len) < 0) {
+		fprintf(stderr, "block_sock: connect '@%s' FAILED: %s\n", name, strerror(errno)); fflush(stderr);
+		close(s); return -1;
+	}
 	g_bsock = s;
+	fprintf(stderr, "block_sock: connected to '@%s'\n", name); fflush(stderr);
 	return 0;
 }
 void bsock_close(void) { if (g_bsock >= 0) { close(g_bsock); g_bsock = -1; } }

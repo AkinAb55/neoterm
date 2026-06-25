@@ -235,13 +235,20 @@ static int handle(int fd, char *line)
 
 	if (sscanf(line, "MOUNT %63s %511s", fstype, token) == 2) {
 		char path[600]; dev_path(token, path, sizeof path);
+		fprintf(stderr, "ukfsd: MOUNT recv fstype=%s token=%s -> path=%s\n", fstype, token, path); fflush(stderr);
 		if (strcmp(fstype, "auto") == 0) {
 			/* probe the engine's filesystems in turn (matches libukfs_all's
 			 * lazy mount). uk_mount rejects an unregistered name before it
 			 * touches the device, so a miss is cheap. */
 			static const char *cands[] = { "vfat", "exfat", "ntfs3", "ext4", NULL };
-			for (int i = 0; cands[i]; i++)
-				if (ukfs_mount(cands[i], path) == 0) return reply_ok(fd);
+			for (int i = 0; cands[i]; i++) {
+				fprintf(stderr, "ukfsd: MOUNT auto trying %s on %s\n", cands[i], path); fflush(stderr);
+				if (ukfs_mount(cands[i], path) == 0) {
+					fprintf(stderr, "ukfsd: MOUNT %s OK\n", cands[i]); fflush(stderr);
+					return reply_ok(fd);
+				}
+			}
+			fprintf(stderr, "ukfsd: MOUNT auto: all candidates failed\n"); fflush(stderr);
 			return reply_err(fd, ENODEV);
 		}
 		return ukfs_mount(fstype, path) == 0 ? reply_ok(fd) : reply_err(fd, ENODEV);
@@ -291,6 +298,8 @@ static void serve(int cfd)
 int main(int argc, char **argv)
 {
 	const char *sockname = (argc > 1) ? argv[1] : UKFSD_SOCKET_NAME;
+	setenv("UK_FS_DEBUG", "1", 0);   /* TEMP: verbose engine mount logging -> ukfsd.log */
+	setenv("UK_LOGLEVEL", "7", 0);
 	signal(SIGPIPE, SIG_IGN);
 
 	int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
