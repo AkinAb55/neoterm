@@ -44,6 +44,7 @@ static int    read_string(Tracee *t, char *dst, word_t src, size_t max) { (void)
 static int    write_data(Tracee *t, word_t a, const void *src, size_t n) { (void)t;(void)a;(void)src;(void)n; return 0; }
 static int    read_data(Tracee *t, void *dst, word_t src, size_t n) { (void)t;(void)src; memset(dst, 0, n); return 0; }
 static int    set_sysarg_path(Tracee *t, const char *p, Reg r) { (void)t;(void)p;(void)r; return 0; }
+static int    get_sysarg_path(Tracee *t, char path[PATH_MAX], Reg r) { (void)t;(void)r; if (path) path[0] = 0; return 0; }
 
 /* block proxy socket helpers (injected just above the FS block in enter.c). The
  * getdents test drives them through a canned, scriptable response. */
