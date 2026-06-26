@@ -575,6 +575,7 @@ static int ukfs_open_redirect(Tracee *tracee, const char *rel, int flags)
 		(void) ukfs_simple("TRUNCATE 0 ", rel);
 	(void) set_sysarg_path(tracee, isdir ? "/" : "/.ukfs_ph", SYSARG_2);
 	open_pending_set(tracee->pid, isdir, rel);
+	if (strstr(rel, "config")) { char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: OPEN rel='%s' flags=0x%x q=%d isdir=%d\n", rel, (unsigned) flags, q, isdir); uk_dbg_line(l); }
 	return isdir ? 2 : 0;
 }
 
@@ -587,7 +588,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v26-path UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v27-cfgtrace UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -673,6 +674,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		}
 		long n = ukfs_write_at(v->path, pos, tmp, len);
 		free(tmp);
+		if (strstr(v->path, "config")) { char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: WRITE poke=%ld off=%lld len=%zu p='%s'\n", n, pos, len, v->path); uk_dbg_line(l); }
 		if (n < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EIO); set_sysnum(tracee, PR_void); return true; }
 		if (nr == PR_write) v->off += n;
 		v->wrote = 1;          /* defer the block-device flush to close (SYNC) */
@@ -726,7 +728,10 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		if (v) {
 			/* Flush deferred writes once, here, instead of per write() — the latter
 			 * is O(n^2) (each sync rewrites the whole dirty-buffer list). */
-			if (v->wrote) (void) ukfs_simple("SYNC ", v->path);
+			if (v->wrote) {
+				long sr = ukfs_simple("SYNC ", v->path);
+				if (strstr(v->path, "config")) { char l[PATH_MAX + 64]; snprintf(l, sizeof l, "uk_fs: CLOSE sync=%ld p='%s'\n", sr, v->path); uk_dbg_line(l); }
+			}
 			vfd_free(v);
 		}
 		return false;          /* let the real close of the placeholder fd run */
@@ -951,9 +956,12 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		int un = ukfs_rel_at(tracee, (int) peek_reg(tracee, CURRENT, SYSARG_3), ng, nrel, sizeof nrel);
 		if (!uo && !un) return false;
 		if (uo != un) {     /* across the vmount boundary: let userspace copy+unlink */
+			uk_dbg_line("uk_fs: RENAME EXDEV (cross-boundary)\n");
 			poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EXDEV); set_sysnum(tracee, PR_void); return true;
 		}
-		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) ukfs_two_path("RENAME", orel, nrel)); set_sysnum(tracee, PR_void); return true;
+		long rr = ukfs_two_path("RENAME", orel, nrel);
+		{ char l[2 * PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: RENAME poke=%ld o='%s' n='%s'\n", rr, orel, nrel); uk_dbg_line(l); }
+		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) rr); set_sysnum(tracee, PR_void); return true;
 	}
 
 	/* openat under the vmount: rewrite the path to a real placeholder so the
