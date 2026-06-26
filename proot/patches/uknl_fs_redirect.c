@@ -580,7 +580,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v19-fakeid0 UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v20-xattr-utime UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -818,6 +818,31 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
 		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
 		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;   /* no xattrs */
+	}
+	/* set/remove xattr under the vmount: no xattrs on FAT, report success (no-op).
+	 * Crucially this also stops the call reaching fake_id0, which would try to
+	 * persist it on the non-existent host-shadow path and return EPERM. */
+	if (nr == PR_setxattr || nr == PR_lsetxattr || nr == PR_removexattr || nr == PR_lremovexattr) {
+		word_t pa = peek_reg(tracee, CURRENT, SYSARG_1); char gp[PATH_MAX], rel[PATH_MAX];
+		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
+		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		uk_dbg_line("uk_fs: setxattr/removexattr handled (no-op)\n");
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	}
+	/* utimensat/utimes under the vmount: report success (same fake_id0-bypass
+	 * reason). Path in SYSARG_2 (utimensat/futimesat) or SYSARG_1 (utimes); an
+	 * empty/NULL path means the dirfd itself (futimens). */
+	if (nr == PR_utimensat || nr == PR_futimesat || nr == PR_utimes) {
+		word_t pa = peek_reg(tracee, CURRENT, (nr == PR_utimes) ? SYSARG_1 : SYSARG_2);
+		char gp[PATH_MAX], rel[PATH_MAX];
+		if (pa && read_string(tracee, gp, pa, sizeof gp) > 0 && gp[0]) {
+			if (!ukfs_rel_at(tracee, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
+		} else {
+			if (nr == PR_utimes) return false;          /* utimes needs a path */
+			if (!vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1))) return false;
+		}
+		uk_dbg_line("uk_fs: utimensat handled (no-op)\n");
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
 	}
 
 	/* access(2) family under the vmount. access() checks the REAL uid, which under

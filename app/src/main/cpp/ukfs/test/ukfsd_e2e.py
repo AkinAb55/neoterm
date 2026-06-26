@@ -128,13 +128,19 @@ cmd('RENAME %d %d' % (len(old), len(new))); s.sendall(old + new)
 check("RENAME inner.txt -> renamed.txt", line() == 'OK')
 check("LIST /sub after rename", listdir('/sub') == ['renamed.txt'])
 
-# 6b) git-style rename: LFN lock file -> 8.3 target (reproduces config.lock -> config)
+# 6b) git config write reproduction: CREATE + two writes (incl. a non-zero offset,
+# as git does for "[core]\n" then "\t...version = 0\n") + lock->config rename, then
+# verify the bytes survive (catches an offset-7 write or rename data-loss bug).
+GITCFG = b'[core]\n\trepositoryformatversion = 0\n'
 cmd('CREATE 33188 /sub/config.lock'); check("CREATE config.lock", line() == 'OK')
-cmd('WRITE 0 7 /sub/config.lock'); s.sendall(b'[core]\n'); check("WRITE config.lock", line() == 'OK 7')
+cmd('WRITE 0 7 /sub/config.lock');  s.sendall(b'[core]\n'); check("WRITE config.lock @0", line() == 'OK 7')
+cmd('WRITE 7 29 /sub/config.lock'); s.sendall(b'\trepositoryformatversion = 0\n'); check("WRITE config.lock @7", line() == 'OK 29')
+check("READ config.lock content", readfile('/sub/config.lock') == GITCFG)
 o2, n2 = b'sub/config.lock', b'sub/config'
 cmd('RENAME %d %d' % (len(o2), len(n2))); s.sendall(o2 + n2)
 check("RENAME config.lock -> config (LFN->8.3)", line() == 'OK')
 check("LIST /sub has config", 'config' in listdir('/sub'))
+check("READ config after rename", readfile('/sub/config') == GITCFG)
 cmd('UNLINK /sub/config'); line()
 
 # 7) chmod + truncate
