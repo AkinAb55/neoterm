@@ -339,7 +339,32 @@ void ihold(struct inode *inode) { if (inode) inode->i_count.counter++; }
 int  insert_inode_locked(struct inode *inode) { (void)inode; return 0; }
 void insert_inode_hash(struct inode *inode)
 { unsigned long h = inode->i_ino % IHASH; inode->i_hash.next = (struct hlist_node *)g_ihash[h]; g_ihash[h] = inode; }
-void remove_inode_hash(struct inode *inode) { (void)inode; }
+/* Unhash an evicted inode so a future iget re-reads it fresh from disk. CRITICAL:
+ * FAT reuses a deleted entry's directory slot (-> same i_pos/i_ino) for the next
+ * file/dir created there. With the inode left cached, iget_locked() would return
+ * the STALE inode of the deleted file (wrong mode/clusters) — so a new directory
+ * at a reused slot fails the is-a-dir check in api_walk, and lookups/creates
+ * under it flakily fail with ENOENT/EIO. Scan all buckets (iget_locked keys on
+ * i_ino, iget5_locked on a driver hashval) and remove by pointer; don't free
+ * (stale leaked dentries may still point at it — unhashing is enough to stop new
+ * lookups from resurrecting it). */
+void remove_inode_hash(struct inode *inode)
+{
+	if (!inode) return;
+	for (int h = 0; h < IHASH; h++) {
+		struct inode *cur = g_ihash[h], *prev = 0;
+		while (cur) {
+			struct inode *nx = cur->i_hash.next ? (struct inode *)cur->i_hash.next : 0;
+			if (cur == inode) {
+				if (prev) prev->i_hash.next = cur->i_hash.next;
+				else g_ihash[h] = nx;
+				cur->i_hash.next = 0;
+				return;
+			}
+			prev = cur; cur = nx;
+		}
+	}
+}
 void clear_inode(struct inode *inode) { (void)inode; }
 /* bad-inode JELZŐ (i_state bit), NEM i_ino==0 — a $MFT legitimen i_ino=0 (MFT_REC_MFT)! */
 #define UK_I_BAD (1<<13)
@@ -921,6 +946,19 @@ static struct uk_fcache *g_fcache;   /* fwd-decl: a ukfs_remount törli (a telje
 int ukfs_mount(const char *fstype, const char *img)
 {
 	if (!g_api_inited) { ukernel_run_module_inits(); g_api_inited = 1; }
+	/* Start from a CLEAN cache. ukfsd is one long-lived process; a guest
+	 * umount→mount cycle (or remounting a different device) reuses these globals,
+	 * so stale buffer/inode/page caches from a previous mount would leak in and
+	 * make lookups read pre-fsck / pre-write block contents — flaky ENOENT/EIO.
+	 * Drop them (don't free: leaked driver refs must not become use-after-free),
+	 * exactly like ukfs_remount. The i_sb guard already separates inodes by sb,
+	 * but the buffer cache is keyed by block number and MUST be dropped. */
+	g_bhlist = NULL;
+	memset(g_ihash, 0, sizeof(g_ihash));
+	g_fcache = NULL;
+	g_blocksize = 512;
+	if (g_bdev_fd >= 0) { close(g_bdev_fd); g_bdev_fd = -1; }
+	if (g_bdev_sock >= 0) { bsock_close(); g_bdev_sock = -1; }
 	g_api_root = uk_mount(fstype, img);
 	return (g_api_root && g_api_root->d_inode) ? 0 : -1;
 }
@@ -1074,7 +1112,13 @@ static struct dentry *api_walk(const char *path, struct inode **parent, struct d
 		}
 		/* köztes komponens: le kell tudni lépni (könyvtár) */
 		struct dentry *d = lookup_one(cur->d_inode, cur, comp);
-		if (!d || !d->d_inode || (d->d_inode->i_mode & 0170000) != 0040000) return 0;
+		if (!d || !d->d_inode || (d->d_inode->i_mode & 0170000) != 0040000) {
+			fprintf(stderr, "ukfsd: api_walk FAIL comp='%s' path='%s' d=%p inode=%p mode=%o\n",
+			        comp, path, (void*)d, d ? (void*)d->d_inode : 0,
+			        (d && d->d_inode) ? (unsigned)d->d_inode->i_mode : 0u);
+			fflush(stderr);
+			return 0;
+		}
 		cur = d;
 		comp = next;
 	}
@@ -1252,6 +1296,7 @@ long ukfs_unlink(const char *name)
 	 * a nlink==0-t maga ellenőrzi). Enélkül: fsck "Deleted inode has zero dtime" + count wrong. */
 	if (target && dir->i_sb->s_op && dir->i_sb->s_op->evict_inode)
 		dir->i_sb->s_op->evict_inode(target);
+	remove_inode_hash(target);                         /* drop from icache: its slot may be reused */
 	uk_flush_meta(dir, 0);                              /* a szülő-könyvtár (bejegyzés törölve) + bitmapek */
 	return 0;
 }
@@ -1271,6 +1316,7 @@ long ukfs_rmdir(const char *name)
 	if (e) return e;
 	if (target && dir->i_sb->s_op && dir->i_sb->s_op->evict_inode)
 		dir->i_sb->s_op->evict_inode(target);          /* dtime + bitmap + dir-count (lásd unlink) */
+	remove_inode_hash(target);                         /* drop from icache: its slot may be reused */
 	uk_flush_meta(dir, 0);
 	return 0;
 }
@@ -1300,8 +1346,10 @@ long ukfs_rename(const char *oldpath, const char *newpath)
 	if (e) return e;
 	/* ha a rename felülírt egy meglévő célt, a régi cél-inode-ot evictálni kell (dtime + bitmap),
 	 * mint az unlinknál — különben fsck "Deleted inode has zero dtime" / count wrong. */
-	if (replaced && replaced != moved && ndir->i_sb->s_op && ndir->i_sb->s_op->evict_inode)
+	if (replaced && replaced != moved && ndir->i_sb->s_op && ndir->i_sb->s_op->evict_inode) {
 		ndir->i_sb->s_op->evict_inode(replaced);
+		remove_inode_hash(replaced);                   /* overwritten target: its slot may be reused */
+	}
 	/* a MOZGATOTT fájl inode-ját is ki kell írni: vfat/ntfs3-nál a méret/cluster a DIR-ENTRYBEN
 	 * van (az új i_pos-on), amit a write_inode (fat_write_inode) ír — különben a cél 0 méretű lesz. */
 	if (moved && ndir->i_sb->s_op && ndir->i_sb->s_op->write_inode) {
