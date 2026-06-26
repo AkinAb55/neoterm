@@ -474,7 +474,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v7-umount UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v8-dupwrite UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -802,8 +802,32 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 void uknl_fs_open_exit(Tracee *tracee, word_t nr)
 {
 	if (!uk_fs_on()) return;
-	if (nr != PR_openat) return;
 	int pid = tracee->pid;
+
+	/* dup/dup2/dup3 of a vfd: make the new fd number alias the same ukfs path.
+	 * Without this, a write through a redirected fd is lost: `echo > file` opens
+	 * the file (vfd), dup2()s it onto stdout (fd 1), closes the original, then
+	 * writes to fd 1 — which, untracked, hits the /dev/null placeholder and the
+	 * data vanishes (the file stays empty). On aarch64 dup2 is implemented via
+	 * dup3, so both are handled. */
+	if (nr == PR_dup || nr == PR_dup2 || nr == PR_dup3) {
+		struct ukfs_vfd *src = vfd_find(pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		if (!src) return;
+		long newfd = (long)(int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+		if (newfd < 0 || (int) newfd == src->fd) return;
+		struct ukfs_vfd *old = vfd_find(pid, (int) newfd);   /* dup2/3 closed it first */
+		if (old) vfd_free(old);
+		struct ukfs_vfd *v = vfd_alloc();
+		if (v) {
+			memset(v, 0, sizeof *v);
+			v->used = 1; v->pid = pid; v->fd = (int) newfd;
+			v->isdir = src->isdir; v->off = src->off;
+			snprintf(v->path, sizeof v->path, "%s", src->path);
+		}
+		return;
+	}
+
+	if (nr != PR_openat) return;
 	struct ukfs_pending *pp = NULL;
 	for (int i = 0; i < 64; i++)
 		if (g_open_pending[i].used && g_open_pending[i].pid == pid) { pp = &g_open_pending[i]; break; }

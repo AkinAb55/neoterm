@@ -33,7 +33,8 @@ enum { PR_void = 0, PR_mount, PR_newfstatat, PR_fstatat64, PR_statx,
        PR_close, PR_readlinkat, PR_write, PR_pwrite64, PR_ftruncate,
        PR_mkdirat, PR_unlinkat, PR_symlinkat, PR_fchmodat, PR_fchownat,
        PR_truncate, PR_renameat, PR_renameat2,
-       PR_umount2, PR_fstat, PR_getxattr, PR_lgetxattr, PR_listxattr, PR_llistxattr };
+       PR_umount2, PR_fstat, PR_getxattr, PR_lgetxattr, PR_listxattr, PR_llistxattr,
+       PR_dup, PR_dup2, PR_dup3 };
 #ifndef EXDEV
 #define EXDEV 18
 #endif
