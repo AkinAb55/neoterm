@@ -580,7 +580,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v20-xattr-utime UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v21-diag UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -1001,6 +1001,26 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		return r == 1;
 	}
 
+	/* TEMP DIAG (git clone EPERM): a trapped syscall reached here unhandled while a
+	 * vmount is active. If its path arg is under the vmount, fake_id0/proot handles
+	 * it next and may EPERM it (the "could not write config file" failure). fake_id0
+	 * only intercepts seccomp-trapped syscalls, so the culprit necessarily passes
+	 * through here — log its number + path to dmesg to identify it in one build. */
+	{
+		char gp[PATH_MAX];
+		size_t ml = g_vmount[0] ? strlen(g_vmount) : 0;
+		for (int ai = 0; ml && ai < 2; ai++) {
+			word_t pa = peek_reg(tracee, CURRENT, ai == 0 ? SYSARG_1 : SYSARG_2);
+			if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0 || gp[0] != '/') continue;
+			if (strncmp(gp, g_vmount, ml) == 0 && (gp[ml] == '\0' || gp[ml] == '/')) {
+				char l[PATH_MAX + 96];
+				snprintf(l, sizeof l, "uk_fs: UNHANDLED nr=%lu arg%d path='%s'\n",
+				         (unsigned long) nr, ai + 1, gp);
+				uk_dbg_line(l);
+				break;
+			}
+		}
+	}
 	return false;
 }
 
