@@ -465,6 +465,31 @@ static bool uknl_fs_umount_hook(Tracee *tracee)
 	return true;
 }
 
+#ifndef AT_FDCWD
+#define AT_FDCWD (-100)
+#endif
+/* Resolve an *at (dirfd, user path) pair to a vmount-relative path. Absolute
+ * paths go through ukfs_rel; a relative path is joined onto the dirfd's vfd path
+ * — so tools that open the mount dir and then operate relative to that fd (cp,
+ * coreutils ls -l, find, …) resolve under the mount instead of leaking to the
+ * host. Returns 1 (rel filled) iff the target is under the vmount. */
+static int ukfs_rel_at(int pid, int dirfd, const char *path, char *rel, size_t rsz)
+{
+	if (path[0] == '/')
+		return ukfs_rel(path, rel, rsz);
+	if (dirfd == AT_FDCWD)
+		return 0;                       /* relative to cwd: not our concern here */
+	struct ukfs_vfd *v = vfd_find(pid, dirfd);
+	if (!v) return 0;                       /* dirfd isn't one of our mount fds */
+	if (!path[0])
+		snprintf(rel, rsz, "%s", v->path);              /* empty path => the dir itself */
+	else if (v->path[0] == '/' && v->path[1] == '\0')
+		snprintf(rel, rsz, "/%s", path);                /* dir is the mount root */
+	else
+		snprintf(rel, rsz, "%s/%s", v->path, path);
+	return 1;
+}
+
 /* Shared openat/openat2 redirect for a vmount-relative path @rel with open
  * @flags. Returns 1 if fully handled (SYSARG_RESULT poked + PR_void), 0 if it
  * rewrote the path to a placeholder so the real open proceeds (fd bound at exit),
@@ -507,7 +532,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v11-openat2 UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v12-dirfd UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -645,6 +670,14 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		if (v) vfd_free(v);
 		return false;          /* let the real close of the placeholder fd run */
 	}
+	/* fsync/fdatasync on a vfd: ukfs writes are already flushed (uk_flush_meta),
+	 * and the placeholder fd is /dev/null whose fsync returns EINVAL — which makes
+	 * editors report "Error writing ...: Invalid argument". Report success. */
+	if (nr == PR_fsync || nr == PR_fdatasync) {
+		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		if (!v) return false;
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	}
 
 	/* fstat(fd) on a vfd: report the ukfs file's own attributes, so e.g. the
 	 * mount root (the dir fd ls opens) shows the real FS stat, not the host
@@ -668,7 +701,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		char gp[PATH_MAX], rel[PATH_MAX];
 		int have_rel = 0;
 		if (pa && read_string(tracee, gp, pa, sizeof gp) > 0 && gp[0] != '\0') {
-			have_rel = ukfs_rel(gp, rel, sizeof rel);
+			have_rel = ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel);
 		} else {
 			int flags = (int) peek_reg(tracee, CURRENT, (nr == PR_statx) ? SYSARG_3 : SYSARG_4);
 			if (flags & 0x1000 /* AT_EMPTY_PATH */) {
@@ -718,10 +751,13 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	 * existing path (ENOENT only when it truly doesn't exist). access=SYSARG_1 path,
 	 * faccessat/faccessat2=SYSARG_2 path. */
 	if (nr == PR_access || nr == PR_faccessat || nr == PR_faccessat2) {
-		word_t pa = peek_reg(tracee, CURRENT, (nr == PR_access) ? SYSARG_1 : SYSARG_2);
+		int isaccess = (nr == PR_access);
+		word_t pa = peek_reg(tracee, CURRENT, isaccess ? SYSARG_1 : SYSARG_2);
 		char gp[PATH_MAX], rel[PATH_MAX];
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		if (!(isaccess ? ukfs_rel(gp, rel, sizeof rel)
+		               : ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)))
+			return false;
 		unsigned mode, uid, gid, nlink; long size, mt, at; unsigned long ino, rdev, blocks;
 		int q = ukfs_query_stat(rel, &mode, &uid, &gid, &size, &ino, &mt, &at, &nlink, &rdev, &blocks);
 		if (q == -1) return false;                 /* socket down: let host try */
@@ -735,7 +771,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		char gp[PATH_MAX];
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
 		char rel[PATH_MAX];
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		if (!ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
 		char tgt[PATH_MAX];
 		long n = ukfs_readlink_at(rel, tgt, sizeof tgt);
 		if (n < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EINVAL); set_sysnum(tracee, PR_void); return true; }
@@ -750,7 +786,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (nr == PR_mkdirat) {
 		word_t pa = peek_reg(tracee, CURRENT, SYSARG_2); char gp[PATH_MAX], rel[PATH_MAX];
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		if (!ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
 		unsigned mode = (unsigned) peek_reg(tracee, CURRENT, SYSARG_3) & 07777;
 		char pfx[48]; snprintf(pfx, sizeof pfx, "MKDIR %u ", mode);
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) ukfs_simple(pfx, rel)); set_sysnum(tracee, PR_void); return true;
@@ -758,7 +794,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (nr == PR_unlinkat) {
 		word_t pa = peek_reg(tracee, CURRENT, SYSARG_2); char gp[PATH_MAX], rel[PATH_MAX];
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		if (!ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
 		int flags = (int) peek_reg(tracee, CURRENT, SYSARG_3);
 		int r = ukfs_simple((flags & 0x200) ? "RMDIR " : "UNLINK ", rel);   /* AT_REMOVEDIR */
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) r); set_sysnum(tracee, PR_void); return true;
@@ -769,13 +805,13 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		char target[PATH_MAX], lp[PATH_MAX], rel[PATH_MAX];
 		if (!ta || read_string(tracee, target, ta, sizeof target) <= 0) return false;
 		if (!la || read_string(tracee, lp, la, sizeof lp) <= 0) return false;
-		if (!ukfs_rel(lp, rel, sizeof rel)) return false;
+		if (!ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_2), lp, rel, sizeof rel)) return false;
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) ukfs_two_path("SYMLINK", target, rel)); set_sysnum(tracee, PR_void); return true;
 	}
 	if (nr == PR_fchmodat) {
 		word_t pa = peek_reg(tracee, CURRENT, SYSARG_2); char gp[PATH_MAX], rel[PATH_MAX];
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		if (!ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
 		unsigned mode = (unsigned) peek_reg(tracee, CURRENT, SYSARG_3) & 07777;
 		char pfx[48]; snprintf(pfx, sizeof pfx, "CHMOD %u ", mode);
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) ukfs_simple(pfx, rel)); set_sysnum(tracee, PR_void); return true;
@@ -783,7 +819,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (nr == PR_fchownat) {
 		word_t pa = peek_reg(tracee, CURRENT, SYSARG_2); char gp[PATH_MAX], rel[PATH_MAX];
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		if (!ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
 		unsigned uid = (unsigned) peek_reg(tracee, CURRENT, SYSARG_3);
 		unsigned gid = (unsigned) peek_reg(tracee, CURRENT, SYSARG_4);
 		char pfx[64]; snprintf(pfx, sizeof pfx, "CHOWN %u %u ", uid, gid);
@@ -803,7 +839,8 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		char og[PATH_MAX], ng[PATH_MAX], orel[PATH_MAX], nrel[PATH_MAX];
 		if (!oa || read_string(tracee, og, oa, sizeof og) <= 0) return false;
 		if (!na || read_string(tracee, ng, na, sizeof ng) <= 0) return false;
-		int uo = ukfs_rel(og, orel, sizeof orel), un = ukfs_rel(ng, nrel, sizeof nrel);
+		int uo = ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), og, orel, sizeof orel);
+		int un = ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_3), ng, nrel, sizeof nrel);
 		if (!uo && !un) return false;
 		if (uo != un) {     /* across the vmount boundary: let userspace copy+unlink */
 			poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EXDEV); set_sysnum(tracee, PR_void); return true;
@@ -821,7 +858,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		char gp[PATH_MAX];
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
 		char rel[PATH_MAX];
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		if (!ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
 		int flags = (int) peek_reg(tracee, CURRENT, SYSARG_3);
 		return ukfs_open_redirect(tracee, rel, flags) == 1;
 	}
@@ -830,7 +867,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		char gp[PATH_MAX];
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
 		char rel[PATH_MAX];
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		if (!ukfs_rel_at(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
 		/* struct open_how { __u64 flags; __u64 mode; __u64 resolve; } at SYSARG_3,
 		 * size in SYSARG_4. We only need flags (and let create use the default mode). */
 		word_t howp = peek_reg(tracee, CURRENT, SYSARG_3);
