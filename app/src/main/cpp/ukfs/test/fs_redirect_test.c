@@ -38,7 +38,7 @@ enum { PR_void = 0, PR_mount, PR_newfstatat, PR_fstatat64, PR_statx,
        PR_fsync, PR_fdatasync, PR_fchmod, PR_fchown,
        PR_setxattr, PR_lsetxattr, PR_removexattr, PR_lremovexattr,
        PR_utimensat, PR_futimesat, PR_utimes, PR_mmap, PR_mmap2,
-       PR_chdir, PR_fchdir };
+       PR_chdir, PR_fchdir, PR_fcntl, PR_fcntl64 };
 #ifndef EXDEV
 #define EXDEV 18
 #endif

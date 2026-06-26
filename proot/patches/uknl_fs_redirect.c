@@ -706,7 +706,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v37-getdfix UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v38-fcntldup UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -1314,6 +1314,32 @@ void uknl_fs_open_exit(Tracee *tracee, word_t nr)
 		struct ukfs_vfd *old = vfd_find(pid, (int) newfd);
 		if (old) vfd_free(old);
 		/* If the source is one of our vfds, the new fd aliases the same path. */
+		struct ukfs_vfd *src = vfd_find(pid, oldfd);
+		if (!src) return;
+		struct ukfs_vfd *v = vfd_alloc();
+		if (v) {
+			memset(v, 0, sizeof *v);
+			v->used = 1; v->pid = pid; v->fd = (int) newfd;
+			v->isdir = src->isdir; v->off = src->off;
+			snprintf(v->path, sizeof v->path, "%s", src->path);
+		}
+		return;
+	}
+
+	/* fcntl(fd, F_DUPFD|F_DUPFD_CLOEXEC) is ANOTHER way to dup an fd — glibc's
+	 * fdopendir() uses it, so `rm -rf`/`find` read a directory through one fd but
+	 * stat/open its children through the DUP. Untracked, those child ops miss the
+	 * vfd and leak to the host placeholder (rm sees an "empty" dir and can't
+	 * recurse). Alias the new fd to the source vfd, same as dup3. */
+	if (nr == PR_fcntl || nr == PR_fcntl64) {
+		int cmd = (int) peek_reg(tracee, ORIGINAL, SYSARG_2);
+		if (cmd != 0 /*F_DUPFD*/ && cmd != 1030 /*F_DUPFD_CLOEXEC*/) return;
+		long newfd = (long)(int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+		if (newfd < 0) return;
+		int oldfd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
+		if ((int) newfd == oldfd) return;
+		struct ukfs_vfd *old = vfd_find(pid, (int) newfd);
+		if (old) vfd_free(old);
 		struct ukfs_vfd *src = vfd_find(pid, oldfd);
 		if (!src) return;
 		struct ukfs_vfd *v = vfd_alloc();
