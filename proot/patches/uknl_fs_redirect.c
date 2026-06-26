@@ -588,7 +588,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v27-cfgtrace UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v28-final UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -1042,6 +1042,24 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		}
 	}
 	return false;
+}
+
+/* TEMP DIAG: called at the VERY END of translate_syscall_exit (after fake_id0's
+ * SYSCALL_EXIT_END, which can still overwrite the result register). The earlier
+ * uknl_fs_open_exit probe runs before that point, so it can't see a late EPERM
+ * poke. Log the FINAL result git actually receives for rename/close/open under
+ * the vmount — rename always, others only on error — to settle whether the
+ * config commit's rename/close is delivered as 0 or mangled to -EPERM. */
+void uknl_fs_exit_final(Tracee *tracee, word_t nr);
+void uknl_fs_exit_final(Tracee *tracee, word_t nr)
+{
+	if (!uk_fs_on() || !g_vmounted) return;
+	int res = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	if (nr == PR_renameat || nr == PR_renameat2) {
+		char l[96]; snprintf(l, sizeof l, "uk_fs: EXIT-FINAL rename res=%d\n", res); uk_dbg_line(l);
+	} else if ((nr == PR_close || nr == PR_openat || nr == PR_openat2) && res < 0) {
+		char l[96]; snprintf(l, sizeof l, "uk_fs: EXIT-FINAL nr=%lu res=%d\n", (unsigned long) nr, res); uk_dbg_line(l);
+	}
 }
 
 /* Called from translate_syscall_exit (exit.c) for every syscall exit: binds the

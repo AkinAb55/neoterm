@@ -949,11 +949,21 @@ EX = ROOT + "/syscall/exit.c"; s = rd(EX)
 if 'uknl_fs_open_exit' not in s:
     must('void translate_syscall_exit(Tracee *tracee)\n{' in s, "exit.c translate_syscall_exit anchor (fs)")
     s = s.replace('void translate_syscall_exit(Tracee *tracee)\n{',
-                  'extern void uknl_fs_open_exit(Tracee *tracee, word_t nr);\n\n'
+                  'extern void uknl_fs_open_exit(Tracee *tracee, word_t nr);\n'
+                  'extern void uknl_fs_exit_final(Tracee *tracee, word_t nr);\n\n'
                   'void translate_syscall_exit(Tracee *tracee)\n{', 1)
     ex_anchor = '\tsyscall_number = get_sysnum(tracee, ORIGINAL);'
     must(ex_anchor in s, "exit.c get_sysnum anchor (fs)")
     s = s.replace(ex_anchor, ex_anchor + '\n\tuknl_fs_open_exit(tracee, syscall_number);', 1)
+    # TEMP DIAG: also call a hook at the VERY END (after SYSCALL_EXIT_END), where a
+    # late fake_id0 result-poke would already be applied — to log the final result
+    # git actually receives (re-derive the sysnum; it isn't in scope on every path).
+    ex_end = ('\tstatus = notify_extensions(tracee, SYSCALL_EXIT_END, 0, 0);\n'
+              '\tif (status < 0)\n'
+              '\t\tpoke_reg(tracee, SYSARG_RESULT, (word_t) status);\n}')
+    must(ex_end in s, "exit.c SYSCALL_EXIT_END tail anchor (fs)")
+    s = s.replace(ex_end, ex_end[:-1] +
+                  '\tuknl_fs_exit_final(tracee, get_sysnum(tracee, ORIGINAL));\n}', 1)
     wr(EX, s)
 
 # ---- syscall/seccomp.c: trap the fd-based FS syscalls (no path -> not in proot's
