@@ -64,7 +64,6 @@ static int read_line(int fd, char *buf, size_t cap)
 	for (;;) {
 		char c;
 		ssize_t r = read(fd, &c, 1);
-		if (i == 0) { fprintf(stderr, "ukfsd: first read(fd=%d) -> %zd errno=%d\n", fd, r, (r < 0 ? errno : 0)); fflush(stderr); }
 		if (r == 0) return -1;
 		if (r < 0) { if (errno == EINTR) continue; return -1; }
 		if (c == '\n') { buf[i] = '\0'; return (int)i; }
@@ -305,8 +304,10 @@ int main(int argc, char **argv)
 	 * holding @io.neoterm.fs across app restarts (which would shadow the new
 	 * build). PR_SET_PDEATHSIG fires when our parent (the app) exits. */
 	prctl(PR_SET_PDEATHSIG, SIGKILL);
-	setenv("UK_FS_DEBUG", "1", 0);   /* TEMP: verbose engine mount logging -> ukfsd.log */
-	setenv("UK_LOGLEVEL", "7", 0);
+	/* FS-engine log level: 4 = warnings + errors (e.g. the benign "Volume was not
+	 * properly unmounted" notice and real fs errors), suppressing the INFO/debug
+	 * driver spam (module_init, register_filesystem, …). Override via UK_LOGLEVEL. */
+	setenv("UK_LOGLEVEL", "4", 0);
 	signal(SIGPIPE, SIG_IGN);
 
 	int sfd = socket(AF_UNIX, SOCK_STREAM, 0);

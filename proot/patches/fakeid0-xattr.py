@@ -928,6 +928,15 @@ if 'uknl_fs_dispatch' not in s:
                   'static bool uknl_fs_mount_hook(Tracee *tracee);\n'
                   'void apply_emulated_mount(Tracee *tracee)\n{\n'
                   '\tif (uknl_fs_mount_hook(tracee)) return;', 1)
+    # umount(2)/umount2(2) are SIGSYS-blocked on Android too, handled via
+    # apply_emulated_umount(); hook it the same way so /mnt/usb2 unmount tears
+    # down the vmount + ukfsd connection.
+    aum_anchor = 'void apply_emulated_umount(Tracee *tracee)\n{'
+    must(aum_anchor in s, "enter.c apply_emulated_umount anchor (fs)")
+    s = s.replace(aum_anchor,
+                  'static bool uknl_fs_umount_hook(Tracee *tracee);\n'
+                  'void apply_emulated_umount(Tracee *tracee)\n{\n'
+                  '\tif (uknl_fs_umount_hook(tracee)) return;', 1)
     wr(EN, s)
 
 # ---- syscall/exit.c: capture the fd returned by a redirected openat so reads/
@@ -963,6 +972,7 @@ if 'uk_fs_sysnums' not in s:
                   '\t\t\t{ PR_write,\tFILTER_SYSEXIT },\n'
                   '\t\t\t{ PR_pwrite64,\tFILTER_SYSEXIT },\n'
                   '\t\t\t{ PR_ftruncate,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fstat,\tFILTER_SYSEXIT },\n'
                   '\t\t\tFILTERED_SYSNUM_END,\n'
                   '\t\t};\n'
                   '\t\tstatus = merge_filtered_sysnums(tracee->ctx, &filtered_sysnums, uk_fs_sysnums);\n'

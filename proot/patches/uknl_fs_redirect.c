@@ -98,15 +98,31 @@ static int ukfs_do_mount(void)
 		 * and uksd_wn so partial writes / EINTR are handled. */
 		static const char REQ[] = "MOUNT auto uksd0\n";
 		int wn = uksd_wn(s, REQ, sizeof REQ - 1);
-		char l[96]; snprintf(l, sizeof l, "uk_fs: write fd=%d -> %d (%zu) errno=%d\n",
-		                     s, wn, sizeof REQ - 1, (wn < 0 ? errno : 0));
-		uk_dbg_line(l);
-		if (wn < 0) { ukfs_sdrop(); return -1; }
+		if (wn < 0) {
+			char l[96]; snprintf(l, sizeof l, "uk_fs: MOUNT write failed errno=%d\n", errno);
+			uk_dbg_line(l); ukfs_sdrop(); return -1;
+		}
 	}
 	char line[64];
 	if (uksd_rl(s, line, sizeof line) < 0) { uk_dbg_line("uk_fs: MOUNT no reply\n"); ukfs_sdrop(); return -1; }
-	{ char l[128]; snprintf(l, sizeof l, "uk_fs: ukfsd MOUNT reply='%s'\n", line); uk_dbg_line(l); }
-	return (line[0] == 'O' && line[1] == 'K') ? 0 : -1;
+	if (line[0] == 'O' && line[1] == 'K') return 0;
+	{ char l[128]; snprintf(l, sizeof l, "uk_fs: MOUNT rejected: '%s'\n", line); uk_dbg_line(l); }
+	return -1;
+}
+
+/* Tell ukfsd to unmount and forget the vmount. Dropping the connection alone
+ * already loses the ukfsd-side mount (one FS per connection), but send an
+ * explicit UMOUNT first so ukfsd can flush/free before the close. */
+static void ukfs_do_umount(void)
+{
+	if (g_ukfs_ready && g_ukfs_sock >= 0) {
+		char line[32];
+		if (uksd_wn(g_ukfs_sock, "UMOUNT\n", 7) >= 0)
+			uksd_rl(g_ukfs_sock, line, sizeof line);   /* best-effort reply */
+	}
+	ukfs_sdrop();          /* closes the connection -> ukfsd drops the FS */
+	g_vmounted = 0;
+	g_vmount[0] = '\0';
 }
 
 /* Perform the deferred ukfsd mount on first access (idempotent). */
@@ -433,6 +449,22 @@ static bool uknl_fs_mount_hook(Tracee *tracee)
 	return true;
 }
 
+/* Umount hook, called from apply_emulated_umount() — the SIGSYS path Android
+ * uses to block umount(2)/umount2(2). Returns true if it handled an unmount of
+ * our vmount point (the caller then reports success to the guest). */
+static bool uknl_fs_umount_hook(Tracee *tracee)
+{
+	if (!uk_fs_on() || !g_vmounted) return false;
+	char tgt[PATH_MAX];
+	if (get_sysarg_path(tracee, tgt, SYSARG_1) < 0) return false;
+	if (strcmp(tgt, g_vmount) != 0) return false;   /* not our mount point */
+	char l[PATH_MAX + 64];
+	snprintf(l, sizeof l, "uk_fs: UMOUNT hook tgt='%s'\n", tgt);
+	uk_dbg(tracee, l);
+	ukfs_do_umount();
+	return true;
+}
+
 static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 {
 	/* --- TEMP DEBUG v3: one-time INIT line at the first syscall (shows the raw
@@ -442,7 +474,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v6-vmount UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v7-umount UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -473,6 +505,20 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		if (!ta || read_string(tracee, tgt, ta, sizeof tgt) <= 0) return false;
 		snprintf(g_vmount, sizeof g_vmount, "%s", tgt);
 		g_vmounted = 1; g_ukfs_ready = 0;
+		poke_reg(tracee, SYSARG_RESULT, 0);
+		set_sysnum(tracee, PR_void);
+		return true;
+	}
+
+	/* umount(2)/umount2(2) on the NORMAL path (non-Android). On Android these are
+	 * SIGSYS-blocked and handled via the apply_emulated_umount hook instead. */
+	if (nr == PR_umount2) {
+		if (!g_vmounted) return false;
+		word_t ta = peek_reg(tracee, CURRENT, SYSARG_1);
+		char tgt[PATH_MAX];
+		if (!ta || read_string(tracee, tgt, ta, sizeof tgt) <= 0) return false;
+		if (strcmp(tgt, g_vmount) != 0) return false;
+		ukfs_do_umount();
 		poke_reg(tracee, SYSARG_RESULT, 0);
 		set_sysnum(tracee, PR_void);
 		return true;
@@ -567,13 +613,37 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		return false;          /* let the real close of the placeholder fd run */
 	}
 
-	/* stat family on a path under the vmount: answer from ukfsd. */
+	/* fstat(fd) on a vfd: report the ukfs file's own attributes, so e.g. the
+	 * mount root (the dir fd ls opens) shows the real FS stat, not the host
+	 * placeholder fd's stat. (Needs PR_fstat in the seccomp trap set.) */
+	if (nr == PR_fstat) {
+		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		if (!v) return false;
+		unsigned mode, uid, gid, nlink; long size, mt, at; unsigned long ino, rdev, blocks;
+		if (ukfs_query_stat(v->path, &mode, &uid, &gid, &size, &ino, &mt, &at, &nlink, &rdev, &blocks) != 0)
+			return false;
+		ukfs_put_stat(tracee, peek_reg(tracee, CURRENT, SYSARG_2),
+		              mode, uid, gid, size, ino, mt, at, nlink, rdev, blocks);
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	}
+
+	/* stat family on a path under the vmount: answer from ukfsd. Also handles the
+	 * empty-path + AT_EMPTY_PATH form (fstatat(fd, "", AT_EMPTY_PATH)), which many
+	 * libcs use for fstat — resolve it against the vfd's path. */
 	if (nr == PR_newfstatat || nr == PR_fstatat64 || nr == PR_statx) {
 		word_t pa = peek_reg(tracee, CURRENT, SYSARG_2);
-		char gp[PATH_MAX];
-		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0 || gp[0] == '\0') return false;
-		char rel[PATH_MAX];
-		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		char gp[PATH_MAX], rel[PATH_MAX];
+		int have_rel = 0;
+		if (pa && read_string(tracee, gp, pa, sizeof gp) > 0 && gp[0] != '\0') {
+			have_rel = ukfs_rel(gp, rel, sizeof rel);
+		} else {
+			int flags = (int) peek_reg(tracee, CURRENT, (nr == PR_statx) ? SYSARG_3 : SYSARG_4);
+			if (flags & 0x1000 /* AT_EMPTY_PATH */) {
+				struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+				if (v) { snprintf(rel, sizeof rel, "%s", v->path); have_rel = 1; }
+			}
+		}
+		if (!have_rel) return false;
 		unsigned mode, uid, gid, nlink; long size, mt, at; unsigned long ino, rdev, blocks;
 		int q = ukfs_query_stat(rel, &mode, &uid, &gid, &size, &ino, &mt, &at, &nlink, &rdev, &blocks);
 		if (q == -1) return false;                 /* socket down: let host try */
@@ -591,6 +661,23 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		set_sysnum(tracee, PR_void);
 		return true;
 	}
+
+	/* xattr ops under the vmount: the FAT/exFAT engine has no xattrs. Without this
+	 * the calls fall through to a non-existent host path (ENOENT), which makes ls
+	 * print a "?" access-method indicator. getxattr -> ENOTSUP, listxattr -> empty. */
+	if (nr == PR_getxattr || nr == PR_lgetxattr) {
+		word_t pa = peek_reg(tracee, CURRENT, SYSARG_1); char gp[PATH_MAX], rel[PATH_MAX];
+		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
+		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - ENOTSUP); set_sysnum(tracee, PR_void); return true;
+	}
+	if (nr == PR_listxattr || nr == PR_llistxattr) {
+		word_t pa = peek_reg(tracee, CURRENT, SYSARG_1); char gp[PATH_MAX], rel[PATH_MAX];
+		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
+		if (!ukfs_rel(gp, rel, sizeof rel)) return false;
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;   /* no xattrs */
+	}
+
 
 	/* readlinkat on a symlink under the vmount. */
 	if (nr == PR_readlinkat) {
