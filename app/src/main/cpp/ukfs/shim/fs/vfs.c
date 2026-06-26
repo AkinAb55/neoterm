@@ -1771,7 +1771,9 @@ long ukfs_write_file(const char *name, const char *data, size_t len)
 	if (!g_api_root) return -1;
 	struct inode *dir = 0; struct dentry *pdent = 0; const char *leaf = 0;
 	struct dentry *de = api_walk(name, &dir, &pdent, &leaf);
-	if (!dir || !leaf) return -1;          /* rossz út (köztes komponens nem könyvtár) */
+	if (!dir || !leaf) return -2;          /* parent dir missing -> -ENOENT (NOT -1/EIO): git
+	                                        * creates objects/<xx>/tmp and expects ENOENT so it
+	                                        * mkdir's the fan-out dir and retries; EIO is fatal. */
 	struct inode *inode = (de && de->d_inode) ? de->d_inode : 0;
 	if (!inode) {                         /* nem létezik -> létrehozás a valódi driverrel */
 		if (!dir->i_op || !dir->i_op->create) return -2;
@@ -1855,7 +1857,7 @@ long ukfs_write_file_at(const char *name, const char *data, size_t len, long lon
 	if (!g_api_root) return -1;
 	struct inode *dir = 0; struct dentry *pdent = 0; const char *leaf = 0;
 	struct dentry *de = api_walk(name, &dir, &pdent, &leaf);
-	if (!dir || !leaf) return -1;
+	if (!dir || !leaf) return -2;          /* parent dir missing -> -ENOENT (see ukfs_write_file) */
 	struct inode *inode = (de && de->d_inode) ? de->d_inode : 0;
 	if (!inode) {                         /* nem létezik -> létrehozás a valódi driverrel */
 		if (!dir->i_op || !dir->i_op->create) return -2;

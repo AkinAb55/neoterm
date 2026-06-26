@@ -311,7 +311,9 @@ static int ukfs_create_at(const char *rel, unsigned mode)
 	char line[32]; if (uksd_rl(s, line, sizeof line) < 0) { ukfs_sdrop(); return -1; }
 	if (line[0] == 'O' && line[1] == 'K') return 0;
 	{ char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: CREATE '%s' FAIL reply='%s'\n", rel, line); uk_dbg_line(l); }
-	return -1;
+	/* return the real -errno so the caller can poke it (e.g. ENOENT when the parent
+	 * fan-out dir doesn't exist -> git mkdir's it and retries; -EIO would be fatal). */
+	int e; return (sscanf(line, "ERR %d", &e) == 1) ? -e : -1;
 }
 
 /* WRITE <off> <len> <path> + payload: bytes written, or -1. */
@@ -633,8 +635,11 @@ static int ukfs_open_redirect(Tracee *tracee, const char *rel, int flags)
 	int isdir = (q == 0) && ((mode & 0170000) == 0040000);   /* S_IFDIR */
 	if (q == -2) {
 		if (flags & O_CREAT) {
-			if (ukfs_create_at(rel, 0100644) < 0) {
-				poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EIO); set_sysnum(tracee, PR_void); return 1;
+			int ce = ukfs_create_at(rel, 0100644);
+			if (ce < 0) {
+				/* poke the real errno (ENOENT when the parent dir is missing), not a
+				 * blanket EIO — git relies on ENOENT to create objects/<xx>/ and retry. */
+				poke_reg(tracee, SYSARG_RESULT, (word_t)(long)(ce == -1 ? -EIO : ce)); set_sysnum(tracee, PR_void); return 1;
 			}
 			isdir = 0;
 		} else {
@@ -729,7 +734,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v41-getcwd-readlink UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v42-create-enoent UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
