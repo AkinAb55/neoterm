@@ -460,6 +460,9 @@ static int ukfs_load_dir(struct ukfs_vfd *v)
 	}
 	v->dent_n = k; v->dent_idx = 0;
 	free(blob);
+	{ char l[512]; int o2 = snprintf(l, sizeof l, "uk_fs: load_dir '%s' n=%d cnt=%d:", v->path, v->dent_n, cnt);
+	  for (int i = 0; i < v->dent_n && o2 < 460; i++) o2 += snprintf(l + o2, sizeof l - o2, " %s/%d", v->dents[i].name, v->dents[i].type);
+	  snprintf(l + o2, sizeof l - o2, "\n"); uk_dbg_line(l); }
 	return 0;
 }
 
@@ -638,7 +641,7 @@ static int ukfs_open_redirect(Tracee *tracee, const char *rel, int flags)
 		(void) set_sysarg_path(tracee, backing, SYSARG_2);
 	}
 	open_pending_set(tracee->pid, isdir, rel, backing);
-	if (strstr(rel, "config")) { char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: OPEN rel='%s' flags=0x%x q=%d isdir=%d\n", rel, (unsigned) flags, q, isdir); uk_dbg_line(l); }
+	if (!strstr(rel, ".so") && !strstr(rel, "/lib")) { char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: OPEN rel='%s' flags=0x%x q=%d isdir=%d\n", rel, (unsigned) flags, q, isdir); uk_dbg_line(l); }
 	return isdir ? 2 : 0;
 }
 
@@ -703,7 +706,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v35-listdbg UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v36-getdents UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
