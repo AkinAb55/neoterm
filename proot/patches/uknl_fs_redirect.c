@@ -333,6 +333,28 @@ static int ukfs_two_path(const char *cmd, const char *a, const char *b)
 	int e; return (sscanf(line, "ERR %d", &e) == 1) ? -e : -1;
 }
 
+/* Thread-group id of a tracee. Under ptrace, tracee->pid is the THREAD id (TID);
+ * file descriptors are shared by the whole thread group, so the vfd table must be
+ * keyed by the tgid — otherwise a worker thread (e.g. git index-pack's delta
+ * resolvers) reading/mmap'ing a fd that the leader opened wouldn't find the vfd,
+ * and its read would hit the empty placeholder ("premature end of pack file").
+ * The tid->tgid map is stable for a thread's lifetime, so cache it. */
+static int ukfs_tgid(int tid)
+{
+	static struct { int tid, tgid; } cache[512];
+	static int cn = 0;
+	for (int i = 0; i < cn; i++) if (cache[i].tid == tid) return cache[i].tgid;
+	int tgid = tid;
+	char path[64]; snprintf(path, sizeof path, "/proc/%d/status", tid);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		char buf[2048]; ssize_t n = read(fd, buf, sizeof buf - 1); close(fd);
+		if (n > 0) { buf[n] = '\0'; char *t = strstr(buf, "Tgid:"); if (t) tgid = atoi(t + 5); }
+	}
+	if (cn < 512) { cache[cn].tid = tid; cache[cn].tgid = tgid; cn++; }
+	return tgid;
+}
+
 /* ---- vfd table: a guest fd (over a placeholder file) -> a ukfsd path. The
  *      guest opens a real placeholder (/dev/null or /), gets a real fd, and
  *      every read/lseek/getdents/close on it is proxied here. ---- */
@@ -559,7 +581,7 @@ static int ukfs_rel_at(Tracee *tracee, int dirfd, const char *path, char *rel, s
 		snprintf(abs, sizeof abs, "%s/%s", cwd, path);
 		return ukfs_rel(abs, rel, rsz);
 	}
-	struct ukfs_vfd *v = vfd_find(tracee->pid, dirfd);
+	struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), dirfd);
 	if (!v) return 0;                       /* dirfd isn't one of our mount fds */
 	if (!path[0])
 		snprintf(rel, rsz, "%s", v->path);              /* empty path => the dir itself */
@@ -660,7 +682,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v30-mmap UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v31-tgid UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -718,7 +740,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	 * SYSARG_5; MAP_ANONYMOUS opens (fd=-1) and non-vfd fds fall straight through. */
 	if (nr == PR_mmap || nr == PR_mmap2) {
 		int fd = (int) peek_reg(tracee, CURRENT, SYSARG_5);
-		struct ukfs_vfd *v = (fd >= 0) ? vfd_find(tracee->pid, fd) : NULL;
+		struct ukfs_vfd *v = (fd >= 0) ? vfd_find(ukfs_tgid(tracee->pid), fd) : NULL;
 		if (!v || v->isdir) return false;
 		ukfs_populate_fd(tracee, fd, v->path);
 		return false;     /* native mmap now maps real bytes */
@@ -726,7 +748,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 
 	/* fd-based ops on a vfd (set up by a prior openat). */
 	if (nr == PR_read || nr == PR_pread64) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v || v->isdir) return false;
 		long long pos = (nr == PR_pread64)
 			? (long long)(off_t) peek_reg(tracee, CURRENT, SYSARG_4) : v->off;
@@ -743,7 +765,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) n); set_sysnum(tracee, PR_void); return true;
 	}
 	if (nr == PR_write || nr == PR_pwrite64) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v || v->isdir) return false;
 		long long pos = (nr == PR_pwrite64)
 			? (long long)(off_t) peek_reg(tracee, CURRENT, SYSARG_4) : v->off;
@@ -764,7 +786,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) n); set_sysnum(tracee, PR_void); return true;
 	}
 	if (nr == PR_ftruncate) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v) return false;
 		long long sz = (long long)(off_t) peek_reg(tracee, CURRENT, SYSARG_2);
 		char pfx[48]; snprintf(pfx, sizeof pfx, "TRUNCATE %lld ", sz);
@@ -772,7 +794,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) r); set_sysnum(tracee, PR_void); return true;
 	}
 	if (nr == PR_lseek) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v) return false;
 		long long off = (long long)(off_t) peek_reg(tracee, CURRENT, SYSARG_2);
 		int whence = (int) peek_reg(tracee, CURRENT, SYSARG_3);
@@ -789,7 +811,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		poke_reg(tracee, SYSARG_RESULT, (word_t) no); set_sysnum(tracee, PR_void); return true;
 	}
 	if (nr == PR_getdents64) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v || !v->isdir) return false;
 		if (!v->dents && ukfs_load_dir(v) < 0) {
 			poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EIO); set_sysnum(tracee, PR_void); return true;
@@ -807,7 +829,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		poke_reg(tracee, SYSARG_RESULT, (word_t) w); set_sysnum(tracee, PR_void); return true;
 	}
 	if (nr == PR_close) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (v) {
 			/* Flush deferred writes once, here, instead of per write() — the latter
 			 * is O(n^2) (each sync rewrites the whole dirty-buffer list). */
@@ -823,7 +845,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	 * ukfsd's page cache until close). The placeholder fd is /dev/null, whose fsync
 	 * returns EINVAL — which makes editors report "Error writing: Invalid argument". */
 	if (nr == PR_fsync || nr == PR_fdatasync) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v) return false;
 		if (v->wrote) { (void) ukfs_simple("SYNC ", v->path); v->wrote = 0; }
 		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
@@ -833,7 +855,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	 * adjust_shared_perm on .git/config: "could not write config file ... Operation
 	 * not permitted"). Route them to the ukfs path instead. */
 	if (nr == PR_fchmod) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v) return false;
 		unsigned mode = (unsigned) peek_reg(tracee, CURRENT, SYSARG_2) & 07777;
 		char pfx[48]; snprintf(pfx, sizeof pfx, "CHMOD %u ", mode);
@@ -841,7 +863,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
 	}
 	if (nr == PR_fchown) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v) return false;
 		unsigned uid = (unsigned) peek_reg(tracee, CURRENT, SYSARG_2);
 		unsigned gid = (unsigned) peek_reg(tracee, CURRENT, SYSARG_3);
@@ -854,7 +876,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	 * mount root (the dir fd ls opens) shows the real FS stat, not the host
 	 * placeholder fd's stat. (Needs PR_fstat in the seccomp trap set.) */
 	if (nr == PR_fstat) {
-		struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 		if (!v) return false;
 		unsigned mode, uid, gid, nlink; long size, mt, at; unsigned long ino, rdev, blocks;
 		if (ukfs_query_stat(v->path, &mode, &uid, &gid, &size, &ino, &mt, &at, &nlink, &rdev, &blocks) != 0)
@@ -876,7 +898,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		} else {
 			int flags = (int) peek_reg(tracee, CURRENT, (nr == PR_statx) ? SYSARG_3 : SYSARG_4);
 			if (flags & 0x1000 /* AT_EMPTY_PATH */) {
-				struct ukfs_vfd *v = vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+				struct ukfs_vfd *v = vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1));
 				if (v) { snprintf(rel, sizeof rel, "%s", v->path); have_rel = 1; }
 			}
 		}
@@ -934,7 +956,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 			if (!ukfs_rel_at(tracee, (int) peek_reg(tracee, CURRENT, SYSARG_1), gp, rel, sizeof rel)) return false;
 		} else {
 			if (nr == PR_utimes) return false;          /* utimes needs a path */
-			if (!vfd_find(tracee->pid, (int) peek_reg(tracee, CURRENT, SYSARG_1))) return false;
+			if (!vfd_find(ukfs_tgid(tracee->pid), (int) peek_reg(tracee, CURRENT, SYSARG_1))) return false;
 		}
 		uk_dbg_line("uk_fs: utimensat handled (no-op)\n");
 		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
@@ -1170,7 +1192,8 @@ void uknl_fs_exit_final(Tracee *tracee, word_t nr)
 void uknl_fs_open_exit(Tracee *tracee, word_t nr)
 {
 	if (!uk_fs_on()) return;
-	int pid = tracee->pid;
+	int pid = ukfs_tgid(tracee->pid);   /* vfd table is keyed by thread group (shared fds) */
+	int tid = tracee->pid;              /* open_pending is per-thread (same thread enter+exit) */
 
 	/* TEMP DIAG (git clone EPERM): NO ukfsd command failed during the config write
 	 * (CREATE/WRITE/RENAME all OK; the only ERRs were a harmless EEXIST mkdir and an
@@ -1234,7 +1257,7 @@ void uknl_fs_open_exit(Tracee *tracee, word_t nr)
 	if (nr != PR_openat && nr != PR_openat2) return;
 	struct ukfs_pending *pp = NULL;
 	for (int i = 0; i < 64; i++)
-		if (g_open_pending[i].used && g_open_pending[i].pid == pid) { pp = &g_open_pending[i]; break; }
+		if (g_open_pending[i].used && g_open_pending[i].pid == tid) { pp = &g_open_pending[i]; break; }
 	if (!pp) return;
 	long fd = (long)(int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
 	if (fd >= 0) {
