@@ -56,8 +56,18 @@ public class NeoX11Service extends Service {
             wakeLock.acquire();
 
             System.loadLibrary("Xlorie");
-            CmdEntryPoint.startInProcess(getApplicationContext(), new String[]{":0"});
-            Log.i("NeoX11Service", "in-process X server requested on :0");
+            // NeoTerm: disable the MIT-SHM (XShm) extension. All our GUI clients run
+            // under proot and use real glibc SysV shared memory, which Android's
+            // SELinux blocks cross-process (the X server is a separate :x11server
+            // process), so XShm fails with BadAccess/BadShmSeg and video apps
+            // (mpv/ffplay) get no picture. With MIT-SHM gone, Xlib clients fall back
+            // to plain XPutImage over the socket — slower but correct, and the error
+            // spam / "waiting for XShm completion" stalls disappear. "-extension
+            // <name>" is core X.Org dix handling (processed before the ddx), so it's
+            // safe regardless of lorie's own argument parsing.
+            CmdEntryPoint.startInProcess(getApplicationContext(),
+                new String[]{":0", "-extension", "MIT-SHM"});
+            Log.i("NeoX11Service", "in-process X server requested on :0 (MIT-SHM disabled)");
         } catch (Throwable t) {
             Log.e("NeoX11Service", "failed to start X server", t);
         }
