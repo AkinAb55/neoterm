@@ -49,9 +49,6 @@ long iov_iter_count() { return 0; }
 long i_uid_read() { return 0; }
 long i_uid_write() { return 0; }
 long kfree_link() { return 0; }
-long le16_add_cpu() { return 0; }
-long le32_add_cpu() { return 0; }
-long le64_add_cpu() { return 0; }
 long lock_page() { return 0; }
 long mapping_gfp_mask() { return 0; }
 long mapping_set_error() { return 0; }

@@ -510,7 +510,10 @@ struct dentry_operations {
 	void (*d_prune)(struct dentry *);
 };
 
+#ifndef _UK_STRUCT_PATH_DEFINED
+#define _UK_STRUCT_PATH_DEFINED
 struct path { struct vfsmount *mnt; struct dentry *dentry; };
+#endif
 
 /* ===== file + file_operations (TELJES VFS, a régi mezőkkel KOMPATIBILIS) ===== */
 struct file {

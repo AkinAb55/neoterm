@@ -83,6 +83,27 @@ foreach(c ${UKFS_NTFS_LIB})
     COMPILE_OPTIONS "-include;linux/minmax.h")
 endforeach()
 
+# --- ext4 driver + jbd2 journal: the full in-tree driver (its super.c registers
+#     ext4_fs_type). The optional feature files (acl/crypto/verity/xattr_security)
+#     are not vendored — POSIX_ACL/ENCRYPTION/VERITY/SECURITY are off, matching the
+#     header stubs. jbd2 provides the journal; ext4_stubs.c supplies the extra
+#     kernel symbols. The MOUNT auto-probe tries it last (after vfat/exfat/ntfs3). ---
+set(UKFS_EXT4_DEFS -DCONFIG_EXT4_FS=1 -DCONFIG_JBD2=1)
+file(GLOB UKFS_JBD2_SRC ${UKFS_DIR}/linux/fs/jbd2/*.c)
+foreach(c ${UKFS_JBD2_SRC})
+  get_filename_component(b ${c} NAME_WE)
+  list(APPEND UKFS_OBJ_SRCS ${c})
+  set_source_files_properties(${c} PROPERTIES
+    COMPILE_DEFINITIONS "KBUILD_MODNAME=\"jbd2_${b}\";CONFIG_EXT4_FS=1;CONFIG_JBD2=1")
+endforeach()
+file(GLOB UKFS_EXT4_SRC ${UKFS_DIR}/linux/fs/ext4/*.c)
+foreach(c ${UKFS_EXT4_SRC})
+  get_filename_component(b ${c} NAME_WE)
+  list(APPEND UKFS_OBJ_SRCS ${c})
+  set_source_files_properties(${c} PROPERTIES
+    COMPILE_DEFINITIONS "KBUILD_MODNAME=\"ext4_${b}\";CONFIG_EXT4_FS=1;CONFIG_JBD2=1")
+endforeach()
+
 # --- shared FS engine: the vfat driver + VFS/ACL shim + kernel-API shim,
 #     compiled once and linked into both the test harness and the ukfsd server. ---
 add_library(ukfs_engine OBJECT
@@ -90,10 +111,11 @@ add_library(ukfs_engine OBJECT
   ${UKFS_DIR}/shim/fs/block_sock.c   # block-over-socket backend (io.neoterm.block)
   ${UKFS_DIR}/shim/fs/posix_acl.c
   ${UKFS_DIR}/shim/fs/ntfs3_stubs.c  # extra kernel symbols ntfs3 needs
+  ${UKFS_DIR}/shim/fs/ext4_stubs.c   # extra kernel symbols ext4/jbd2 need (crc16, timers, ...)
   ${UKFS_DIR}/shim/compat_bionic.c   # backtrace/hex/system_wq/get_random_u32 shims
   ${UKFS_OBJ_SRCS}
   ${UKFS_SHIM_CORE})
-target_include_directories(ukfs_engine PRIVATE ${UKFS_INC} ${UKFS_DIR}/linux/fs/fat ${UKFS_DIR}/linux/fs/exfat ${UKFS_DIR}/linux/fs/ntfs3 ${UKFS_DIR}/linux/fs/ntfs3/lib)
+target_include_directories(ukfs_engine PRIVATE ${UKFS_INC} ${UKFS_DIR}/linux/fs/fat ${UKFS_DIR}/linux/fs/exfat ${UKFS_DIR}/linux/fs/ntfs3 ${UKFS_DIR}/linux/fs/ntfs3/lib ${UKFS_DIR}/linux/fs/ext4 ${UKFS_DIR}/linux/fs/jbd2)
 target_compile_options(ukfs_engine PRIVATE ${UKFS_KCFLAGS} ${UKFS_FAT_DEFS})
 
 # --- ukfsd: io.neoterm.fs unix-socket server (the Android FS daemon) ---
@@ -102,12 +124,12 @@ target_compile_options(ukfs_engine PRIVATE ${UKFS_KCFLAGS} ${UKFS_FAT_DEFS})
 # the same deployment trick as libproot.so. FsBridge.kt launches it from there.
 add_executable(ukfsd ${UKFS_DIR}/shim/fs/ukfsd.c $<TARGET_OBJECTS:ukfs_engine>)
 set_target_properties(ukfsd PROPERTIES PREFIX "lib" OUTPUT_NAME "ukfsd" SUFFIX ".so")
-target_include_directories(ukfsd PRIVATE ${UKFS_INC} ${UKFS_DIR}/linux/fs/fat ${UKFS_DIR}/linux/fs/exfat ${UKFS_DIR}/linux/fs/ntfs3 ${UKFS_DIR}/linux/fs/ntfs3/lib)
+target_include_directories(ukfsd PRIVATE ${UKFS_INC} ${UKFS_DIR}/linux/fs/fat ${UKFS_DIR}/linux/fs/exfat ${UKFS_DIR}/linux/fs/ntfs3 ${UKFS_DIR}/linux/fs/ntfs3/lib ${UKFS_DIR}/linux/fs/ext4 ${UKFS_DIR}/linux/fs/jbd2)
 target_compile_options(ukfsd PRIVATE ${UKFS_KCFLAGS} ${UKFS_FAT_DEFS})
 target_link_libraries(ukfsd dl)
 
 # --- ukfs_test_vfat: standalone mount/list/read/write harness (dev/debug) ---
 add_executable(ukfs_test_vfat ${UKFS_DIR}/shim/fs/ukfs_test.c $<TARGET_OBJECTS:ukfs_engine>)
-target_include_directories(ukfs_test_vfat PRIVATE ${UKFS_INC} ${UKFS_DIR}/linux/fs/fat ${UKFS_DIR}/linux/fs/exfat ${UKFS_DIR}/linux/fs/ntfs3 ${UKFS_DIR}/linux/fs/ntfs3/lib)
+target_include_directories(ukfs_test_vfat PRIVATE ${UKFS_INC} ${UKFS_DIR}/linux/fs/fat ${UKFS_DIR}/linux/fs/exfat ${UKFS_DIR}/linux/fs/ntfs3 ${UKFS_DIR}/linux/fs/ntfs3/lib ${UKFS_DIR}/linux/fs/ext4 ${UKFS_DIR}/linux/fs/jbd2)
 target_compile_options(ukfs_test_vfat PRIVATE ${UKFS_KCFLAGS} ${UKFS_FAT_DEFS})
 target_link_libraries(ukfs_test_vfat dl)

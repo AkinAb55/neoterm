@@ -108,10 +108,11 @@ printf '#ifndef _STUB_ASHMEM_H\n#define _STUB_ASHMEM_H\n#include <linux/ioctl.h>
 ok "build host proot (patched)"
 
 # ── 3. host ukfsd ─────────────────────────────────────────────────────────────
-KCF="-O2 -fno-strict-aliasing -fno-builtin -fshort-wchar -D_GNU_SOURCE -D__KERNEL__ -DMODULE -w -Wno-implicit-function-declaration -I $UKFS/include -I $UKFS/linux/fs/fat -I $UKFS/linux/fs/exfat -I $UKFS/linux/fs/ntfs3 -I $UKFS/linux/fs/ntfs3/lib"
+KCF="-O2 -fno-strict-aliasing -fno-builtin -fshort-wchar -D_GNU_SOURCE -D__KERNEL__ -DMODULE -w -Wno-implicit-function-declaration -I $UKFS/include -I $UKFS/linux/fs/fat -I $UKFS/linux/fs/exfat -I $UKFS/linux/fs/ntfs3 -I $UKFS/linux/fs/ntfs3/lib -I $UKFS/linux/fs/ext4 -I $UKFS/linux/fs/jbd2"
 FATDEF='-DCONFIG_VFAT_FS=1 -DCONFIG_FAT_FS=1 -DCONFIG_FAT_DEFAULT_CODEPAGE=437 -DCONFIG_FAT_DEFAULT_IOCHARSET="iso8859-1" -DCONFIG_FAT_DEFAULT_UTF8=0'
 EXDEF='-DCONFIG_EXFAT_FS=1 -DCONFIG_EXFAT_DEFAULT_IOCHARSET="utf8"'
 NDEF='-DCONFIG_NTFS3_FS=1 -DCONFIG_NTFS3_LZX_XPRESS=1 -DCONFIG_NLS_DEFAULT="utf8"'
+E4DEF='-DCONFIG_EXT4_FS=1 -DCONFIG_JBD2=1'
 mkdir -p "$W/uk"; OBJ=""
 for c in cache dir fatent file inode misc nfs namei_vfat; do
   gcc -c $KCF $FATDEF -DKBUILD_MODNAME="\"v_$c\"" "$UKFS/linux/fs/fat/$c.c" -o "$W/uk/fat_$c.o" 2>/dev/null || { bad "ukfsd build ($c)"; exit 1; }
@@ -129,7 +130,11 @@ for c in "$UKFS"/linux/fs/ntfs3/lib/*.c; do
   b="$(basename "$c" .c)"; gcc -c $KCF $NDEF -include linux/minmax.h -DKBUILD_MODNAME="\"n3lib_$b\"" "$c" -o "$W/uk/n3lib_$b.o" 2>/dev/null || { bad "ukfsd build (ntfs3/lib/$b)"; exit 1; }
   OBJ="$OBJ $W/uk/n3lib_$b.o"
 done
-for f in vfs:shim/fs/vfs.c blocksock:shim/fs/block_sock.c posix_acl:shim/fs/posix_acl.c ntstub:shim/fs/ntfs3_stubs.c compat:shim/compat_bionic.c; do
+for c in "$UKFS"/linux/fs/jbd2/*.c "$UKFS"/linux/fs/ext4/*.c; do
+  b="$(basename "$c" .c)"; gcc -c $KCF $E4DEF -DKBUILD_MODNAME="\"e4_$b\"" "$c" -o "$W/uk/e4_$b.o" 2>/dev/null || { bad "ukfsd build (ext4/$b)"; exit 1; }
+  OBJ="$OBJ $W/uk/e4_$b.o"
+done
+for f in vfs:shim/fs/vfs.c blocksock:shim/fs/block_sock.c posix_acl:shim/fs/posix_acl.c ntstub:shim/fs/ntfs3_stubs.c e4stub:shim/fs/ext4_stubs.c compat:shim/compat_bionic.c; do
   b="${f%%:*}"; s="${f##*:}"; gcc -c $KCF $FATDEF "$UKFS/$s" -o "$W/uk/$b.o" 2>/dev/null || { bad "ukfsd build ($s)"; exit 1; }
   OBJ="$OBJ $W/uk/$b.o"
 done
@@ -263,6 +268,13 @@ if have mkfs.ntfs; then
   run_e2e ntfs3 "$W/ntfs.img"
 else
   skip "proot e2e [ntfs3]" "mkfs.ntfs not installed"
+fi
+if have mkfs.ext4; then
+  dd if=/dev/zero of="$W/ext4.img" bs=1M count=64 status=none
+  mkfs.ext4 -q -F "$W/ext4.img" >/dev/null 2>&1
+  run_e2e ext4 "$W/ext4.img"
+else
+  skip "proot e2e [ext4]" "mkfs.ext4 not installed"
 fi
 
 echo

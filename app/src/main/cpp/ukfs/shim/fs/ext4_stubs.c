@@ -20,8 +20,6 @@ long bio_max_segs() { return 0; }
 long bio_sectors() { return 0; }
 long bit_waitqueue() { return 0; }
 long blk_crypto_submit_bio() { return 0; }
-long blkdev_issue_discard() { return 0; }
-long blkdev_issue_zeroout() { return 0; }
 long block_commit_write() { return 0; }
 long block_is_partially_uptodate() { return 0; }
 long block_page_mkwrite() { return 0; }
@@ -64,17 +62,12 @@ long filemap_get_folios() { return 0; }
 long filemap_get_folios_tag() { return 0; }
 long filemap_release_folio() { return 0; }
 long filemap_write_and_wait() { return 0; }
-long filemap_write_and_wait_range() { return 0; }
-long file_modified() { return 0; }
 long file_path() { return 0; }
-long file_update_time() { return 0; }
-long file_write_and_wait_range() { return 0; }
 long __find_get_block_nonatomic() { return 0; }
 long find_inode_by_ino_rcu() { return 0; }
 long finish_open_simple() { return 0; }
 long FMR_OWNER() { return 0; }
 long folio_clear_checked() { return 0; }
-long folio_clear_dirty() { return 0; }
 long folio_clear_dirty_for_io() { return 0; }
 long folio_clear_uptodate() { return 0; }
 long folio_end_read() { return 0; }
@@ -136,7 +129,6 @@ long fsverity_ioctl_read_metadata() { return 0; }
 long generic_atomic_write_valid() { return 0; }
 long generic_check_addressable() { return 0; }
 long generic_error_remove_folio() { return 0; }
-long generic_file_llseek_size() { return 0; }
 long generic_fill_statx_atomic_writes() { return 0; }
 long generic_perform_write() { return 0; }
 long generic_set_sb_d_ops() { return 0; }
@@ -156,11 +148,7 @@ long inode_lock_nested() { return 0; }
 /* inode_set_cached_link: VALÓDI impl a vfs.c-ben (i_link/i_linklen) — a fast-symlink readlinkhez */
 long inode_set_flags() { return 0; }
 long inode_state_clear() { return 0; }
-long inode_trylock_shared() { return 0; }
-long invalidate_bdev() { return 0; }
-long invalidate_mapping_pages() { return 0; }
 long iocb_bio_iopoll() { return 0; }
-long iomap_dio_rw() { return 0; }
 /* iomap_fiemap: VALÓDI impl a vfs.c-ben (bmap-alapú extent-enumeráció) */
 long iomap_seek_data() { return 0; }
 long iomap_seek_hole() { return 0; }
@@ -172,7 +160,6 @@ long IS_NOQUOTA() { return 0; }
 long IS_NOSEC() { return 0; }
 long is_quota_modification() { return 0; }
 long IS_SWAPFILE() { return 0; }
-long kfree_link() { return 0; }
 long kmemdup_nul() { return 0; }
 long __kprojid_val() { return 0; }
 long ktime_add_ns() { return 0; }
@@ -196,11 +183,8 @@ long lockdep_unregister_key() { return 0; }
 long lock_two_nondirectories() { return 0; }
 long MAJOR() { return 0; }
 long mapping_gfp_constraint() { return 0; }
-long mapping_gfp_mask() { return 0; }
 long mapping_max_folio_order() { return 0; }
-long mapping_set_error() { return 0; }
 long mapping_set_folio_order_range() { return 0; }
-long mapping_tagged() { return 0; }
 long mb_cache_destroy() { return 0; }
 long mb_cache_entry_create() { return 0; }
 long mb_cache_entry_delete_or_get() { return 0; }
@@ -225,10 +209,7 @@ long old_decode_dev() { return 0; }
 long old_encode_dev() { return 0; }
 long old_valid_dev() { return 0; }
 long pagecache_isize_extended() { return 0; }
-long page_cache_sync_readahead() { return 0; }
-long page_folio() { return 0; }
 long path_put() { return 0; }
-long posix_acl_chmod() { return 0; }
 /* posix_acl_alloc / posix_acl_release / posix_acl_update_mode: VALÓDI impl a shim/fs/posix_acl.c-ben */
 long prefetchw() { return 0; }
 long prepare_to_wait_exclusive() { return 0; }
@@ -240,7 +221,6 @@ long proc_create_seq_data() { return 0; }
 long proc_create_single_data() { return 0; }
 long projid_eq() { return 0; }
 long pr_warn_once() { return 0; }
-long ra_has_index() { return 0; }
 long release_dentry_name_snapshot() { return 0; }
 long remove_proc_subtree() { return 0; }
 long round_jiffies_up() { return 0; }
@@ -264,7 +244,6 @@ long secs_to_jiffies() { return 0; }
 long set_blocksize() { return 0; }
 long set_buffer_prio() { return 0; }
 /* set_cached_acl: VALÓDI impl a shim/fs/posix_acl.c-ben (inode->i_acl/i_default_acl cache) */
-long set_delayed_call() { return 0; }
 long set_freezable() { return 0; }
 /* simple_get_link: VALÓDI impl a vfs.c-ben (return inode->i_link) — a readlinkhez kell */
 long sort() { return 0; }
@@ -292,7 +271,6 @@ long try_to_writeback_inodes_sb() { return 0; }
 long unlock_two_nondirectories() { return 0; }
 long unmap_mapping_pages() { return 0; }
 long uuid_is_null() { return 0; }
-long vfs_setpos() { return 0; }
 long vma_desc_set_flags() { return 0; }
 long wait_on_bit_io() { return 0; }
 long WARN_ONCE() { return 0; }
@@ -300,7 +278,6 @@ long WARN_RATELIMIT() { return 0; }
 long wbc_account_cgroup_owner() { return 0; }
 long wbc_init_bio() { return 0; }
 long wbc_to_tag() { return 0; }
-long writeback_iter() { return 0; }
 long write_trylock() { return 0; }
 long xa_destroy() { return 0; }
 long xa_erase() { return 0; }
@@ -328,8 +305,6 @@ unsigned long memweight(const void *ptr, size_t n){ unsigned long c=0; const uns
 int test_bit_le(int nr, const void *a){ return (((const unsigned char*)a)[nr>>3]>>(nr&7))&1; }
 int __test_and_set_bit_le(int nr, void *a){ unsigned char*p=&((unsigned char*)a)[nr>>3]; int o=(*p>>(nr&7))&1; *p|=(1<<(nr&7)); return o; }
 int __test_and_clear_bit_le(int nr, void *a){ unsigned char*p=&((unsigned char*)a)[nr>>3]; int o=(*p>>(nr&7))&1; *p&=~(1<<(nr&7)); return o; }
-void __set_bit_le(int nr, void *a){ ((unsigned char*)a)[nr>>3]|=(1<<(nr&7)); }
-void __clear_bit_le(int nr, void *a){ ((unsigned char*)a)[nr>>3]&=~(1<<(nr&7)); }
 void le16_add_cpu(uint16_t *v, uint16_t a){ *v=(uint16_t)(*v+a); }
 void le32_add_cpu(uint32_t *v, uint32_t a){ *v+=a; }
 void le64_add_cpu(uint64_t *v, uint64_t a){ *v+=a; }
@@ -383,3 +358,24 @@ int posix_acl_create(void *dir, unsigned short *mode, void **default_acl, void *
 /* generic_ci_validate_strict_name: nem-casefold (CONFIG_UNICODE nélkül) FS-en a név mindig
  * érvényes → 1 (true). A no-op 0 (false) -EINVAL-t okozott a dir-entry beszúrásnál. */
 int generic_ci_validate_strict_name(void *dir, void *name) { (void)dir; (void)name; return 1; }
+
+/* crc16 (CRC-16-ANSI/IBM, reflected, poly 0xA001) — MUST be a real impl: ext4
+ * uses it for block-group descriptor checksums (super.c ext4_group_desc_csum).
+ * Bitwise form, identical output to the kernel's table-driven lib/crc16.c. */
+#include <linux/types.h>
+u16 crc16(u16 crc, const u8 *buffer, size_t len)
+{
+	while (len--) {
+		crc ^= *buffer++;
+		for (int i = 0; i < 8; i++)
+			crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
+	}
+	return crc;
+}
+
+/* jbd2 runs its journal thread (kjournald2) inline in our single-threaded shim,
+ * so these timer/wait helpers are no-ops: there is nothing to sleep on or cancel. */
+long schedule_timeout_uninterruptible() { return 0; }
+long timer_delete_sync() { return 0; }
+long timer_shutdown_sync() { return 0; }
+long wake_bit_function() { return 0; }
