@@ -2201,12 +2201,23 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		if (len == 0) { poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; }
 		if (len > (8u << 20)) len = 8u << 20;
 		void *tmp = malloc(len); if (!tmp) return false;
-		long n = ukfs_read_at(v->path, pos, tmp, len);
-		if (n > 0) write_data(tracee, buf, tmp, (size_t) n);
+		/* Fill the whole request, looping over the backend. A single backend read
+		 * tops out at the FUSE one-message cap (128 KiB) and a FUSE daemon may
+		 * legitimately return a short read at a block boundary; a regular file,
+		 * though, only short-reads at EOF, so naive readers (the dynamic loader ->
+		 * "file too short") break on a premature short return. Loop until len or EOF. */
+		long got = 0, n = 0;
+		while ((size_t) got < len) {
+			n = ukfs_read_at(v->path, pos + got, (char *) tmp + got, len - (size_t) got);
+			if (n < 0) break;
+			if (n == 0) break;            /* EOF */
+			got += n;
+		}
+		if (got > 0) write_data(tracee, buf, tmp, (size_t) got);
 		free(tmp);
-		if (n < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EIO); set_sysnum(tracee, PR_void); return true; }
-		if (nr == PR_read) v->off += n;
-		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) n); set_sysnum(tracee, PR_void); return true;
+		if (got == 0 && n < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EIO); set_sysnum(tracee, PR_void); return true; }
+		if (nr == PR_read) v->off += got;
+		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) got); set_sysnum(tracee, PR_void); return true;
 	}
 	if (nr == PR_write || nr == PR_pwrite64) {
 		struct ukfs_vfd *v = vfd_lookup(tracee, (int) peek_reg(tracee, CURRENT, SYSARG_1));
