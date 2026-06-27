@@ -586,6 +586,36 @@ static int ukfs_query_stat(const char *rel, unsigned *mode, unsigned *uid, unsig
 	return 0;
 }
 
+/* Whole-FS statfs of the active mount (df / statvfs). Fills the values from the
+ * driver's s_op->statfs via ukfsd. 0 on success. */
+static int ukfs_query_statfs(unsigned long *bsize, unsigned long long *blocks,
+	unsigned long long *bfree, unsigned long long *bavail, unsigned long long *files,
+	unsigned long long *ffree, long *namelen, long *frsize, long *ftype)
+{
+	int s = ukfs_conn(); if (s < 0) return -1;
+	if (uksd_wn(s, "STATFS\n", 7) < 0) { ukfs_sdrop(); return -1; }
+	char line[224];
+	if (uksd_rl(s, line, sizeof line) < 0) { ukfs_sdrop(); return -1; }
+	return (sscanf(line, "OK %lu %llu %llu %llu %llu %llu %ld %ld %ld",
+	               bsize, blocks, bfree, bavail, files, ffree, namelen, frsize, ftype) == 9) ? 0 : -1;
+}
+
+/* Fill the guest struct statfs/statfs64 (120 B on 64-bit; same layout for both on
+ * aarch64 and x86_64). f_type@0 f_bsize@8 f_blocks@16 f_bfree@24 f_bavail@32
+ * f_files@40 f_ffree@48 f_namelen@64 f_frsize@72. */
+static void ukfs_put_statfs(Tracee *tracee, word_t addr, unsigned long bsize,
+	unsigned long long blocks, unsigned long long bfree, unsigned long long bavail,
+	unsigned long long files, unsigned long long ffree, long namelen, long frsize, long ftype)
+{
+	unsigned char sf[120]; memset(sf, 0, sizeof sf);
+	long f_type = ftype, f_bsize = (long) bsize, f_namelen = namelen ? namelen : 255, f_frsize = frsize ? frsize : (long) bsize;
+	memcpy(sf + 0,  &f_type,   8); memcpy(sf + 8,  &f_bsize, 8);
+	memcpy(sf + 16, &blocks,   8); memcpy(sf + 24, &bfree,   8); memcpy(sf + 32, &bavail, 8);
+	memcpy(sf + 40, &files,    8); memcpy(sf + 48, &ffree,   8);
+	memcpy(sf + 64, &f_namelen,8); memcpy(sf + 72, &f_frsize,8);
+	write_data(tracee, addr, sf, sizeof sf);
+}
+
 /* aarch64 struct stat (128 B) — offsets match the block proxy's uksd_put_stat,
  * plus uid/gid (24/28) and a/m/ctime seconds (72/88/104). */
 static void ukfs_put_stat(Tracee *tracee, word_t addr, unsigned mode, unsigned uid, unsigned gid,
@@ -1391,6 +1421,31 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		if (r > 0 && buf) write_data(tracee, buf, cwd, len);
 		pend_res_set(tracee->pid, nr, r);
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) r); set_sysnum(tracee, PR_void); return true;
+	}
+
+	/* statfs(path)/statfs64 and fstatfs(fd)/fstatfs64 under a ukfs mount: answer
+	 * `df` / statvfs from the real driver stats instead of leaking the host rootfs
+	 * size. statfs path is SYSARG_1; the struct (statfs/statfs64, 120 B on 64-bit)
+	 * is SYSARG_2 for statfs / SYSARG_2 for fstatfs. */
+	if (nr == PR_statfs || nr == PR_statfs64) {
+		word_t pa = peek_reg(tracee, CURRENT, SYSARG_1);
+		char gp[PATH_MAX], rel[PATH_MAX];
+		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
+		if (!ukfs_rel(gp, rel, sizeof rel)) return false;     /* not under a vmount */
+		unsigned long bs; unsigned long long bl, bf, ba, fi, ff; long nl, fr, ft;
+		if (ukfs_query_statfs(&bs, &bl, &bf, &ba, &fi, &ff, &nl, &fr, &ft) != 0) return false;
+		ukfs_put_statfs(tracee, peek_reg(tracee, CURRENT, SYSARG_2), bs, bl, bf, ba, fi, ff, nl, fr, ft);
+		pend_res_set(tracee->pid, nr, 0);
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	}
+	if (nr == PR_fstatfs || nr == PR_fstatfs64) {
+		struct ukfs_vfd *v = vfd_lookup(tracee, (int) peek_reg(tracee, CURRENT, SYSARG_1));
+		if (!v) return false;                                 /* g_am set by vfd_lookup */
+		unsigned long bs; unsigned long long bl, bf, ba, fi, ff; long nl, fr, ft;
+		if (ukfs_query_statfs(&bs, &bl, &bf, &ba, &fi, &ff, &nl, &fr, &ft) != 0) return false;
+		ukfs_put_statfs(tracee, peek_reg(tracee, CURRENT, SYSARG_2), bs, bl, bf, ba, fi, ff, nl, fr, ft);
+		pend_res_set(tracee->pid, nr, 0);
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
 	}
 
 	/* mmap(2)/mmap2(2) on a vfd: materialise the real content into the placeholder

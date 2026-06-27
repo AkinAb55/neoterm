@@ -381,6 +381,9 @@ echo "\$LOUT" | sed 's/^/  /'
 echo "\$LOUT" | grep -q RAWREAD=mbr-ok || fail "loop raw read-routing (MBR sig)"
 echo loopdata > "$MPE/lf.txt" || fail "ext4 loop write"
 [ "\$(cat "$MPE/lf.txt")" = loopdata ] || fail "ext4 loop readback"
+# df/statfs must report the IMAGE size (~tens of MB), not the host rootfs
+SZ=\$(df -k "$MPE" 2>/dev/null | awk 'NR==2{print \$2}')
+[ -n "\$SZ" ] && [ "\$SZ" -gt 0 ] && [ "\$SZ" -lt 1000000 ] || fail "df statfs size (1K-blocks=\$SZ)"
 # FAT boot partition via whole-loop at offset (mount -o loop,offset= style)
 "$W/loopmnt" "$W/pi.img" "$MPF" 0 $FATOFF || fail "loop mount @offset (vfat)"
 ls "$MPF" | grep -qi cmdline || fail "fat loop content (\$(ls "$MPF"))"
