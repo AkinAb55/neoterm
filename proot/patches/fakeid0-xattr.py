@@ -896,6 +896,7 @@ if 'uk_block_sysnums' not in s:
                   '\t\t\t{ PR_pwrite64,\tFILTER_SYSEXIT },\n'
                   '\t\t\t{ PR_lseek,\tFILTER_SYSEXIT },\n'
                   '\t\t\t{ PR_close,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_ioctl,\tFILTER_SYSEXIT },\t/* loop device emulation (losetup) */\n'
                   '\t\t\tFILTERED_SYSNUM_END,\n'
                   '\t\t};\n'
                   '\t\tstatus = merge_filtered_sysnums(tracee->ctx, &filtered_sysnums, uk_block_sysnums);\n'

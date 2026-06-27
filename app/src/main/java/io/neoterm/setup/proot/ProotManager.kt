@@ -231,6 +231,22 @@ object ProotManager {
         if (!part.exists()) runCatching { part.writeText("") }
         bind(args, part.absolutePath, "/dev/uksd0p$n")
       }
+      // Loop devices: mount a DOWNLOADED IMAGE file like on a real Linux PC
+      // (`losetup -fP disk.img; mount /dev/loop0p2 …` or `mount -o loop[,offset=N]
+      // -t ext4 disk.img …`). The redirect emulates the loop ioctls (no kernel loop
+      // on Android) and backs each loop with the image's host path. Bind markers for
+      // /dev/loop-control, the loop devices and their partition nodes so the guest's
+      // losetup/mount can open them; the redirect intercepts the ioctls/mounts.
+      val mk = { rel: String ->
+        val f = File(sysdata, rel.removePrefix("/dev/"))
+        if (!f.exists()) runCatching { f.writeText("") }
+        bind(args, f.absolutePath, rel)
+      }
+      mk("/dev/loop-control")
+      for (n in 0..7) {
+        mk("/dev/loop$n")
+        for (p in 1..4) mk("/dev/loop${n}p$p")
+      }
     }
 
     // USB-serial: /dev/ttyUSB* are VIRTUAL hotplug ports, not static binds — the

@@ -31,11 +31,13 @@ object FsBridge {
   @Volatile private var started = false
   private val procs = mutableListOf<Process>()
 
-  /** Socket names served: whole device + the partition pool (mirrors the proot
-   *  redirect's uksd0 / uksd0pN -> io.neoterm.fs[.pN] mapping). */
+  /** Daemon pool (MUST match the proot redirect's UK_POOL). Each live mount — a USB
+   *  partition OR a loop-mounted image — claims one free daemon, so the pool size
+   *  caps simultaneous mounts. */
   private val SOCKETS = listOf(
     "io.neoterm.fs",
-    "io.neoterm.fs.p1", "io.neoterm.fs.p2", "io.neoterm.fs.p3", "io.neoterm.fs.p4"
+    "io.neoterm.fs.p1", "io.neoterm.fs.p2", "io.neoterm.fs.p3", "io.neoterm.fs.p4",
+    "io.neoterm.fs.p5", "io.neoterm.fs.p6", "io.neoterm.fs.p7"
   )
 
   /** The bundled ukfsd binary (jniLibs/<abi>/libukfsd.so -> nativeLibraryDir). */

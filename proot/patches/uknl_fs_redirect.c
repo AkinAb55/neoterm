@@ -38,8 +38,11 @@ static void uk_dbg_line(const char *line);
 struct ukm {
 	int  used;
 	char vmount[PATH_MAX];   /* guest mount point, e.g. "/mnt/boot" */
-	char token[64];          /* device token: "uksd0", "uksd0p1", ... */
-	char fsname[64];         /* ukfsd socket: "io.neoterm.fs", "io.neoterm.fs.p1", ... */
+	char token[600];         /* MOUNT token: "uksd0"/"uksd0pN" (USB), or an absolute
+	                          * HOST image path (loop). dev_path passes the path through. */
+	char fsname[64];         /* ukfsd daemon socket allocated from the pool */
+	long long base, size;    /* explicit byte range (loop / partition of a file) */
+	int  range;              /* send "MOUNT auto <token> <base> <size>" when set */
 	int  sock;               /* this mount's connection (-1 = none) */
 	int  ready;              /* ukfsd has MOUNTed on sock */
 };
@@ -47,7 +50,27 @@ static struct ukm g_m[UK_MAXM];
 static int g_nm = 0;             /* number of registered mounts */
 static int g_am = -1;            /* active mount index (set before each request) */
 
+/* Pool of ukfsd daemon sockets (FsBridge launches one ukfsd per name). ukfsd is
+ * single-mount per process, so each live mount (a USB partition OR a loop image)
+ * claims one free daemon. */
+static const char *UK_POOL[] = {
+	"io.neoterm.fs", "io.neoterm.fs.p1", "io.neoterm.fs.p2", "io.neoterm.fs.p3",
+	"io.neoterm.fs.p4", "io.neoterm.fs.p5", "io.neoterm.fs.p6", "io.neoterm.fs.p7"
+};
+#define UK_NPOOL ((int)(sizeof(UK_POOL)/sizeof(UK_POOL[0])))
+
 static int  ukfs_block_present(void);   /* fwd (defined below) */
+
+/* Pick a daemon socket not already claimed by a live mount, or NULL if all busy. */
+static const char *ukfs_alloc_daemon(void)
+{
+	for (int p = 0; p < UK_NPOOL; p++) {
+		int busy = 0;
+		for (int i = 0; i < UK_MAXM; i++) if (g_m[i].used && strcmp(g_m[i].fsname, UK_POOL[p]) == 0) { busy = 1; break; }
+		if (!busy) return UK_POOL[p];
+	}
+	return NULL;
+}
 
 /* Parse a mount source: if it names our virtual block device or one of its
  * partitions, fill token ("uksd0"/"uksd0pN") + fsname (its io.neoterm.fs[.pN]
@@ -95,8 +118,12 @@ static int ukfs_do_mount(void)
 	struct ukm *m = &g_m[g_am];
 	if (m->sock < 0) return -1;
 	/* NB: send the FULL command INCLUDING the trailing '\n' — ukfsd's read_line()
-	 * blocks until it sees the newline. */
-	char req[96]; int n = snprintf(req, sizeof req, "MOUNT auto %s\n", m->token);
+	 * blocks until it sees the newline. The explicit-range form (loop / partition of
+	 * a file) carries the byte offset+size; the plain form lets ukfsd resolve a
+	 * uksd0/uksd0pN token against the USB device's own partition table. */
+	char req[700]; int n;
+	if (m->range) n = snprintf(req, sizeof req, "MOUNT auto %s %lld %lld\n", m->token, m->base, m->size);
+	else          n = snprintf(req, sizeof req, "MOUNT auto %s\n", m->token);
 	if (uksd_wn(m->sock, req, n) < 0) {
 		char l[96]; snprintf(l, sizeof l, "uk_fs: MOUNT %s write failed errno=%d\n", m->token, errno);
 		uk_dbg_line(l); return -1;
@@ -118,9 +145,11 @@ static int ukfs_conn(void)
 	struct ukm *m = &g_m[g_am];
 	if (m->sock >= 0 && m->ready) return m->sock;
 	if (m->sock < 0) {
-		/* backing device gone? auto-free the slot so the mount point reverts to the
-		 * empty host dir instead of erroring forever (probed only when reconnecting). */
-		if (!ukfs_block_present()) { uk_dbg_line("uk_fs: device gone -> auto-umount\n"); ukfs_unmount_slot(g_am); g_am = -1; return -1; }
+		/* USB-backed mount and the backing device gone? auto-free the slot so the
+		 * mount point reverts to the empty host dir instead of erroring forever
+		 * (probed only when reconnecting). Loop mounts back a host FILE that is
+		 * always present, so skip the io.neoterm.block probe for them. */
+		if (m->token[0] != '/' && !ukfs_block_present()) { uk_dbg_line("uk_fs: device gone -> auto-umount\n"); ukfs_unmount_slot(g_am); g_am = -1; return -1; }
 		int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 		if (s < 0) return -1;
 		struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
@@ -164,23 +193,37 @@ static int ukfs_rel(const char *guest, char *out, size_t osz)
 	return 1;
 }
 
-/* Register (or reuse) a mount slot for a guest mount of <src> at <tgt>. Sets g_am
- * to the slot. Returns the slot index, or -1 (not our device / table full). */
-static int ukfs_mount_register(const char *src, const char *tgt)
+/* Core: register (or reuse the same-vmount) slot. token is the MOUNT token
+ * (uksd0/uksd0pN or a host image path); base/size/range describe an explicit byte
+ * range (loop / partition of a file). Allocates a free daemon from the pool. Sets
+ * g_am. Returns the slot index, or -1 (table or daemon pool full). */
+static int ukm_register(const char *tgt, const char *token, long long base, long long size, int range)
 {
-	char token[64], fsname[64];
-	if (!ukfs_dev_token(src, token, sizeof token, fsname, sizeof fsname)) return -1;
 	int slot = -1;
 	for (int i = 0; i < UK_MAXM; i++) if (g_m[i].used && strcmp(g_m[i].vmount, tgt) == 0) { slot = i; break; }
-	if (slot < 0) { for (int i = 0; i < UK_MAXM; i++) if (!g_m[i].used) { slot = i; break; } if (slot >= 0) g_nm++; }
-	if (slot < 0) return -1;            /* table full */
+	int reuse = (slot >= 0);
+	if (slot < 0) for (int i = 0; i < UK_MAXM; i++) if (!g_m[i].used) { slot = i; break; }
+	if (slot < 0) return -1;                          /* mount table full */
+	const char *fsname;
+	if (reuse) fsname = g_m[slot].fsname;             /* keep this vmount's daemon */
+	else { fsname = ukfs_alloc_daemon(); if (!fsname) return -1; }  /* daemon pool full */
+	if (!reuse) g_nm++;
 	memset(&g_m[slot], 0, sizeof g_m[slot]);
 	g_m[slot].used = 1; g_m[slot].sock = -1; g_m[slot].ready = 0;
+	g_m[slot].base = base; g_m[slot].size = size; g_m[slot].range = range;
 	snprintf(g_m[slot].vmount, sizeof g_m[slot].vmount, "%s", tgt);
 	snprintf(g_m[slot].token,  sizeof g_m[slot].token,  "%s", token);
 	snprintf(g_m[slot].fsname, sizeof g_m[slot].fsname, "%s", fsname);
 	g_am = slot;
 	return slot;
+}
+
+/* Register a mount slot for a guest mount of USB device <src> at <tgt>. */
+static int ukfs_mount_register(const char *src, const char *tgt)
+{
+	char token[64], fsname[64];
+	if (!ukfs_dev_token(src, token, sizeof token, fsname, sizeof fsname)) return -1;
+	return ukm_register(tgt, token, 0, 0, 0);         /* token form: ukfsd resolves the partition */
 }
 
 /* Free the mount slot whose vmount == tgt (real guest umount). Returns 1 if found. */
@@ -189,6 +232,228 @@ static int ukfs_umount_target(const char *tgt)
 	for (int i = 0; i < UK_MAXM; i++)
 		if (g_m[i].used && strcmp(g_m[i].vmount, tgt) == 0) { ukfs_unmount_slot(i); if (g_am == i) g_am = -1; return 1; }
 	return 0;
+}
+
+/* ===== loop devices (losetup / mount -o loop) =====
+ * A guest sees /dev/loop-control + /dev/loopN (bound markers). losetup/mount use
+ * the kernel loop ioctls to bind an image FILE to a loop device at an offset; the
+ * Android kernel has no usable loop layer (no root), so we emulate the ioctls here
+ * and back each loop with the image's HOST path. mount(/dev/loopN[pM]) then routes
+ * to ukfsd as a file-backed mount at the loop offset (+ partition offset). This is
+ * what makes `losetup -fP img; mount /dev/loop0p2 …` and `mount -o loop[,offset=N]
+ * img …` behave exactly like on a real PC. */
+#define UK_NLOOP 8
+struct uklo { int used; char img[600]; long long off, sizelimit; int partscan; };
+static struct uklo g_lo[UK_NLOOP];
+
+/* Connect to an arbitrary ukfsd daemon socket (one-shot queries). fd or -1. */
+static int ukfs_dconn(const char *fsname)
+{
+	int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (s < 0) return -1;
+	struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+	struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+	a.sun_path[0] = '\0'; strncpy(a.sun_path + 1, fsname, sizeof(a.sun_path) - 2);
+	socklen_t len = sizeof(a.sun_family) + 1 + strlen(fsname);
+	if (connect(s, (struct sockaddr *) &a, len) < 0) { close(s); return -1; }
+	return s;
+}
+
+/* Query the partition table of a host image file via a FREE daemon (PARTS doesn't
+ * mount, so the daemon stays free). Fills start/size (bytes) for 1-based partition
+ * `want`; returns 1 on success, 0 if not found. */
+static int ukfs_image_part(const char *hostimg, int want, long long *start, long long *size)
+{
+	const char *fsname = ukfs_alloc_daemon();
+	if (!fsname) fsname = UK_POOL[0];
+	int s = ukfs_dconn(fsname);
+	if (s < 0) return 0;
+	char req[700]; int n = snprintf(req, sizeof req, "PARTS %s\n", hostimg);
+	int found = 0;
+	if (uksd_wn(s, req, n) >= 0) {
+		char line[64];
+		if (uksd_rl(s, line, sizeof line) >= 0 && line[0] == 'O') {
+			int cnt = 0; if (sscanf(line, "OK %d", &cnt) == 1) {
+				for (int i = 0; i < cnt; i++) {
+					char pl[96]; if (uksd_rl(s, pl, sizeof pl) < 0) break;
+					unsigned idx = 0, type = 0; unsigned long long st = 0, sz = 0;
+					if (sscanf(pl, "p%u 0x%x %llu %llu", &idx, &type, &st, &sz) >= 3 && (int) idx == want) {
+						*start = (long long) st; *size = (long long) sz; found = 1;
+					}
+				}
+			}
+		}
+	}
+	close(s);
+	return found;
+}
+
+/* Parse "/dev/loop3" -> (n=3,part=0); "/dev/loop3p2" -> (n=3,part=2); else n=-1. */
+static int ukfs_loop_parse(const char *path, int *part)
+{
+	const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+	if (strncmp(b, "loop", 4) != 0) return -1;
+	const char *d = b + 4; if (*d < '0' || *d > '9') return -1;
+	int n = 0; while (*d >= '0' && *d <= '9') n = n * 10 + (*d++ - '0');
+	int pp = 0;
+	if (*d == 'p') { d++; if (*d < '0' || *d > '9') return -1; while (*d >= '0' && *d <= '9') pp = pp * 10 + (*d++ - '0'); }
+	if (*d) return -1;
+	*part = pp; return n;
+}
+
+/* For a mount source /dev/loopN[pM]: resolve the backing host image + byte range.
+ * Returns 1 (img/base/size filled) or 0 (not a configured loop / unknown part). */
+static int ukfs_loop_resolve(const char *src, char *img, size_t icap, long long *base, long long *size)
+{
+	int part; int n = ukfs_loop_parse(src, &part);
+	if (n < 0 || n >= UK_NLOOP || !g_lo[n].used || !g_lo[n].img[0]) return 0;
+	snprintf(img, icap, "%s", g_lo[n].img);
+	if (part == 0) { *base = g_lo[n].off; *size = g_lo[n].sizelimit; return 1; }
+	long long ps = 0, pz = 0;
+	if (!ukfs_image_part(g_lo[n].img, part, &ps, &pz)) return 0;
+	*base = g_lo[n].off + ps; *size = pz;
+	return 1;
+}
+
+/* The kernel loop ioctls we emulate (linux/loop.h). */
+#define UK_LOOP_SET_FD        0x4C00
+#define UK_LOOP_CLR_FD        0x4C01
+#define UK_LOOP_SET_STATUS    0x4C02
+#define UK_LOOP_SET_STATUS64  0x4C04
+#define UK_LOOP_GET_STATUS64  0x4C05
+#define UK_LOOP_SET_CAPACITY  0x4C07
+#define UK_LOOP_SET_DIRECT_IO 0x4C08
+#define UK_LOOP_SET_BLOCK_SIZE 0x4C09
+#define UK_LOOP_CONFIGURE     0x4C0A
+#define UK_LOOP_CTL_ADD       0x4C80
+#define UK_LOOP_CTL_REMOVE    0x4C81
+#define UK_LOOP_CTL_GET_FREE  0x4C82
+#define UK_LO_FLAGS_PARTSCAN  8
+
+/* Resolve the host image path behind a guest fd (the image losetup/mount passed). */
+static int ukfs_fd_hostpath(Tracee *tracee, int fd, char *out, size_t cap)
+{
+	char lk[64]; snprintf(lk, sizeof lk, "/proc/%d/fd/%d", tracee->pid, fd);
+	ssize_t n = readlink(lk, out, cap - 1);
+	if (n <= 0) return 0;
+	out[n] = '\0';
+	return 1;
+}
+
+/* Emulate losetup/mount's loop ioctls on /dev/loop-control and /dev/loopN (bound
+ * markers). Returns true if fully handled (result poked + PR_void). The loop
+ * binding is recorded in g_lo[]; the actual FS mount happens later when the guest
+ * mounts /dev/loopN[pM] (routed to ukfsd via the image host path + offset). */
+static bool ukfs_loop_ioctl(Tracee *tracee)
+{
+	unsigned long cmd = (unsigned long) peek_reg(tracee, CURRENT, SYSARG_2);
+	if ((cmd & 0xFF00) != 0x4C00) return false;   /* not a loop ioctl (cheap gate: skips TCGETS etc.) */
+	int fd = (int) peek_reg(tracee, CURRENT, SYSARG_1);
+	word_t arg = peek_reg(tracee, CURRENT, SYSARG_3);
+	char pp[PATH_MAX];
+	if (!ukfs_fd_hostpath(tracee, fd, pp, sizeof pp)) return false;
+	const char *b = strrchr(pp, '/'); b = b ? b + 1 : pp;
+
+	if (strcmp(b, "loop-control") == 0) {
+		if (cmd == UK_LOOP_CTL_GET_FREE) {
+			for (int i = 0; i < UK_NLOOP; i++) if (!g_lo[i].used) {
+				memset(&g_lo[i], 0, sizeof g_lo[i]); g_lo[i].used = 1;   /* reserve */
+				poke_reg(tracee, SYSARG_RESULT, (word_t) i); set_sysnum(tracee, PR_void); return true;
+			}
+			poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - ENODEV); set_sysnum(tracee, PR_void); return true;
+		}
+		if (cmd == UK_LOOP_CTL_ADD) {
+			int i = (int) arg;
+			if (i >= 0 && i < UK_NLOOP) { memset(&g_lo[i], 0, sizeof g_lo[i]); g_lo[i].used = 1; poke_reg(tracee, SYSARG_RESULT, (word_t) i); }
+			else poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EINVAL);
+			set_sysnum(tracee, PR_void); return true;
+		}
+		if (cmd == UK_LOOP_CTL_REMOVE) {
+			int i = (int) arg;
+			if (i >= 0 && i < UK_NLOOP) g_lo[i].used = 0;
+			poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+		}
+		return false;
+	}
+
+	int dummy; int n = ukfs_loop_parse(b, &dummy);
+	if (n < 0 || dummy != 0 || n >= UK_NLOOP) return false;   /* not a whole-loop node */
+	struct uklo *L = &g_lo[n];
+
+	switch (cmd) {
+	case UK_LOOP_SET_FD: {
+		char ip[PATH_MAX];
+		if (!ukfs_fd_hostpath(tracee, (int) arg, ip, sizeof ip)) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EBADF); set_sysnum(tracee, PR_void); return true; }
+		L->used = 1; L->off = 0; L->sizelimit = 0; L->partscan = 0;
+		snprintf(L->img, sizeof L->img, "%s", ip);
+		{ char l[PATH_MAX + 64]; snprintf(l, sizeof l, "uk_fs: LOOP_SET_FD loop%d <- %s\n", n, ip); uk_dbg_line(l); }
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	}
+	case UK_LOOP_CONFIGURE: {
+		unsigned char cfg[72];                              /* fd@0, info: off@32, szl@40, flags@60 */
+		if (read_data(tracee, cfg, arg, sizeof cfg) < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EFAULT); set_sysnum(tracee, PR_void); return true; }
+		unsigned int imgfd; memcpy(&imgfd, cfg + 0, 4);
+		unsigned long long off, szl; unsigned int flags;
+		memcpy(&off, cfg + 32, 8); memcpy(&szl, cfg + 40, 8); memcpy(&flags, cfg + 60, 4);
+		char ip[PATH_MAX];
+		if (!ukfs_fd_hostpath(tracee, (int) imgfd, ip, sizeof ip)) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EBADF); set_sysnum(tracee, PR_void); return true; }
+		L->used = 1; snprintf(L->img, sizeof L->img, "%s", ip);
+		L->off = (long long) off; L->sizelimit = (long long) szl; L->partscan = (flags & UK_LO_FLAGS_PARTSCAN) ? 1 : 0;
+		{ char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: LOOP_CONFIGURE loop%d <- %s off=%llu szl=%llu ps=%d\n", n, ip, off, szl, L->partscan); uk_dbg_line(l); }
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	}
+	case UK_LOOP_SET_STATUS:
+	case UK_LOOP_SET_STATUS64: {
+		unsigned char info[56];                             /* off@24, szl@32, flags@52 */
+		if (read_data(tracee, info, arg, sizeof info) < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EFAULT); set_sysnum(tracee, PR_void); return true; }
+		unsigned long long off, szl; unsigned int flags;
+		memcpy(&off, info + 24, 8); memcpy(&szl, info + 32, 8); memcpy(&flags, info + 52, 4);
+		L->off = (long long) off; L->sizelimit = (long long) szl;
+		if (flags & UK_LO_FLAGS_PARTSCAN) L->partscan = 1;
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	}
+	case UK_LOOP_GET_STATUS64: {
+		unsigned char info[232]; memset(info, 0, sizeof info);
+		unsigned long long off = (unsigned long long) L->off, szl = (unsigned long long) L->sizelimit;
+		unsigned int num = (unsigned) n;
+		memcpy(info + 24, &off, 8); memcpy(info + 32, &szl, 8); memcpy(info + 40, &num, 4);
+		snprintf((char *) info + 56, 64, "%s", L->img);     /* lo_file_name */
+		if (write_data(tracee, arg, info, sizeof info) < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) - EFAULT); set_sysnum(tracee, PR_void); return true; }
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	}
+	case UK_LOOP_CLR_FD:
+		L->used = 0; L->img[0] = '\0';
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	case UK_LOOP_SET_CAPACITY:
+	case UK_LOOP_SET_DIRECT_IO:
+	case UK_LOOP_SET_BLOCK_SIZE:
+		poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;
+	default:
+		return false;
+	}
+}
+
+/* Register a mount for any source we own: a USB device (/dev/uksd0[pN]) or a
+ * configured loop device (/dev/loopN[pM]). Returns the slot index, or -1. */
+static int ukfs_register_any(const char *src, const char *tgt)
+{
+	if (ukfs_src_is_dev(src)) return ukfs_mount_register(src, tgt);
+	char img[600]; long long base = 0, size = 0;
+	if (ukfs_loop_resolve(src, img, sizeof img, &base, &size)) {
+		int r = ukm_register(tgt, img, base, size, 1);
+		if (r >= 0) { char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: loop mount %s -> %s base=%lld size=%lld\n", src, img, base, size); uk_dbg_line(l); }
+		return r;
+	}
+	return -1;
+}
+/* True iff src is something ukfs_register_any can mount (USB or configured loop). */
+static int ukfs_src_mountable(const char *src)
+{
+	if (ukfs_src_is_dev(src)) return 1;
+	char img[600]; long long b, s;
+	return ukfs_loop_resolve(src, img, sizeof img, &b, &s);
 }
 
 /* True iff the io.neoterm.block server still has a device attached (SIZE -> OK).
@@ -687,14 +952,14 @@ static bool uknl_fs_mount_hook(Tracee *tracee)
 	if (!uk_fs_on()) return false;
 	char src[PATH_MAX];
 	if (get_sysarg_path(tracee, src, SYSARG_1) < 0) return false;
-	if (!ukfs_src_is_dev(src)) return false;
+	if (!ukfs_src_mountable(src)) return false;
 	char tgt[PATH_MAX];
 	if (get_sysarg_path(tracee, tgt, SYSARG_2) < 0) return false;
 	/* Register the vmount slot only — no socket I/O here (this may run in the SIGSYS
 	 * context where it wouldn't deliver). The ukfsd MOUNT happens lazily on the
-	 * first access under the mount point. The src device token (uksd0 / uksd0pN)
-	 * selects which partition + which ukfsd this mount talks to. */
-	if (ukfs_mount_register(src, tgt) < 0) return false;
+	 * first access under the mount point. The src (uksd0 / uksd0pN / loopN[pM])
+	 * selects which partition/image + which ukfsd this mount talks to. */
+	if (ukfs_register_any(src, tgt) < 0) return false;
 	char l[PATH_MAX + 96];
 	snprintf(l, sizeof l, "uk_fs: MOUNT hook src='%s' tgt='%s' (deferred)\n", src, tgt);
 	uk_dbg(tracee, l);
@@ -890,7 +1155,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v47-multipart UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v48-loop UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -908,6 +1173,10 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 
 	if (!uk_fs_on()) return false;
 
+	/* loop device ioctls (losetup / mount -o loop) — handled before the g_nm guard
+	 * since losetup runs BEFORE any filesystem is mounted. */
+	if (nr == PR_ioctl && ukfs_loop_ioctl(tracee)) return true;
+
 	/* mount(2) on the NORMAL path (non-Android, where mount isn't SIGSYS-blocked):
 	 * register the vmount and fake success. The actual ukfsd MOUNT is deferred to
 	 * first access, same as the apply_emulated_mount hook used on Android. */
@@ -915,11 +1184,11 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		word_t sa = peek_reg(tracee, CURRENT, SYSARG_1);
 		char src[PATH_MAX];
 		if (!sa || read_string(tracee, src, sa, sizeof src) <= 0) return false;
-		if (!ukfs_src_is_dev(src)) return false;
+		if (!ukfs_src_mountable(src)) return false;
 		word_t ta = peek_reg(tracee, CURRENT, SYSARG_2);
 		char tgt[PATH_MAX];
 		if (!ta || read_string(tracee, tgt, ta, sizeof tgt) <= 0) return false;
-		if (ukfs_mount_register(src, tgt) < 0) return false;
+		if (ukfs_register_any(src, tgt) < 0) return false;
 		poke_reg(tracee, SYSARG_RESULT, 0);
 		set_sysnum(tracee, PR_void);
 		return true;

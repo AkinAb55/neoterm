@@ -328,8 +328,10 @@ ls "$MP2" | grep -q '^etc\$' || fail "p2 etc missing"
 echo "GUEST_RESULT=\$R"
 EOF
   python3 "$W/blk.py" "$BSOCK" "$W/pi.img" >"$W/blk_parts.log" 2>&1 & PIDS="$PIDS $!"
-  UKFSD_BLOCKSOCK="$BSOCK" "$W/ukfsd" "io.neoterm.fs.p1" >"$W/ukfsd_p1.log" 2>&1 & PIDS="$PIDS $!"
-  UKFSD_BLOCKSOCK="$BSOCK" "$W/ukfsd" "io.neoterm.fs.p2" >"$W/ukfsd_p2.log" 2>&1 & PIDS="$PIDS $!"
+  # launch the full daemon pool (the redirect allocates a free daemon per mount)
+  for sk in io.neoterm.fs io.neoterm.fs.p1 io.neoterm.fs.p2 io.neoterm.fs.p3 io.neoterm.fs.p4; do
+    UKFSD_BLOCKSOCK="$BSOCK" "$W/ukfsd" "$sk" >"$W/ukfsd_$sk.log" 2>&1 & PIDS="$PIDS $!"
+  done
   sleep 0.6
   out="$(UK_FS=1 UK_BLOCK=1 "$W/prsrc/proot" -0 /bin/sh "$W/guest_parts.sh" 2>&1)"
   echo "$out" | sed "s/^/    [parts] /"
@@ -340,6 +342,56 @@ EOF
   fi
 else
   skip "proot e2e [parts]" "mkfs.ext4 / mcopy / python3 missing"
+fi
+
+# ── loop devices: mount a DOWNLOADED IMAGE like on a real Linux PC — losetup -fP
+#    + mount /dev/loopNp2, and mount -o loop,offset=,sizelimit= -t vfat. The redirect
+#    emulates the loop ioctls; ukfsd opens the image's host path directly. ──────────
+if [ -f "$W/pi.img" ] && have losetup && have mount; then
+  for p in $PIDS; do kill "$p" 2>/dev/null; done; PIDS=""; sleep 0.3
+  # daemon pool (loop mounts allocate free daemons; PARTS query needs one too) — no
+  # block server needed: loop mounts open the image host path directly.
+  for sk in io.neoterm.fs io.neoterm.fs.p1 io.neoterm.fs.p2 io.neoterm.fs.p3 io.neoterm.fs.p4; do
+    UKFSD_BLOCKSOCK="$BSOCK" "$W/ukfsd" "$sk" >"$W/ukfsd_$sk.log" 2>&1 & PIDS="$PIDS $!"
+  done
+  sleep 0.6
+  gcc -O2 -o "$W/loopmnt" "$UKFS/test/loopmnt.c" 2>/dev/null || bad "build loopmnt helper"
+  # loop device node markers + proot binds. NOTE: we drive the loop ioctls via the
+  # loopmnt helper (not the host `losetup`, which would scan sysfs and grab the
+  # host's REAL loop devices, bypassing the emulation). A bound /dev/kmsg captures
+  # the redirect's debug log.
+  : > "$W/kmsg"
+  mkdir -p "$W/lmark"
+  LB="-b $W/kmsg:/dev/kmsg"
+  # marker basename MUST equal the device basename — the redirect identifies the
+  # loop device by readlink'ing the fd and parsing the basename.
+  mkm() { : > "$W/lmark/$1"; LB="$LB -b $W/lmark/$1:/dev/$1"; }
+  mkm loop-control
+  for n in 0 1 2 3; do mkm "loop$n"; for q in 1 2 3 4; do mkm "loop${n}p$q"; done; done
+  MPE="$W/lmpe"; MPF="$W/lmpf"; rm -rf "$MPE" "$MPF"; mkdir -p "$MPE" "$MPF"
+  FATOFF=$((2048*512))
+  cat > "$W/guest_loop.sh" <<EOF
+set +e
+R=0; fail(){ echo "  GUESTFAIL: \$1"; R=1; }
+# ext4 root partition (p2) via loop partition scan
+"$W/loopmnt" "$W/pi.img" "$MPE" 2 || fail "loop mount p2 (ext4)"
+echo loopdata > "$MPE/lf.txt" || fail "ext4 loop write"
+[ "\$(cat "$MPE/lf.txt")" = loopdata ] || fail "ext4 loop readback"
+# FAT boot partition via whole-loop at offset (mount -o loop,offset= style)
+"$W/loopmnt" "$W/pi.img" "$MPF" 0 $FATOFF || fail "loop mount @offset (vfat)"
+ls "$MPF" | grep -qi cmdline || fail "fat loop content (\$(ls "$MPF"))"
+echo "GUEST_RESULT=\$R"
+EOF
+  out="$(UK_FS=1 UK_BLOCK=1 "$W/prsrc/proot" -0 $LB /bin/sh "$W/guest_loop.sh" 2>&1)"
+  echo "$out" | sed "s/^/    [loop] /"
+  if echo "$out" | grep -q "GUEST_RESULT=0"; then
+    ok "proot e2e [loop]: loop-mount image partition (ext4) + whole-loop @offset (vfat)"
+  else
+    bad "proot e2e [loop]: image-file loop mount"
+    grep -a 'uk_fs:\|LOOP' "$W/kmsg" 2>/dev/null | sed 's/^/      kmsg: /' | tail -15
+  fi
+else
+  skip "proot e2e [loop]" "no pi.img / losetup / mount"
 fi
 
 echo

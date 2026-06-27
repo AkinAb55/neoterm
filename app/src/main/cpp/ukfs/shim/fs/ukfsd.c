@@ -268,6 +268,22 @@ static int handle(int fd, char *line)
 	long long n1, n2, n3, n4; size_t l1, l2; int pos = 0;
 	char fstype[64], token[512];
 
+	/* Explicit-range form: "MOUNT <fstype> <token> <base> <size>" mounts <token>
+	 * (which may be an ABSOLUTE host path — dev_path passes it through, so ukfsd
+	 * opens the file directly) at byte offset <base> for <size> bytes. This is how
+	 * the loop layer mounts a partition of an image file. base==0 && size==0 = whole
+	 * device. Must be tried BEFORE the 2-arg form (which would match the prefix). */
+	{
+		long long ebase = 0, esize = 0;
+		if (sscanf(line, "MOUNT %63s %511s %lld %lld", fstype, token, &ebase, &esize) == 4) {
+			char path[600]; dev_path(token, path, sizeof path);
+			fprintf(stderr, "ukfsd: MOUNT recv fstype=%s token=%s -> path=%s base=%lld size=%lld\n", fstype, token, path, ebase, esize); fflush(stderr);
+			int isp = (ebase != 0 || esize != 0);
+			if (mount_at(fstype, path, isp, ebase, esize) == 0) return reply_ok(fd);
+			fprintf(stderr, "ukfsd: MOUNT (explicit range): all candidates failed\n"); fflush(stderr);
+			return reply_err(fd, ENODEV);
+		}
+	}
 	if (sscanf(line, "MOUNT %63s %511s", fstype, token) == 2) {
 		char bare[512]; int pn = part_suffix(token, bare, sizeof bare);
 		char path[600]; dev_path(bare, path, sizeof path);
