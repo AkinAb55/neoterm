@@ -7,7 +7,7 @@ import io.neoterm.setup.proot.Kmsg
 import java.io.File
 
 /**
- * Fake **/sys/block** + **/sys/dev/block** tree for the USB pendrive, so the
+ * Fake `/sys/block` + `/sys/dev/block` tree for the USB pendrive, so the
  * standard Linux block tooling enumerates /dev/uksd0 — `lsblk`, `rpi-imager`,
  * `gnome-disks`, `gparted`, `blkid -o list`, … all walk sysfs to find drives, and
  * Android's SELinux blocks the real /sys/dev/block (EACCES). Same idea as
