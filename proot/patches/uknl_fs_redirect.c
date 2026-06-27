@@ -523,7 +523,8 @@ static bool ukfs_loopfd_op(Tracee *tracee, word_t nr)
 		word_t arg = peek_reg(tracee, CURRENT, SYSARG_3);
 		if (cmd == 0x80081272UL) { unsigned long long v = (unsigned long long) avail; write_data(tracee, arg, &v, 8); poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; } /* BLKGETSIZE64 */
 		if (cmd == 0x1260UL)     { unsigned long v = (unsigned long)(avail / 512); write_data(tracee, arg, &v, sizeof v); poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; } /* BLKGETSIZE */
-		if (cmd == 0x1268UL || cmd == 0x127BUL) { int v = 512; write_data(tracee, arg, &v, sizeof v); poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; } /* BLKSSZGET / BLKPBSZGET */
+		if (cmd == 0x1268UL || cmd == 0x127BUL || cmd == 0x1278UL) { int v = 512; write_data(tracee, arg, &v, sizeof v); poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; } /* BLKSSZGET / BLKPBSZGET / BLKIOMIN */
+		if (cmd == 0x1279UL || cmd == 0x127AUL) { int v = 0; write_data(tracee, arg, &v, sizeof v); poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; } /* BLKIOOPT / BLKALIGNOFF (silence mkfs "device geometry" warning) */
 		if (cmd == 0x125FUL || cmd == 0x1261UL || cmd == 0x127CUL) { poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; } /* BLKRRPART / BLKFLSBUF / BLKDISCARD-no-op */
 		return false;   /* other ioctls: let them run natively */
 	}
@@ -602,7 +603,6 @@ static int ukfs_query_stat(const char *rel, unsigned *mode, unsigned *uid, unsig
 	if (uksd_rl(s, line, sizeof line) < 0) { ukfs_sdrop(); return -1; }
 	if (sscanf(line, "OK %u %u %u %ld %lu %ld %ld %u %lu %lu",
 	           mode, uid, gid, size, ino, mtime, atime, nlink, rdev, blocks) != 10) {
-		{ char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: query_stat '%s' BAD reply='%s'\n", rel, line); uk_dbg_line(l); }
 		return -2;
 	}
 	return 0;
@@ -1016,9 +1016,6 @@ static int ukfs_load_dir(struct ukfs_vfd *v)
 	}
 	v->dent_n = k; v->dent_idx = 0;
 	free(blob);
-	{ char l[512]; int o2 = snprintf(l, sizeof l, "uk_fs: load_dir '%s' n=%d cnt=%d:", v->path, v->dent_n, cnt);
-	  for (int i = 0; i < v->dent_n && o2 < 460; i++) o2 += snprintf(l + o2, sizeof l - o2, " %s/%d", v->dents[i].name, v->dents[i].type);
-	  snprintf(l + o2, sizeof l - o2, "\n"); uk_dbg_line(l); }
 	return 0;
 }
 
@@ -1200,7 +1197,6 @@ static int ukfs_open_redirect_arg(Tracee *tracee, const char *rel, int flags, Re
 		(void) set_sysarg_path(tracee, backing, patharg);
 	}
 	open_pending_set(tracee->pid, isdir, (flags & O_APPEND) ? 1 : 0, rel, backing);
-	if (!strstr(rel, ".so") && !strstr(rel, "/lib")) { char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: OPEN rel='%s' flags=0x%x q=%d isdir=%d\n", rel, (unsigned) flags, q, isdir); uk_dbg_line(l); }
 	return isdir ? 2 : 0;
 }
 /* openat/openat2 path lives in SYSARG_2 — the common case. */
@@ -1235,7 +1231,6 @@ static void ukfs_populate_fd(Tracee *tracee, int fd, const char *relpath)
 	}
 	(void) ftruncate(bfd, (off_t) size);
 	close(bfd);
-	{ char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: mmap populate fd=%d bytes=%lld p='%s'\n", fd, off, relpath); uk_dbg_line(l); }
 }
 
 /* Writeback for a PROT_WRITE|MAP_SHARED mapping: the guest wrote into the
@@ -1293,7 +1288,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	if (!uk_dbg_init) {
 		uk_dbg_init = 1;
 		char l[256];
-		snprintf(l, sizeof l, "uk_fs: INIT v49-loop UK_FS='%s' UK_BLOCK='%s'\n",
+		snprintf(l, sizeof l, "uk_fs: INIT v50-loop UK_FS='%s' UK_BLOCK='%s'\n",
 		         getenv("UK_FS") ? getenv("UK_FS") : "(null)",
 		         getenv("UK_BLOCK") ? getenv("UK_BLOCK") : "(null)");
 		uk_dbg(tracee, l);
@@ -1631,7 +1626,6 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		}
 		if (w) write_data(tracee, buf, tmp, w);
 		free(tmp);
-		{ char l[96]; snprintf(l, sizeof l, "uk_fs: getdents '%s' emit=%zu idx=%d/%d\n", v->path, w, v->dent_idx, v->dent_n); uk_dbg_line(l); }
 		/* getdents64 is trapped by BOTH our set AND proot's hidden_files extension,
 		 * so (like renameat) the PR_void-poked byte count can be clobbered before the
 		 * tracee resumes -> the caller sees a short/empty dir and stops recursing
@@ -1866,11 +1860,6 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		if (!pa || read_string(tracee, gp, pa, sizeof gp) <= 0) return false;
 		int mdfd = (int) peek_reg(tracee, CURRENT, SYSARG_1);
 		if (!ukfs_rel_at(tracee, mdfd, gp, rel, sizeof rel)) {
-			struct ukfs_vfd *mv = (gp[0] != '/' && mdfd != AT_FDCWD) ? vfd_lookup(tracee, mdfd) : NULL;
-			char l[PATH_MAX + 96];
-			snprintf(l, sizeof l, "uk_fs: MKDIR-MISS dirfd=%d gp='%s' vfd=%p tgid=%d\n",
-			         mdfd, gp, (void*) mv, ukfs_tgid(tracee->pid));
-			uk_dbg_line(l);
 			return false;
 		}
 		unsigned mode = (unsigned) peek_reg(tracee, CURRENT, SYSARG_3) & 07777;
@@ -2109,32 +2098,7 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		poke_reg(tracee, SYSARG_RESULT, (word_t)(long) r); set_sysnum(tracee, PR_void); return true;
 	}
 
-	/* TEMP DIAG (git clone EPERM): a trapped syscall reached here unhandled while a
-	 * vmount is active, so fake_id0/proot handles it next and may EPERM it (the
-	 * "could not write config file" failure). The earlier abs-path-only filter
-	 * missed it because git's CWD is the mount, so it uses RELATIVE paths. Resolve
-	 * arg1 (legacy path-in-arg1: chmod/chown/statfs/...) against the CWD and arg2
-	 * (the *at convention: dirfd in arg1, path in arg2) against arg1's dirfd —
-	 * exactly as the real handlers do — and log any that lands under the vmount.
-	 * Also log every unhandled trapped op while the CWD itself is under the vmount,
-	 * so a culprit that passes the path by fd/relative form still shows up. */
-	{
-		char gp[PATH_MAX], rel[PATH_MAX];
-		word_t a1 = peek_reg(tracee, CURRENT, SYSARG_1);
-		word_t a2 = peek_reg(tracee, CURRENT, SYSARG_2);
-		if (a1 && read_string(tracee, gp, a1, sizeof gp) > 0 && gp[0] &&
-		    ukfs_rel_at(tracee, AT_FDCWD, gp, rel, sizeof rel)) {
-			char l[PATH_MAX + 96];
-			snprintf(l, sizeof l, "uk_fs: UNHANDLED nr=%lu a1='%s' rel='%s'\n", (unsigned long) nr, gp, rel);
-			uk_dbg_line(l);
-		} else if (a2 && read_string(tracee, gp, a2, sizeof gp) > 0 && gp[0] &&
-		           ukfs_rel_at(tracee, (int) a1, gp, rel, sizeof rel)) {
-			char l[PATH_MAX + 96];
-			snprintf(l, sizeof l, "uk_fs: UNHANDLED nr=%lu a2='%s' rel='%s'\n", (unsigned long) nr, gp, rel);
-			uk_dbg_line(l);
-		}
-	}
-	return false;
+		return false;
 }
 
 /* TEMP DIAG: called at the VERY END of translate_syscall_exit (after fake_id0's
@@ -2170,32 +2134,6 @@ void uknl_fs_open_exit(Tracee *tracee, word_t nr)
 	if (!uk_fs_on()) return;
 	int pid = ukfs_tgid(tracee->pid);   /* vfd table is keyed by thread group (shared fds) */
 	int tid = tracee->pid;              /* open_pending is per-thread (same thread enter+exit) */
-
-	/* TEMP DIAG (git clone EPERM): NO ukfsd command failed during the config write
-	 * (CREATE/WRITE/RENAME all OK; the only ERRs were a harmless EEXIST mkdir and an
-	 * ENOENT rollback unlink), yet git still saw EPERM. So the -EPERM is poked onto
-	 * some syscall's RESULT register by fake_id0 or a real translated syscall, not
-	 * returned by the FS engine. Log every syscall that EXITS with exactly -EPERM
-	 * (-1) while a vmount is active — that's the culprit, by number. EPERM is rare,
-	 * so this is near-silent; the decoder maps the number to a name. */
-	if (g_nm > 0) {
-		int res = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT);   /* 32-bit, like fake_id0 */
-		if (res == -1 || res == -13) {       /* -EPERM / -EACCES */
-			/* Print BOTH path candidates verbatim (no vmount filter): the EACCES
-			 * opens carry no vmount path, so we need to see exactly which files they
-			 * are — config-probe red herrings vs. the real culprit. arg1 (legacy
-			 * path-in-arg1) and arg2 (the *at path) are both dumped when readable. */
-			char g1[PATH_MAX], g2[PATH_MAX]; g1[0] = g2[0] = 0;
-			word_t a1 = peek_reg(tracee, ORIGINAL, SYSARG_1);
-			word_t a2 = peek_reg(tracee, ORIGINAL, SYSARG_2);
-			if (a1 && read_string(tracee, g1, a1, sizeof g1) > 0 && g1[0] != '/') g1[0] = 0;
-			if (a2) read_string(tracee, g2, a2, sizeof g2);
-			char l[2 * PATH_MAX + 96];
-			snprintf(l, sizeof l, "uk_fs: EPERM-EXIT nr=%lu res=%d a1='%s' a2='%s'\n",
-			         (unsigned long) nr, res, g1, g2);
-			uk_dbg_line(l);
-		}
-	}
 
 	/* Track a freshly-opened /dev/loopN[pM] node so raw reads/writes on it serve
 	 * from the backing image (blkid/file/fdisk/dd and bare `mount` auto-detect). */
@@ -2283,7 +2221,6 @@ void uknl_fs_open_exit(Tracee *tracee, word_t nr)
 			v->append = pp->append; v->mnt = pp->mnt;
 			snprintf(v->path, sizeof v->path, "%s", pp->path);
 			snprintf(v->backing, sizeof v->backing, "%s", pp->backing);
-			if (pp->isdir) { char l[PATH_MAX + 96]; snprintf(l, sizeof l, "uk_fs: vfd+DIR fd=%ld path='%s' tgid=%d\n", fd, pp->path, pid); uk_dbg_line(l); }
 		}
 		/* Unlink the per-fd placeholder now: the guest fd keeps the inode alive
 		 * (anonymous), mmap-populate reaches it via /proc/<pid>/fd/<fd>, and it is
