@@ -86,6 +86,7 @@ static int uksd_rn(int s, void *b, size_t n) { (void)s; if (g_resp_bpos + n > g_
 #define UKNL_FS_REDIRECT_TEST 1
 #include "fused.h"
 int uknl_pump_one(void) { return 0; }
+static word_t alloc_mem(Tracee *t, ssize_t size) { (void)t; (void)size; return 0; }
 int restart_tracee(Tracee *t, int signal) { (void)t; (void)signal; return 0; }
 int push_specific_regs(Tracee *t, int including_sysnum) { (void)t; (void)including_sysnum; return 0; }
 static void save_current_regs(Tracee *t, RegVersion v) { (void)t; (void)v; }

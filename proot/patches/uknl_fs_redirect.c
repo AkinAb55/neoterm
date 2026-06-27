@@ -1826,6 +1826,60 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		unsigned mode, uid, gid, nlink; long size, mt, at; unsigned long ino, rdev, blocks;
 		if (ukfs_query_stat(rel, &mode, &uid, &gid, &size, &ino, &mt, &at, &nlink, &rdev, &blocks) != 0) return false;
 		if ((mode & 0170000) != 0100000) return false;   /* only regular files */
+
+		/* #! script on the vmount: don't materialise (that would make the kernel exec
+		 * a temp path, so the script sees $0 = /.ukfs_exec_* and self-locating tools
+		 * like AppImage AppRun compute the wrong $APPDIR). Instead rewrite execve to
+		 * run the INTERPRETER with the original mount path as argv[1]: the interpreter
+		 * open()s that path -> served via the FS redirect -> and $0 is the real mount
+		 * path. */
+		{
+			char hdr[256];
+			long hn = ukfs_read_at(rel, 0, hdr, sizeof hdr - 1);
+			if (hn >= 2 && hdr[0] == '#' && hdr[1] == '!') {
+				char line[256]; int li = 0;
+				for (long i = 2; i < hn && hdr[i] != '\n' && li < (int) sizeof line - 1; i++) line[li++] = hdr[i];
+				line[li] = '\0';
+				char *q = line; while (*q == ' ' || *q == '\t') q++;
+				char interp[256], iarg[256]; iarg[0] = '\0';
+				int k = 0; while (*q && *q != ' ' && *q != '\t' && k < (int) sizeof interp - 1) interp[k++] = *q++;
+				interp[k] = '\0';
+				while (*q == ' ' || *q == '\t') q++;
+				if (*q) snprintf(iarg, sizeof iarg, "%s", q);
+				int argvarg = (nr == PR_execveat) ? SYSARG_3 : SYSARG_2;
+				word_t oargv = peek_reg(tracee, CURRENT, argvarg);
+				word_t optr[250]; int on = 0, oerr = 0;
+				if (oargv) for (; on < 250; on++) {
+					word_t w = 0;
+					if (read_data(tracee, &w, oargv + (word_t) on * sizeof(word_t), sizeof w) < 0) { oerr = 1; break; }
+					if (w == 0) break;
+					optr[on] = w;
+				}
+				if (interp[0] == '/' && !oerr) {
+					word_t s_i = alloc_mem(tracee, (ssize_t)(strlen(interp) + 1));
+					word_t s_p = alloc_mem(tracee, (ssize_t)(strlen(gp) + 1));
+					word_t s_a = iarg[0] ? alloc_mem(tracee, (ssize_t)(strlen(iarg) + 1)) : 1;
+					word_t s_v = alloc_mem(tracee, (ssize_t)((on + 4) * sizeof(word_t)));
+					if (s_i && s_p && s_a && s_v) {
+						write_data(tracee, s_i, interp, strlen(interp) + 1);
+						write_data(tracee, s_p, gp, strlen(gp) + 1);
+						if (iarg[0]) write_data(tracee, s_a, iarg, strlen(iarg) + 1);
+						word_t arr[256]; int ai = 0;
+						arr[ai++] = s_i;
+						if (iarg[0]) arr[ai++] = s_a;
+						arr[ai++] = s_p;                              /* argv[1] = script path = $0 */
+						for (int i = 1; i < on; i++) arr[ai++] = optr[i];   /* original args after argv[0] */
+						arr[ai++] = 0;
+						write_data(tracee, s_v, arr, (word_t) ai * sizeof(word_t));
+						set_sysarg_path(tracee, interp, patharg);     /* exec the interpreter */
+						poke_reg(tracee, argvarg, s_v);
+						char l[PATH_MAX + 64]; snprintf(l, sizeof l, "uk_fs: exec script %s via %s ($0 preserved)\n", gp, interp); uk_dbg(tracee, l);
+						return false;
+					}
+				}
+				/* shebang rewrite not possible: fall through to materialise */
+			}
+		}
 		char gtmp[64]; snprintf(gtmp, sizeof gtmp, "/.ukfs_exec_%d", tracee->pid);
 		char htmp[PATH_MAX];
 		if (translate_path(tracee, htmp, AT_FDCWD, gtmp, false) < 0) return false;
