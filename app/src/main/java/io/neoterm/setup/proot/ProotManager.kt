@@ -271,6 +271,11 @@ object ProotManager {
     // and IIO-aware tools see the device sensors.
     io.neoterm.utils.SensorBridge.sysfsBinds().forEach { (host, guest) -> bind(args, host, guest) }
 
+    // USB storage: bind the fake /sys/block + /sys/dev/block trees so lsblk and
+    // disk GUIs (rpi-imager, gnome-disks, gparted) enumerate /dev/uksd0[pN]
+    // (Android SELinux blocks the real /sys/dev/block). Empty until a drive attaches.
+    io.neoterm.setup.usbserial.BlockSysfsBridge.sysfsBinds().forEach { (host, guest) -> bind(args, host, guest) }
+
     // Fake /proc fájlok (proot-distro sysdata mintájára): az Android korlátozott
     // /proc-ja miatt a ps/top/uptime/free hibára futna ("Unable to get system
     // boot time"). A /proc bind UTÁN kötjük, hogy a konkrétabb bind felülírja.

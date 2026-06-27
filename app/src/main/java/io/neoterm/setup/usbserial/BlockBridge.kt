@@ -135,6 +135,9 @@ object BlockBridge {
     // ukfsd is needed so the guest can mount this newly attached device. No-op if
     // it is already running.
     runCatching { FsBridge.ensureReady() }
+    // Publish the fake /sys/block tree so lsblk/rpi-imager/gnome-disks see the
+    // drive (reads the partition table off the device for the per-partition nodes).
+    runCatching { BlockSysfsBridge.refresh(totalBytes, sectorSize) { off, len -> readAt(off, len) } }
   }
 
   @Synchronized
@@ -161,6 +164,7 @@ object BlockBridge {
     runCatching { conn?.close() }
     conn = null; iface = null; epIn = null; epOut = null; deviceName = null; totalBytes = 0
     runCatching { RandomAccessFile(marker, "rw").use { it.setLength(0) } }   // shrink the marker back
+    runCatching { BlockSysfsBridge.clear() }   // drop the /sys/block tree (no drive)
     Kmsg.log("usb-block: $msg")
   }
 
