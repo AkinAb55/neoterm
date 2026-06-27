@@ -513,7 +513,7 @@ if 'uknl_maybe_inject_ttyusb' not in s:
                   '#include "path/path.h"\n'
                   '#include <sys/socket.h>\n#include <sys/un.h>\n#include <sys/time.h>\n'
                   '#include <unistd.h>\n#include <string.h>\n#include <stddef.h>\n'
-                  '#include <stdbool.h>\n', 1)
+                  '#include <stdbool.h>\n#include <stdlib.h>\n', 1)
     helpers = (
         '/* NeoTerm: one request/reply to the app-side usb-serial server. */\n'
         'static bool uknl_query(const char *req, char *resp, size_t resp_sz)\n'
@@ -560,29 +560,50 @@ if 'uknl_maybe_inject_ttyusb' not in s:
         '\tmemcpy(d->d_name, name, nl + 1);\n'
         '\tfor (size_t i = offsetof(struct linux_dirent64, d_name) + nl + 1; i < reclen; i++) buf[i] = 0;\n'
         '\treturn reclen;\n}\n\n'
-        '/* Append the active ttyUSB ports at the EOF of a getdents64 on /dev, so\n'
-        ' * glob (ls /dev/ttyUSB*) and enumeration find the virtual hotplug ports. */\n'
+        '/* NeoTerm: true iff the io.neoterm.block server has a device attached\n'
+        ' * (SIZE -> OK only while deviceName != null), so /dev/uksd0 hotplugs. */\n'
+        'static bool uknl_block_present(void)\n{\n'
+        '\tint s = socket(AF_UNIX, SOCK_STREAM, 0);\n'
+        '\tif (s < 0) return false;\n'
+        '\tstruct timeval tv = { .tv_sec = 1, .tv_usec = 0 };\n'
+        '\tsetsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);\n'
+        '\tsetsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);\n'
+        '\tstruct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;\n'
+        '\tconst char *nm = "io.neoterm.block";\n'
+        '\ta.sun_path[0] = \'\\0\'; strncpy(a.sun_path + 1, nm, sizeof(a.sun_path) - 2);\n'
+        '\tsocklen_t len = sizeof(a.sun_family) + 1 + strlen(nm);\n'
+        '\tif (connect(s, (struct sockaddr *) &a, len) < 0) { close(s); return false; }\n'
+        '\tbool ok = write(s, "SIZE\\n", 5) == 5;\n'
+        '\tchar r[8] = {0}; ssize_t n = ok ? read(s, r, sizeof r - 1) : -1;\n'
+        '\tclose(s);\n'
+        '\treturn n >= 2 && r[0] == \'O\' && r[1] == \'K\';\n}\n\n'
+        '/* Append the active ttyUSB ports (and /dev/uksd0 when USB-storage is on) at\n'
+        ' * the EOF of a getdents64 on /dev, so glob (ls /dev/ttyUSB*, ls /dev/uksd0)\n'
+        ' * and enumeration find the virtual hotplug nodes. */\n'
         'static bool uknl_maybe_inject_ttyusb(Tracee *tracee, int res)\n{\n'
         '\tif (get_sysnum(tracee, ORIGINAL) != PR_getdents64)\n\t\treturn false;\n'
         '\tint fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);\n'
         '\tchar path[PATH_MAX];\n'
         '\tif (readlink_proc_pid_fd(tracee->pid, fd, path) < 0)\n\t\treturn false;\n'
-        '\tunsigned char dtype = 2;\t/* DT_CHR */\n'
         '\tif (strcmp(path, "/dev") != 0)\n\t\treturn false;\n'
         '\tif (res > 0) { uknl_inj_del(tracee->pid, fd); return false; }\n'
         '\tif (res != 0)\n\t\treturn false;\n'
         '\tif (uknl_inj_has(tracee->pid, fd))\n\t\treturn false;\n'
-        '\tchar list[256];\n'
-        '\tif (!uknl_query("LIST\\n", list, sizeof list)) return false;\n'
-        '\tif (list[0] == \'\\0\' || list[0] == \'-\') { uknl_inj_add(tracee->pid, fd); return false; }\n'
         '\tword_t buf_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);\n'
         '\tunsigned int count = peek_reg(tracee, ORIGINAL, SYSARG_3);\n'
         '\tchar out[1024];\n\tsize_t off = 0;\n\tunsigned long long ino = 0x7574620000ULL;\n'
-        '\tchar *save = NULL;\n'
-        '\tfor (char *tok = strtok_r(list, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {\n'
-        '\t\tif (tok[0] == \'\\0\') continue;\n'
-        '\t\tsize_t r = uknl_put_dirent64(out + off, sizeof(out) - off, tok, ino++, (long long)(0x7f000000 + off), dtype);\n'
-        '\t\tif (r == 0) break;\n\t\toff += r;\n\t}\n'
+        '\tchar list[256];\n'
+        '\tif (uknl_query("LIST\\n", list, sizeof list) && list[0] != \'\\0\' && list[0] != \'-\') {\n'
+        '\t\tchar *save = NULL;\n'
+        '\t\tfor (char *tok = strtok_r(list, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {\n'
+        '\t\t\tif (tok[0] == \'\\0\') continue;\n'
+        '\t\t\tsize_t r = uknl_put_dirent64(out + off, sizeof(out) - off, tok, ino++, (long long)(0x7f000000 + off), 2 /* DT_CHR */);\n'
+        '\t\t\tif (r == 0) break;\n\t\t\toff += r;\n\t\t}\n'
+        '\t}\n'
+        '\tif (getenv("UK_BLOCK") && uknl_block_present()) {\n'
+        '\t\tsize_t r = uknl_put_dirent64(out + off, sizeof(out) - off, "uksd0", ino++, (long long)(0x7f000000 + off), 6 /* DT_BLK */);\n'
+        '\t\tif (r > 0) off += r;\n'
+        '\t}\n'
         '\tif (off == 0 || off > count) { uknl_inj_add(tracee->pid, fd); return false; }\n'
         '\tif (write_data(tracee, buf_addr, out, off) < 0) return false;\n'
         '\tpoke_reg(tracee, SYSARG_RESULT, off);\n'
@@ -634,5 +655,448 @@ if 'NeoTerm: Android SELinux denies flock' not in s:
         '\t}\n\n')
     s = s.replace(fl_anchor, fl_case + fl_anchor, 1)
     wr(EF, s)
+
+# ---- USB block-device proxy: /dev/uksd0 (a bound empty marker) becomes a real
+#      block device by proxying its I/O syscalls to the app-side SCSI bridge over
+#      io.neoterm.block. dd/fdisk/parted/mkfs.*/fsck.*/mtools + a userspace FS all
+#      work on ANY filesystem, no root. Gated by the UK_BLOCK env (set by
+#      ProotManager only when the storage toggle is on) so non-storage sessions
+#      pay nothing: without it the I/O syscalls are not even in the seccomp filter. ----
+EN = ROOT + "/syscall/enter.c"; s = rd(EN)
+if 'uknl_block_dispatch' not in s:
+    must('int translate_syscall_enter(Tracee *tracee)\n{' in s, "enter.c translate_syscall_enter anchor (block)")
+    helpers = (
+        '/* NeoTerm: USB block-device proxy (/dev/uksd0 -> io.neoterm.block). */\n'
+        'static int g_uk_block = -1;\n'
+        'static int uk_block_on(void) { if (g_uk_block < 0) { const char *e = getenv("UK_BLOCK"); g_uk_block = (e && *e && *e != \'0\') ? 1 : 0; } return g_uk_block; }\n'
+        'static int g_uksd_sock = -1;\n'
+        'static long long g_uksd_size = -1;\n'
+        'static int g_uksd_sector = 512;\n'
+        'static int uksd_conn(void)\n'
+        '{\n'
+        '\tif (g_uksd_sock >= 0) return g_uksd_sock;\n'
+        '\tint s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);\n'
+        '\tif (s < 0) return -1;\n'
+        '\tstruct timeval tv = { .tv_sec = 20, .tv_usec = 0 };\n'
+        '\tsetsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);\n'
+        '\tsetsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);\n'
+        '\tstruct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;\n'
+        '\tconst char *name = "io.neoterm.block";\n'
+        '\ta.sun_path[0] = \'\\0\'; strncpy(a.sun_path + 1, name, sizeof(a.sun_path) - 2);\n'
+        '\tsocklen_t len = sizeof(a.sun_family) + 1 + strlen(name);\n'
+        '\tif (connect(s, (struct sockaddr *) &a, len) < 0) { close(s); return -1; }\n'
+        '\tg_uksd_sock = s; return s;\n'
+        '}\n'
+        'static void uksd_drop(void) { if (g_uksd_sock >= 0) { close(g_uksd_sock); g_uksd_sock = -1; } }\n'
+        'static int uksd_wn(int s, const void *b, size_t n) { size_t o = 0; while (o < n) { ssize_t r = write(s, (const char *)b + o, n - o); if (r < 0) { if (errno == EINTR) continue; return -1; } if (r == 0) return -1; o += r; } return 0; }\n'
+        'static int uksd_rn(int s, void *b, size_t n) { size_t o = 0; while (o < n) { ssize_t r = read(s, (char *)b + o, n - o); if (r < 0) { if (errno == EINTR) continue; return -1; } if (r == 0) return -1; o += r; } return 0; }\n'
+        'static int uksd_rl(int s, char *b, size_t bs) { size_t o = 0; while (o + 1 < bs) { char c; if (uksd_rn(s, &c, 1) < 0) return -1; if (c == \'\\n\') { b[o] = 0; return (int)o; } b[o++] = c; } b[o] = 0; return (int)o; }\n'
+        'static int uksd_size_q(void)\n'
+        '{\n'
+        '\tif (g_uksd_size >= 0) return 0;\n'
+        '\tint s = uksd_conn(); if (s < 0) return -1;\n'
+        '\tif (uksd_wn(s, "SIZE\\n", 5) < 0) { uksd_drop(); return -1; }\n'
+        '\tchar line[128]; if (uksd_rl(s, line, sizeof line) < 0) { uksd_drop(); return -1; }\n'
+        '\tlong long sz; int sec;\n'
+        '\tif (sscanf(line, "OK %lld %d", &sz, &sec) != 2) return -1;\n'
+        '\tg_uksd_size = sz; g_uksd_sector = sec; return 0;\n'
+        '}\n'
+        'static ssize_t uksd_read(long long off, void *buf, size_t len)\n'
+        '{\n'
+        '\tint s = uksd_conn(); if (s < 0) return -1;\n'
+        '\tchar req[64]; int rl = snprintf(req, sizeof req, "READ %lld %zu\\n", off, len);\n'
+        '\tif (uksd_wn(s, req, rl) < 0) { uksd_drop(); return -1; }\n'
+        '\tchar line[64]; if (uksd_rl(s, line, sizeof line) < 0) { uksd_drop(); return -1; }\n'
+        '\tsize_t n; if (sscanf(line, "OK %zu", &n) != 1) return -1;\n'
+        '\tif (n > len) n = len;\n'
+        '\tif (uksd_rn(s, buf, n) < 0) { uksd_drop(); return -1; }\n'
+        '\treturn (ssize_t) n;\n'
+        '}\n'
+        'static ssize_t uksd_write(long long off, const void *buf, size_t len)\n'
+        '{\n'
+        '\tint s = uksd_conn(); if (s < 0) return -1;\n'
+        '\tchar req[64]; int rl = snprintf(req, sizeof req, "WRITE %lld %zu\\n", off, len);\n'
+        '\tif (uksd_wn(s, req, rl) < 0 || uksd_wn(s, buf, len) < 0) { uksd_drop(); return -1; }\n'
+        '\tchar line[16]; if (uksd_rl(s, line, sizeof line) < 0) { uksd_drop(); return -1; }\n'
+        '\treturn (line[0] == \'O\' && line[1] == \'K\') ? (ssize_t) len : -1;\n'
+        '}\n'
+        'static void uksd_flush(void)\n'
+        '{\n'
+        '\tint s = uksd_conn(); if (s < 0) return;\n'
+        '\tif (uksd_wn(s, "FLUSH\\n", 6) < 0) { uksd_drop(); return; }\n'
+        '\tchar line[16]; if (uksd_rl(s, line, sizeof line) < 0) uksd_drop();\n'
+        '}\n'
+        'static struct { int pid; int fd; long long off; } g_blk[64];\n'
+        'static int g_blkn = 0;\n'
+        'static int blk_idx(int pid, int fd) { for (int i = 0; i < g_blkn; i++) if (g_blk[i].pid == pid && g_blk[i].fd == fd) return i; return -1; }\n'
+        'static long long *blk_off(int pid, int fd) { int i = blk_idx(pid, fd); if (i < 0) { if (g_blkn >= 64) return NULL; i = g_blkn++; g_blk[i].pid = pid; g_blk[i].fd = fd; g_blk[i].off = 0; } return &g_blk[i].off; }\n'
+        'static void blk_del(int pid, int fd) { int i = blk_idx(pid, fd); if (i >= 0) g_blk[i] = g_blk[--g_blkn]; }\n'
+        'static int uksd_is(Tracee *tracee, int fd)\n'
+        '{\n'
+        '\tchar link[64], path[PATH_MAX];\n'
+        '\tsnprintf(link, sizeof link, "/proc/%d/fd/%d", tracee->pid, fd);\n'
+        '\tssize_t n = readlink(link, path, sizeof(path) - 1);\n'
+        '\tif (n <= 0) return 0;\n\tpath[n] = \'\\0\';\n'
+        '\treturn strstr(path, "/sysdata/uksd0") != NULL;   /* the bound marker file */\n'
+        '}\n'
+        'static int uksd_path_is(const char *p)\n'
+        '{\n'
+        '\tsize_t n = strlen(p);\n'
+        '\treturn n >= 6 && strcmp(p + n - 6, "/uksd0") == 0;   /* guest sees /dev/uksd0 */\n'
+        '}\n'
+        '/* Fake a block-device struct stat (aarch64 kernel layout, 128 bytes) so tools\n'
+        ' * recognise /dev/uksd0 as a block special device, exactly like a ttyUSB node. */\n'
+        'static void uksd_put_stat(Tracee *tracee, word_t addr)\n'
+        '{\n'
+        '\tunsigned char st[128];\n'
+        '\tmemset(st, 0, sizeof st);\n'
+        '\tunsigned long st_ino = 0xb10c0UL;\n'
+        '\tunsigned int  st_mode = 0060660;            /* S_IFBLK | 0660 */\n'
+        '\tunsigned int  st_nlink = 1;\n'
+        '\tunsigned long st_rdev = (8UL << 8);         /* major 8, minor 0 (sd-like) */\n'
+        '\tlong          st_size = (long) g_uksd_size;\n'
+        '\tint           st_blksize = g_uksd_sector > 0 ? g_uksd_sector : 512;\n'
+        '\tlong          st_blocks = (long)(g_uksd_size / 512);\n'
+        '\tmemcpy(st + 8,  &st_ino,     8);\n'
+        '\tmemcpy(st + 16, &st_mode,    4);\n'
+        '\tmemcpy(st + 20, &st_nlink,   4);\n'
+        '\tmemcpy(st + 32, &st_rdev,    8);\n'
+        '\tmemcpy(st + 48, &st_size,    8);\n'
+        '\tmemcpy(st + 56, &st_blksize, 4);\n'
+        '\tmemcpy(st + 64, &st_blocks,  8);\n'
+        '\twrite_data(tracee, addr, st, sizeof st);\n'
+        '}\n'
+        'static void uksd_put_statx(Tracee *tracee, word_t addr)\n'
+        '{\n'
+        '\tunsigned char sx[256];\n'
+        '\tmemset(sx, 0, sizeof sx);\n'
+        '\tunsigned int  stx_mask = 0x000007ffU;       /* STATX_BASIC_STATS */\n'
+        '\tunsigned int  stx_blksize = g_uksd_sector > 0 ? g_uksd_sector : 512;\n'
+        '\tunsigned int  stx_nlink = 1;\n'
+        '\tunsigned short stx_mode = 0x61B0;           /* S_IFBLK | 0660 */\n'
+        '\tunsigned long long stx_ino = 0xb10c0ULL;\n'
+        '\tunsigned long long stx_size = (unsigned long long) g_uksd_size;\n'
+        '\tunsigned long long stx_blocks = (unsigned long long)(g_uksd_size / 512);\n'
+        '\tunsigned int stx_rdev_major = 8, stx_rdev_minor = 0;\n'
+        '\tmemcpy(sx + 0,   &stx_mask,       4);\n'
+        '\tmemcpy(sx + 4,   &stx_blksize,    4);\n'
+        '\tmemcpy(sx + 16,  &stx_nlink,      4);\n'
+        '\tmemcpy(sx + 28,  &stx_mode,       2);\n'
+        '\tmemcpy(sx + 32,  &stx_ino,        8);\n'
+        '\tmemcpy(sx + 40,  &stx_size,       8);\n'
+        '\tmemcpy(sx + 48,  &stx_blocks,     8);\n'
+        '\tmemcpy(sx + 128, &stx_rdev_major, 4);\n'
+        '\tmemcpy(sx + 132, &stx_rdev_minor, 4);\n'
+        '\twrite_data(tracee, addr, sx, sizeof sx);\n'
+        '}\n'
+        '/* Returns true if a /dev/uksd0 I/O syscall was handled (PR_void\'d + result poked). */\n'
+        'static bool uknl_block_dispatch(Tracee *tracee, word_t nr)\n'
+        '{\n'
+        '\tif (!uk_block_on()) return false;\n'
+        '\t/* stat family: report /dev/uksd0 as a block special device. */\n'
+        '\tif (nr == PR_fstat || nr == PR_fstat64) {\n'
+        '\t\tif (!uksd_is(tracee, (int) peek_reg(tracee, CURRENT, SYSARG_1))) return false;\n'
+        '\t\tif (uksd_size_q() < 0) return false;\n'
+        '\t\tuksd_put_stat(tracee, peek_reg(tracee, CURRENT, SYSARG_2));\n'
+        '\t\tpoke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;\n'
+        '\t}\n'
+        '\tif (nr == PR_newfstatat || nr == PR_fstatat64) {\n'
+        '\t\tword_t pa = peek_reg(tracee, CURRENT, SYSARG_2);\n'
+        '\t\tchar gp[PATH_MAX]; bool m;\n'
+        '\t\tif (pa && read_string(tracee, gp, pa, sizeof gp) > 0 && gp[0] != \'\\0\')\n'
+        '\t\t\tm = uksd_path_is(gp);\n'
+        '\t\telse\n'
+        '\t\t\tm = uksd_is(tracee, (int) peek_reg(tracee, CURRENT, SYSARG_1));\n'
+        '\t\tif (!m) return false;\n'
+        '\t\tif (uksd_size_q() < 0) return false;\n'
+        '\t\tuksd_put_stat(tracee, peek_reg(tracee, CURRENT, SYSARG_3));\n'
+        '\t\tpoke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;\n'
+        '\t}\n'
+        '\tif (nr == PR_statx) {\n'
+        '\t\tword_t pa = peek_reg(tracee, CURRENT, SYSARG_2);\n'
+        '\t\tchar gp[PATH_MAX]; bool m;\n'
+        '\t\tif (pa && read_string(tracee, gp, pa, sizeof gp) > 0 && gp[0] != \'\\0\')\n'
+        '\t\t\tm = uksd_path_is(gp);\n'
+        '\t\telse\n'
+        '\t\t\tm = uksd_is(tracee, (int) peek_reg(tracee, CURRENT, SYSARG_1));\n'
+        '\t\tif (!m) return false;\n'
+        '\t\tif (uksd_size_q() < 0) return false;\n'
+        '\t\tuksd_put_statx(tracee, peek_reg(tracee, CURRENT, SYSARG_5));\n'
+        '\t\tpoke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true;\n'
+        '\t}\n'
+        '\tif (nr != PR_read && nr != PR_write && nr != PR_lseek &&\n'
+        '\t    nr != PR_pread64 && nr != PR_pwrite64 && nr != PR_ioctl && nr != PR_close) return false;\n'
+        '\tint fd = (int) peek_reg(tracee, CURRENT, SYSARG_1);\n'
+        '\tif (nr == PR_close) { if (blk_idx(tracee->pid, fd) >= 0) uksd_flush(); blk_del(tracee->pid, fd); return false; }\n'
+        '\tif (!uksd_is(tracee, fd)) return false;\n'
+        '\tif (uksd_size_q() < 0) return false;\n'
+        '\tif (nr == PR_ioctl) {\n'
+        '\t\tunsigned long cmd = (unsigned long) peek_reg(tracee, CURRENT, SYSARG_2);\n'
+        '\t\tword_t arg = peek_reg(tracee, CURRENT, SYSARG_3);\n'
+        '\t\tif (cmd == 0x80081272UL) { unsigned long long v = (unsigned long long) g_uksd_size; write_data(tracee, arg, &v, 8); poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; }\n'
+        '\t\tif (cmd == 0x1260UL) { unsigned long v = (unsigned long)(g_uksd_size / 512); write_data(tracee, arg, &v, sizeof v); poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; }\n'
+        '\t\tif (cmd == 0x1268UL) { int v = g_uksd_sector; write_data(tracee, arg, &v, sizeof v); poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; }\n'
+        '\t\tif (cmd == 0x1261UL) { poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; }\n'
+        '\t\treturn false;\n'
+        '\t}\n'
+        '\tlong long *offp = blk_off(tracee->pid, fd);\n'
+        '\tif (!offp) return false;\n'
+        '\tif (nr == PR_lseek) {\n'
+        '\t\tlong long arg = (long long)(off_t) peek_reg(tracee, CURRENT, SYSARG_2);\n'
+        '\t\tint whence = (int) peek_reg(tracee, CURRENT, SYSARG_3);\n'
+        '\t\tlong long no = (whence == 1) ? *offp + arg : (whence == 2) ? g_uksd_size + arg : arg;\n'
+        '\t\tif (no < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long)-EINVAL); set_sysnum(tracee, PR_void); return true; }\n'
+        '\t\t*offp = no; poke_reg(tracee, SYSARG_RESULT, (word_t) no); set_sysnum(tracee, PR_void); return true;\n'
+        '\t}\n'
+        '\tlong long pos = (nr == PR_pread64 || nr == PR_pwrite64)\n'
+        '\t\t? (long long)(off_t) peek_reg(tracee, CURRENT, SYSARG_4) : *offp;\n'
+        '\tsize_t len = (size_t) peek_reg(tracee, CURRENT, SYSARG_3);\n'
+        '\tword_t buf = peek_reg(tracee, CURRENT, SYSARG_2);\n'
+        '\tif (len == 0) { poke_reg(tracee, SYSARG_RESULT, 0); set_sysnum(tracee, PR_void); return true; }\n'
+        '\tif (len > (8u << 20)) len = 8u << 20;\n'
+        '\tvoid *tmp = malloc(len); if (!tmp) return false;\n'
+        '\tssize_t r;\n'
+        '\tif (nr == PR_read || nr == PR_pread64) {\n'
+        '\t\tr = uksd_read(pos, tmp, len);\n'
+        '\t\tif (r > 0) write_data(tracee, buf, tmp, r);\n'
+        '\t} else {\n'
+        '\t\tif (read_data(tracee, tmp, buf, len) < 0) { free(tmp); poke_reg(tracee, SYSARG_RESULT, (word_t)(long)-EFAULT); set_sysnum(tracee, PR_void); return true; }\n'
+        '\t\tr = uksd_write(pos, tmp, len);\n'
+        '\t}\n'
+        '\tfree(tmp);\n'
+        '\tif (r < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long)-EIO); set_sysnum(tracee, PR_void); return true; }\n'
+        '\tif (nr == PR_read || nr == PR_write) *offp += r;\n'
+        '\tpoke_reg(tracee, SYSARG_RESULT, (word_t) r); set_sysnum(tracee, PR_void); return true;\n'
+        '}\n\n')
+    s = s.replace('int translate_syscall_enter(Tracee *tracee)\n{',
+                  helpers + 'int translate_syscall_enter(Tracee *tracee)\n{', 1)
+    # Inject the dispatch BEFORE notify_extensions (the fake_id0 ENTER hook): vmount
+    # paths must be handled by our redirect first, otherwise fake_id0 intercepts e.g.
+    # a chmod on the FS file and tries to persist ownership as an xattr on the
+    # non-existent host-shadow path -> EPERM (git clone "could not write config file").
+    nx_anchor = '\tstatus = notify_extensions(tracee, SYSCALL_ENTER_START, 0, 0);'
+    must(nx_anchor in s, "enter.c notify_extensions anchor (block)")
+    s = s.replace(nx_anchor,
+                  '\tsyscall_number = get_sysnum(tracee, ORIGINAL);\n'
+                  '\tif (uknl_block_dispatch(tracee, syscall_number))\n\t\treturn 0;\n'
+                  + nx_anchor, 1)
+    wr(EN, s)
+
+SC = ROOT + "/syscall/seccomp.c"; s = rd(SC)
+if 'uk_block_sysnums' not in s:
+    sc_anchor = 'status = merge_filtered_sysnums(tracee->ctx, &filtered_sysnums, proot_sysnums);'
+    must(sc_anchor in s, "seccomp proot_sysnums merge anchor (block)")
+    s = s.replace(sc_anchor, sc_anchor +
+                  '\n\t/* NeoTerm: trap the block-I/O syscalls only when /dev/uksd0 is wanted. */\n'
+                  '\tif (status >= 0 && getenv("UK_BLOCK")) {\n'
+                  '\t\tstatic const FilteredSysnum uk_block_sysnums[] = {\n'
+                  '\t\t\t{ PR_read,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_write,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_pread64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_pwrite64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_lseek,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_close,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_ioctl,\tFILTER_SYSEXIT },\t/* loop device emulation (losetup) */\n'
+                  '\t\t\tFILTERED_SYSNUM_END,\n'
+                  '\t\t};\n'
+                  '\t\tstatus = merge_filtered_sysnums(tracee->ctx, &filtered_sysnums, uk_block_sysnums);\n'
+                  '\t}', 1)
+    wr(SC, s)
+
+# ---- syscall/enter.c: USB-filesystem redirect (/dev/uksd0 mount -> ukfsd over
+#      io.neoterm.fs). The C lives in patches/uknl_fs_redirect.c (lintable on its
+#      own); we inject it verbatim just before translate_syscall_enter (after the
+#      block proxy, so it can reuse uksd_wn/uksd_rn/uksd_rl) and add a dispatch
+#      call right after the block dispatch in the syscall switch. ----
+import os
+EN = ROOT + "/syscall/enter.c"; s = rd(EN)
+if 'uknl_fs_dispatch' not in s:
+    fs_c = rd(os.path.join(os.path.dirname(os.path.abspath(__file__)), "uknl_fs_redirect.c"))
+    must('int translate_syscall_enter(Tracee *tracee)\n{' in s, "enter.c translate_syscall_enter anchor (fs)")
+    s = s.replace('int translate_syscall_enter(Tracee *tracee)\n{',
+                  fs_c + '\nint translate_syscall_enter(Tracee *tracee)\n{', 1)
+    blk_anchor = ('\tif (uknl_block_dispatch(tracee, syscall_number))\n\t\treturn 0;\n'
+                  '\tstatus = notify_extensions(tracee, SYSCALL_ENTER_START, 0, 0);')
+    must(blk_anchor in s, "enter.c block-dispatch anchor (fs)")
+    s = s.replace(blk_anchor,
+                  '\tif (uknl_block_dispatch(tracee, syscall_number))\n\t\treturn 0;\n'
+                  '\tif (uknl_fs_dispatch(tracee, syscall_number))\n\t\treturn 0;\n'
+                  '\tstatus = notify_extensions(tracee, SYSCALL_ENTER_START, 0, 0);', 1)
+    # mount(2) is blocked by Android's parent seccomp (SIGSYS), so it never reaches
+    # translate_syscall_enter — proot's SIGSYS handler calls apply_emulated_mount()
+    # directly (tracee/seccomp.c). Hook that common function so the /dev/uksd0
+    # mount redirect runs on BOTH paths. Forward-declare the hook (it's defined
+    # later, in the injected fs block) and call it at the top of the function.
+    am_anchor = 'void apply_emulated_mount(Tracee *tracee)\n{'
+    must(am_anchor in s, "enter.c apply_emulated_mount anchor (fs)")
+    s = s.replace(am_anchor,
+                  'static bool uknl_fs_mount_hook(Tracee *tracee);\n'
+                  'void apply_emulated_mount(Tracee *tracee)\n{\n'
+                  '\tif (uknl_fs_mount_hook(tracee)) return;', 1)
+    # umount(2)/umount2(2) are SIGSYS-blocked on Android too, handled via
+    # apply_emulated_umount(); hook it the same way so /mnt/usb2 unmount tears
+    # down the vmount + ukfsd connection.
+    aum_anchor = 'void apply_emulated_umount(Tracee *tracee)\n{'
+    must(aum_anchor in s, "enter.c apply_emulated_umount anchor (fs)")
+    s = s.replace(aum_anchor,
+                  'static bool uknl_fs_umount_hook(Tracee *tracee);\n'
+                  'void apply_emulated_umount(Tracee *tracee)\n{\n'
+                  '\tif (uknl_fs_umount_hook(tracee)) return;', 1)
+    wr(EN, s)
+
+# ---- syscall/exit.c: capture the fd returned by a redirected openat so reads/
+#      getdents/lseek on it can be proxied (uknl_fs_open_exit lives in enter.c). ----
+EX = ROOT + "/syscall/exit.c"; s = rd(EX)
+if 'uknl_fs_open_exit' not in s:
+    must('void translate_syscall_exit(Tracee *tracee)\n{' in s, "exit.c translate_syscall_exit anchor (fs)")
+    s = s.replace('void translate_syscall_exit(Tracee *tracee)\n{',
+                  'extern void uknl_fs_open_exit(Tracee *tracee, word_t nr);\n'
+                  'extern void uknl_fs_exit_final(Tracee *tracee, word_t nr);\n\n'
+                  'void translate_syscall_exit(Tracee *tracee)\n{', 1)
+    ex_anchor = '\tsyscall_number = get_sysnum(tracee, ORIGINAL);'
+    must(ex_anchor in s, "exit.c get_sysnum anchor (fs)")
+    s = s.replace(ex_anchor, ex_anchor + '\n\tuknl_fs_open_exit(tracee, syscall_number);', 1)
+    # TEMP DIAG: also call a hook at the VERY END (after SYSCALL_EXIT_END), where a
+    # late fake_id0 result-poke would already be applied — to log the final result
+    # git actually receives (re-derive the sysnum; it isn't in scope on every path).
+    ex_end = ('\tstatus = notify_extensions(tracee, SYSCALL_EXIT_END, 0, 0);\n'
+              '\tif (status < 0)\n'
+              '\t\tpoke_reg(tracee, SYSARG_RESULT, (word_t) status);\n}')
+    must(ex_end in s, "exit.c SYSCALL_EXIT_END tail anchor (fs)")
+    s = s.replace(ex_end, ex_end[:-1] +
+                  '\tuknl_fs_exit_final(tracee, get_sysnum(tracee, ORIGINAL));\n}', 1)
+    wr(EX, s)
+
+# ---- syscall/seccomp.c: trap the fd-based FS syscalls (no path -> not in proot's
+#      default translation set) at sysexit, only when UK_FS is requested. openat is
+#      added too so the exit hook above runs to capture the fd. ----
+SC = ROOT + "/syscall/seccomp.c"; s = rd(SC)
+if 'uk_fs_sysnums' not in s:
+    sc_anchor = 'status = merge_filtered_sysnums(tracee->ctx, &filtered_sysnums, proot_sysnums);'
+    must(sc_anchor in s, "seccomp proot_sysnums merge anchor (fs)")
+    s = s.replace(sc_anchor, sc_anchor +
+                  '\n\t/* NeoTerm: trap fd-based FS syscalls (+ openat exit) when UK_FS is wanted. */\n'
+                  '\tif (status >= 0 && getenv("UK_FS")) {\n'
+                  '\t\tstatic const FilteredSysnum uk_fs_sysnums[] = {\n'
+                  '\t\t\t{ PR_openat,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_openat2,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_creat,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fchmodat2,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_copy_file_range,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_sendfile,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_sendfile64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_read,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_pread64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_lseek,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_close,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_getdents64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_write,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_pwrite64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_ftruncate,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fstat,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_dup,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_dup2,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_dup3,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fsync,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fdatasync,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fchmod,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fchown,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_mmap,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_mmap2,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_msync,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fcntl,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_fcntl64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\tFILTERED_SYSNUM_END,\n'
+                  '\t\t};\n'
+                  '\t\tstatus = merge_filtered_sysnums(tracee->ctx, &filtered_sysnums, uk_fs_sysnums);\n'
+                  '\t}', 1)
+    wr(SC, s)
+
+# ---- path/proc.c: resolve "/proc/self" + "/proc/thread-self" in readlink_proc's
+#      @base to the tracee's pid. fd magic-links reached via a binding whose target
+#      contains "self" (we bind /proc/self/fd -> /dev/fd and /proc/self/fd/{0,1,2}
+#      -> /dev/std{in,out,err}) otherwise hit atoi("self")==0 -> DEFAULT, so PRoot
+#      readlink()s them in its OWN context (wrong pid) -> ENOENT. That breaks shell
+#      process substitution ("grep: /dev/fd/63: No such file or directory"). With the
+#      pid substituted, the /proc/<pid>/fd/<n> branch returns DONT_CANONICALIZE and
+#      the anonymous pipe/socket link is left intact for the tracee to open. ----
+PC = ROOT + "/path/proc.c"; s = rd(PC)
+if 'NeoTerm: normalize "/proc/self"' not in s:
+    pc_anchor = ('\tconst Tracee *known_tracee;\n'
+                 '\tchar proc_path[64]; /* 64 > sizeof("/proc//fd/") + 2 * sizeof(#ULONG_MAX) */\n'
+                 '\tint status;\n'
+                 '\tpid_t pid;\n')
+    must(pc_anchor in s, "proc.c readlink_proc decls anchor")
+    s = s.replace(pc_anchor,
+                  '\tconst Tracee *known_tracee;\n'
+                  '\tchar proc_path[64]; /* 64 > sizeof("/proc//fd/") + 2 * sizeof(#ULONG_MAX) */\n'
+                  '\tchar base_buf[PATH_MAX];\n'
+                  '\tint status;\n'
+                  '\tpid_t pid;\n'
+                  '\n'
+                  '\t/* NeoTerm: normalize "/proc/self" and "/proc/thread-self" in @base to the\n'
+                  '\t * tracee\'s numeric pid, so fd magic-links reached via a binding whose target\n'
+                  '\t * contains "self" (e.g. -b /proc/self/fd:/dev/fd) are handled by the per-pid\n'
+                  '\t * branch below instead of being readlink()\'d in PRoot\'s own context. */\n'
+                  '\t{\n'
+                  '\t\tconst char *rest = NULL;\n'
+                  '\t\tif (strncmp(base, "/proc/self", 10) == 0 && (base[10] == \'/\' || base[10] == \'\\0\'))\n'
+                  '\t\t\trest = base + 10;\n'
+                  '\t\telse if (strncmp(base, "/proc/thread-self", 17) == 0 && (base[17] == \'/\' || base[17] == \'\\0\'))\n'
+                  '\t\t\trest = base + 17;\n'
+                  '\t\tif (rest != NULL) {\n'
+                  '\t\t\tstatus = snprintf(base_buf, sizeof(base_buf), "/proc/%d%s", tracee->pid, rest);\n'
+                  '\t\t\tif (status < 0 || (size_t) status >= sizeof(base_buf))\n'
+                  '\t\t\t\treturn -EPERM;\n'
+                  '\t\t\tbase = base_buf;\n'
+                  '\t\t\tcomparison = compare_paths("/proc", base);\n'
+                  '\t\t}\n'
+                  '\t}\n', 1)
+    wr(PC, s)
+
+# ---- path/binding.c: don't canonicalize "/proc/self" + "/proc/thread-self" host
+#      binding targets. new_binding() runs realpath2() on the host path at startup,
+#      which resolves "self" to PRoot's OWN pid — pinning -b /proc/self/fd:/dev/fd
+#      (and /dev/std{in,out,err}) to PRoot's fds. The guest's /dev/fd/N then maps to
+#      PRoot fd N -> ENOENT, breaking shell process substitution. Store the path
+#      verbatim so "self" stays per-process and resolves to the tracee. ----
+PB = ROOT + "/path/binding.c"; s = rd(PB)
+if 'NeoTerm: keep the per-process "self"' not in s:
+    bind_anchor = ('\tstatus = realpath2(tracee->reconf.tracee, binding->host.path, host, true);\n'
+                   '\tif (status < 0) {\n')
+    must(bind_anchor in s, "binding.c new_binding realpath2 anchor")
+    s = s.replace(bind_anchor,
+                  '\tif (strncmp(host, "/proc/self/", 11) == 0 || strncmp(host, "/proc/thread-self/", 18) == 0) {\n'
+                  '\t\t/* NeoTerm: keep the per-process "self" magic; realpath2 would resolve it\n'
+                  '\t\t * to PRoot\'s OWN pid, pinning -b /proc/self/fd:/dev/fd (and the std* binds)\n'
+                  '\t\t * to PRoot\'s fds. Store verbatim so the tracee resolves "self" to itself;\n'
+                  '\t\t * readlink_proc maps it to the tracee pid during canonicalization. */\n'
+                  '\t\tif (strlen(host) >= PATH_MAX) status = -ENAMETOOLONG;\n'
+                  '\t\telse { strcpy(binding->host.path, host); status = 0; }\n'
+                  '\t} else\n'
+                  '\tstatus = realpath2(tracee->reconf.tracee, binding->host.path, host, true);\n'
+                  '\tif (status < 0) {\n', 1)
+    wr(PB, s)
+
+# ---- teach proot the fchmodat2(2) syscall (sysnum 452, arch-agnostic on the ABIs
+#      we target). glibc routes fchmodat(...,AT_SYMLINK_NOFOLLOW) through it, so
+#      tar/cp -p/rsync use it to restore directory modes; without a PR_ mapping proot
+#      runs it natively against the host shadow (-> ENOENT under a vmount). Append the
+#      abstract sysnum and wire it into each arch's raw->PR_ table so it traps and the
+#      redirect's PR_fchmodat2 handler runs. ----
+SNL = ROOT + "/syscall/sysnums.list"; s = rd(SNL)
+if 'SYSNUM(fchmodat2)' not in s:
+    if not s.endswith('\n'): s += '\n'
+    s += 'SYSNUM(fchmodat2)\n'
+    wr(SNL, s)
+for arch, num in (("x86_64", 452), ("arm64", 452), ("arm", 452), ("i386", 452), ("x32", 452), ("sh4", 452)):
+    AH = ROOT + "/syscall/sysnums-%s.h" % arch
+    try: s = rd(AH)
+    except FileNotFoundError: continue
+    if 'PR_fchmodat2' in s: continue
+    anchor = '[ %d ] = PR_fchmodat,' % {"x86_64":268,"arm64":53,"arm":333,"i386":306,"x32":268,"sh4":306}[arch]
+    if anchor in s:
+        s = s.replace(anchor, anchor + '\n\t[ %d ] = PR_fchmodat2,' % num, 1)
+        wr(AH, s)
 
 print("ALL PATCHES APPLIED OK")

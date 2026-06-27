@@ -213,11 +213,55 @@ object ProotManager {
     }
     bind(args, kmsgBuf.absolutePath, "/dev/kmsg")
 
+    // USB storage: an empty marker file bound onto /dev/uksd0 makes it an openable,
+    // seekable, ls-able node; the proot block proxy (enter.c, UK_BLOCK) overrides its
+    // I/O with SCSI to the app-side BlockBridge. Only when the toggle is on.
+    if (NeoPreference.isUsbStorageEnabled()) {
+      val sysdata = File("${NeoTermPath.PROOT_ROOT_PATH}/sysdata").apply { mkdirs() }
+      val uksd = File(sysdata, "uksd0")
+      if (!uksd.exists()) runCatching { uksd.writeText("") }
+      bind(args, uksd.absolutePath, "/dev/uksd0")
+      // Partition nodes /dev/uksd0p1..p4: a multi-partition device (Raspberry Pi
+      // card: FAT boot + ext4 root) is mounted per-partition. The redirect routes
+      // a mount of /dev/uksd0pN to ukfsd on io.neoterm.fs.pN (one daemon each, see
+      // FsBridge). Bind empty markers so the guest `mount /dev/uksd0pN` resolves;
+      // probing a non-existent partition simply yields a failed mount.
+      for (n in 1..4) {
+        val part = File(sysdata, "uksd0p$n")
+        if (!part.exists()) runCatching { part.writeText("") }
+        bind(args, part.absolutePath, "/dev/uksd0p$n")
+      }
+      // Loop devices: mount a DOWNLOADED IMAGE file like on a real Linux PC
+      // (`losetup -fP disk.img; mount /dev/loop0p2 …` or `mount -o loop[,offset=N]
+      // -t ext4 disk.img …`). The redirect emulates the loop ioctls (no kernel loop
+      // on Android) and backs each loop with the image's host path. Bind markers for
+      // /dev/loop-control, the loop devices and their partition nodes so the guest's
+      // losetup/mount can open them; the redirect intercepts the ioctls/mounts.
+      val mk = { rel: String ->
+        val f = File(sysdata, rel.removePrefix("/dev/"))
+        if (!f.exists()) runCatching { f.writeText("") }
+        bind(args, f.absolutePath, rel)
+      }
+      mk("/dev/loop-control")
+      for (n in 0..7) {
+        mk("/dev/loop$n")
+        for (p in 1..4) mk("/dev/loop${n}p$p")
+      }
+    }
+
     // USB-serial: /dev/ttyUSB* are VIRTUAL hotplug ports, not static binds — the
     // proot open-redirect (enter.c) maps them to the live PTY at open time. Just
     // make sure the app-side control/redirect server is up before the guest opens
     // them. A device can be (un)plugged any time during the session.
     io.neoterm.setup.usbserial.UsbSerialBridge.ensureReady()
+    // USB storage: a pendrive is a VIRTUAL block device /dev/uksd0 — the proot
+    // block proxy (enter.c) routes its I/O to the app-side SCSI bridge. Bring the
+    // control server up; the device may be (un)plugged any time.
+    io.neoterm.setup.usbserial.BlockBridge.ensureReady()
+    // USB storage filesystem: launch the ukfsd daemon (io.neoterm.fs), the real
+    // FS engine that mounts /dev/uksd0 (sectors over io.neoterm.block) and serves
+    // the proot VFS-redirect (UK_FS). Without it, mount(/dev/uksd0) does nothing.
+    io.neoterm.setup.usbserial.FsBridge.ensureReady()
     // Bind a writable fake /sys/class/tty so the guest can readdir it (Android
     // SELinux blocks the real one) — ls / pyserial enumerate the ports there.
     io.neoterm.setup.usbserial.UsbSerialBridge.sysfsBind()?.let { bind(args, it, "/sys/class/tty") }
@@ -356,13 +400,17 @@ object ProotManager {
    * írható könyvtárra állítunk.
    */
   private fun buildHostEnv(): Array<String> {
-    return listOf(
+    val env = mutableListOf(
       "PROOT_TMP_DIR=${NeoTermPath.PROOT_TMP_PATH}",
       "HOME=${NeoTermPath.HOME_PATH}",
       "TERM=xterm-256color",
       "PATH=/system/bin:/system/xbin",
       "ANDROID_ROOT=" + (System.getenv("ANDROID_ROOT") ?: "/system"),
       "ANDROID_DATA=" + (System.getenv("ANDROID_DATA") ?: "/data")
-    ).toTypedArray()
+    )
+    // Only with the storage toggle on: proot then traps read/write/lseek/… for the
+    // /dev/uksd0 block proxy (otherwise those syscalls aren't filtered at all).
+    if (NeoPreference.isUsbStorageEnabled()) { env.add("UK_BLOCK=1"); env.add("UK_FS=1") }
+    return env.toTypedArray()
   }
 }
