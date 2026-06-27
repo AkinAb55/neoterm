@@ -73,104 +73,210 @@ static fused_t *fuse_active(void)
 	return m->fuse;
 }
 
-/* ===== /dev/fuse channel (phase 2) =====
+/* ===== /dev/fuse channel (phase 2, marker + in-proot bridge) =====
  * A guest libfuse daemon does open("/dev/fuse") then mount(2). There is no kernel
- * FUSE it can use, so we make /dev/fuse OURS: on open we substitute the syscall
- * with socket(AF_UNIX, SOCK_SEQPACKET) + a chained connect() to a per-open
- * abstract listener the tracer holds, and return that socket fd to the daemon.
- * The accepted peer (held by the tracer) is the channel `fused` drives. Because
- * it's a real kernel socket, the daemon's read()/write() on /dev/fuse are
- * serviced by the kernel, not proot — so network daemons (sshfs/rclone) run
- * without deadlocking the single-threaded tracer. */
-#ifndef UKNL_FS_REDIRECT_TEST
-#include "syscall/chain.h"   /* register_chained_syscall, force_chain_final_result */
-#include "tracee/mem.h"      /* alloc_mem */
-#endif
-#include <sys/un.h>
+ * FUSE it can use, so we make /dev/fuse OURS — WITHOUT morphing the open syscall
+ * (which is unreliable: changing the syscall number at the ptrace stop hits
+ * proot's sysnum-change workaround). Instead open("/dev/fuse") opens the bound
+ * marker normally and returns a real fd; we then intercept the daemon's
+ * read()/write() on that fd EXACTLY like the /dev/uksd0 block proxy (read/write
+ * are reliably trapped, FILTER_SYSEXIT) and bridge them to the `fused` engine
+ * through an in-proot channel. The accessor side (a path op under the FUSE mount)
+ * and the daemon side (read/write on /dev/fuse) PUMP the event loop for each
+ * other, so the single-threaded tracer never deadlocks. */
 #include <stddef.h>
+#include <time.h>
 
-#define UK_NFCH 16
-/* A connected /dev/fuse channel awaiting its mount(2): keyed by (tgid, fd). */
-struct ukfch { int used; int pid; int fd; int lsock; };
+#define UK_NFCH 8
+#define UK_FUSE_MSGCAP (132 * 1024)   /* >= fused's FUSED_MSGCAP (one FUSE message) */
+/* One FUSE channel: the guest /dev/fuse fd + a single in-flight request/reply
+ * (fused is synchronous: at most one outstanding message each way). */
+struct ukfch {
+	int used, pid, fd;
+	fused_t *eng;
+	unsigned char *req; int reqlen, req_ready;
+	unsigned char *rep; int replen, rep_ready;
+	/* The daemon's read(/dev/fuse) is "parked" (left stopped) when no request is
+	 * pending, so the single-threaded tracer doesn't deadlock; it is resumed by
+	 * fch_send when an accessor produces a request. dvec = iovcnt for a parked
+	 * readv(), or -1 for a plain read(). */
+	Tracee *dmn; word_t dbuf; int dcnt; int dvec; int parked;
+};
 static struct ukfch g_fch[UK_NFCH];
-/* A /dev/fuse open in flight between enter (socket subst) and exit (chain connect). */
-struct ukfopen { int used; int tid; int lsock; word_t addr; int addrlen; };
-static struct ukfopen g_fopen[UK_NFCH];
-static int g_fch_seq = 0;
+static int g_fopen_tid[UK_NFCH];          /* this thread's open() is for /dev/fuse */
+static int ukfs_tgid(int tid);            /* fwd (defined below) */
 
-/* The event-loop pump (injected into tracee/event.c): run other tracees until the
- * FUSE channel has a reply. g_am is global and the pump may serve another
- * accessor's op (which re-points it), so save/restore it across the wait. */
-extern int uknl_pump_until_readable(int fd);
-static void fuse_wait_hook(int fd, void *ctx)
+/* One-step event-loop pump (injected into tracee/event.c): handle one other
+ * tracee's stop. Used to let an accessor wait while the FUSE daemon runs. Returns
+ * 0, or -1 if there are no more children. */
+extern int uknl_pump_one(void);
+/* restart_tracee() + push_specific_regs() are proot core (declared by the headers
+ * enter.c already includes); used to resume a parked daemon read. */
+
+/* A daemon read(/dev/fuse) we left stopped (parked): the event loop must skip its
+ * restart so it stays put until fch_send wakes it. The redirect sets this; the
+ * patched restart sites (event_loop + pump_one) consult uknl_fuse_take_park(). */
+static int g_fuse_park_pid = 0;
+int uknl_fuse_take_park(int pid);
+int uknl_fuse_take_park(int pid)
 {
-	(void) ctx;
+	if (g_fuse_park_pid && g_fuse_park_pid == pid) { g_fuse_park_pid = 0; return 1; }
+	return 0;
+}
+
+/* Scatter `n` bytes of `src` into a (possibly vectored) guest buffer of tracee t.
+ * vec<0: plain buffer at `a2`; vec>=0: `vec` iovecs at `a2`. */
+static void fch_scatter(Tracee *t, word_t a2, int vec, const unsigned char *src, size_t n)
+{
+	if (vec < 0) { if (n) write_data(t, a2, src, n); return; }
+	size_t off = 0;
+	for (int i = 0; i < vec && off < n; i++) {
+		word_t iov[2];
+		if (read_data(t, iov, a2 + (word_t) i * 2 * sizeof(word_t), 2 * sizeof(word_t)) < 0) break;
+		size_t chunk = (size_t) iov[1]; if (chunk > n - off) chunk = n - off;
+		if (chunk) write_data(t, iov[0], src + off, chunk);
+		off += chunk;
+	}
+}
+
+/* Deliver one request to a parked daemon's pending read() and resume it. */
+static void fch_wake_daemon(struct ukfch *ch)
+{
+	if (!ch->parked || !ch->dmn) return;
+	size_t n = (size_t) ch->reqlen; if (n > (size_t) ch->dcnt) n = (size_t) ch->dcnt;
+	fch_scatter(ch->dmn, ch->dbuf, ch->dvec, ch->req, n);
+	poke_reg(ch->dmn, SYSARG_RESULT, (word_t) n);
+	set_sysnum(ch->dmn, PR_void);
+	/* The read's exit-restore copies the result from the MODIFIED snapshot (see
+	 * translate_syscall_exit's PR_void path), so reflect PR_void+result there. */
+	save_current_regs(ch->dmn, MODIFIED);
+	ch->req_ready = 0; ch->parked = 0;
+	Tracee *d = ch->dmn; ch->dmn = NULL;
+	(void) push_specific_regs(d, 1);   /* flush PR_void + result to the tracee */
+	(void) restart_tracee(d, 0);
+}
+
+static struct ukfch *fch_by_fd(int pid, int fd)
+{
+	for (int i = 0; i < UK_NFCH; i++)
+		if (g_fch[i].used && g_fch[i].pid == pid && g_fch[i].fd == fd) return &g_fch[i];
+	return NULL;
+}
+
+/* fused transport: store one request for the daemon; if the daemon is parked in
+ * a blocking read(), deliver it and resume the daemon right away. */
+static int fch_send(void *c, const void *buf, size_t len)
+{
+	struct ukfch *ch = c;
+	if (len > UK_FUSE_MSGCAP) return -EIO;
+	memcpy(ch->req, buf, len); ch->reqlen = (int) len; ch->req_ready = 1; ch->rep_ready = 0;
+	if (ch->parked) fch_wake_daemon(ch);
+	return (int) len;
+}
+/* fused transport: wait for the daemon's write() reply, pumping so it can run.
+ * g_am is global and the pump may serve another op, so save/restore it. */
+static int fch_recv(void *c, void *buf, size_t cap)
+{
+	struct ukfch *ch = c;
 	int saved = g_am;
-	uknl_pump_until_readable(fd);
+	while (!ch->rep_ready) { if (uknl_pump_one() < 0) { g_am = saved; return -EIO; } }
 	g_am = saved;
+	int n = ch->replen; if ((size_t) n > cap) n = (int) cap;
+	memcpy(buf, ch->rep, n); ch->rep_ready = 0;
+	return n;
 }
 
-/* enter: turn open("/dev/fuse") into socket(AF_UNIX,SOCK_SEQPACKET,0); set up the
- * per-open listener + the connect address in tracee memory; remember it so the
- * exit hook can chain the connect once the socket fd is known. Always returns
- * false (the substituted socket() must proceed); on any failure the original
- * open just proceeds (libfuse then fails to get a channel — safe fallback). */
-static bool uknl_fuse_open_enter(Tracee *tracee, word_t nr)
+/* enter: remember this thread is opening /dev/fuse (NO morph; the marker open
+ * proceeds and its real fd is captured at exit). */
+static void uknl_fuse_open_enter(Tracee *tracee)
 {
-	(void) nr;
-	int seq = ++g_fch_seq;
-	struct sockaddr_un sa;
-	char nm[64];
-	memset(&sa, 0, sizeof sa);
-	sa.sun_family = AF_UNIX;
-	int nl = snprintf(nm, sizeof nm, "io.neoterm.fuse.%d.%d", tracee->pid, seq);
-	sa.sun_path[0] = '\0';                                  /* abstract namespace */
-	memcpy(sa.sun_path + 1, nm, nl);
-	int alen = (int)(offsetof(struct sockaddr_un, sun_path) + 1 + nl);
-
-	int ls = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-	if (ls < 0) return false;
-	if (bind(ls, (struct sockaddr *) &sa, alen) < 0 || listen(ls, 1) < 0) { close(ls); return false; }
-
-	word_t mem = alloc_mem(tracee, sizeof(struct sockaddr_un));
-	if (mem == 0 || write_data(tracee, mem, &sa, sizeof(struct sockaddr_un)) < 0) { close(ls); return false; }
-
-	struct ukfopen *o = NULL;
-	for (int i = 0; i < UK_NFCH; i++) if (!g_fopen[i].used) { o = &g_fopen[i]; break; }
-	if (!o) { close(ls); return false; }
-	o->used = 1; o->tid = tracee->pid; o->lsock = ls; o->addr = mem; o->addrlen = alen;
-
-	set_sysnum(tracee, PR_socket);
-	poke_reg(tracee, SYSARG_1, AF_UNIX);
-	poke_reg(tracee, SYSARG_2, SOCK_SEQPACKET);
-	poke_reg(tracee, SYSARG_3, 0);
-	poke_reg(tracee, SYSARG_4, 0); poke_reg(tracee, SYSARG_5, 0); poke_reg(tracee, SYSARG_6, 0);
-	{ char l[96]; snprintf(l, sizeof l, "uk_fs: /dev/fuse open -> socket+connect %s\n", nm); uk_dbg(tracee, l); }
-	return false;
+	for (int i = 0; i < UK_NFCH; i++) if (!g_fopen_tid[i]) { g_fopen_tid[i] = tracee->pid; return; }
 }
-
-/* exit: the substituted socket() has returned its fd; chain connect(fd,addr) and
- * force open()'s result to that fd, then record the (tgid,fd)->listener channel
- * so the mount(2) hook can accept() it. Called from uknl_fs_open_exit. */
+/* exit: bind the returned fd as a FUSE channel + build the fused engine on it. */
 static void uknl_fuse_open_exit(Tracee *tracee)
 {
-	struct ukfopen *o = NULL;
-	for (int i = 0; i < UK_NFCH; i++) if (g_fopen[i].used && g_fopen[i].tid == tracee->pid) { o = &g_fopen[i]; break; }
-	if (!o) return;
-	long m = (long)(int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
-	if (m < 0) { close(o->lsock); o->used = 0; return; }      /* socket() failed */
-	register_chained_syscall(tracee, PR_connect, (word_t) m, o->addr, (word_t) o->addrlen, 0, 0, 0);
-	force_chain_final_result(tracee, (word_t) m);             /* open() returns the socket fd */
-	for (int i = 0; i < UK_NFCH; i++) if (!g_fch[i].used) {
-		g_fch[i].used = 1; g_fch[i].pid = ukfs_tgid(tracee->pid); g_fch[i].fd = (int) m; g_fch[i].lsock = o->lsock;
-		o->lsock = -1; break;
-	}
-	if (o->lsock >= 0) close(o->lsock);                       /* table full: drop */
-	o->used = 0;
+	int slot = -1;
+	for (int i = 0; i < UK_NFCH; i++) if (g_fopen_tid[i] == tracee->pid) { slot = i; break; }
+	if (slot < 0) return;
+	g_fopen_tid[slot] = 0;
+	long fd = (long)(int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	if (fd < 0) return;
+	int pid = ukfs_tgid(tracee->pid);
+	struct ukfch *ch = fch_by_fd(pid, (int) fd);          /* recycle a stale fd number */
+	if (!ch) for (int i = 0; i < UK_NFCH; i++) if (!g_fch[i].used) { ch = &g_fch[i]; break; }
+	if (!ch) return;
+	if (ch->eng) fused_destroy(ch->eng);
+	free(ch->req); free(ch->rep);
+	memset(ch, 0, sizeof *ch);
+	ch->req = malloc(UK_FUSE_MSGCAP); ch->rep = malloc(UK_FUSE_MSGCAP);
+	ch->eng = (ch->req && ch->rep) ? fused_new(-1, 0, 0) : NULL;  /* fd unused: io is the channel */
+	if (!ch->eng) { free(ch->req); free(ch->rep); memset(ch, 0, sizeof *ch); return; }
+	fused_set_io(ch->eng, fch_send, fch_recv, ch);
+	ch->used = 1; ch->pid = pid; ch->fd = (int) fd;
+	{ char l[80]; snprintf(l, sizeof l, "uk_fs: /dev/fuse open fd=%ld pid=%d\n", fd, pid); uk_dbg(tracee, l); }
 }
 
-/* Register a FUSE-backed vmount (target -> fused engine over channel C). */
-static int ukm_register_fuse(const char *tgt, fused_t *eng, int chan)
+/* The daemon's read()/write() on a /dev/fuse channel fd (intercepted like the
+ * block proxy). read delivers the queued request (pumping until one exists);
+ * write deposits the reply. Returns true if handled (PR_void'd + result poked). */
+static bool uknl_fuse_chan_io(Tracee *tracee, word_t nr)
+{
+	int is_read  = (nr == PR_read || nr == PR_pread64 || nr == PR_readv);
+	int is_write = (nr == PR_write || nr == PR_pwrite64 || nr == PR_writev);
+	int is_vec   = (nr == PR_readv || nr == PR_writev);
+	if (!is_read && !is_write) return false;
+	int fd = (int) peek_reg(tracee, CURRENT, SYSARG_1);
+	struct ukfch *ch = fch_by_fd(ukfs_tgid(tracee->pid), fd);
+	if (!ch) return false;
+	word_t a2 = peek_reg(tracee, CURRENT, SYSARG_2);   /* buf, or iov base */
+	size_t a3 = (size_t) peek_reg(tracee, CURRENT, SYSARG_3);   /* count, or iovcnt */
+
+	/* Total capacity across a (possibly vectored) buffer, and a scatter/gather
+	 * helper. iovec is {ptr,len} = 2 words. */
+	if (is_read) {
+		/* compute total readable capacity */
+		size_t cap = 0;
+		if (is_vec) {
+			for (size_t i = 0; i < a3; i++) {
+				word_t iov[2];
+				if (read_data(tracee, iov, a2 + i * 2 * sizeof(word_t), 2 * sizeof(word_t)) < 0) break;
+				cap += (size_t) iov[1];
+			}
+		} else cap = a3;
+		if (ch->req_ready) {
+			size_t n = (size_t) ch->reqlen; if (n > cap) n = cap;
+			fch_scatter(tracee, a2, is_vec ? (int) a3 : -1, ch->req, n);
+			ch->req_ready = 0;
+			poke_reg(tracee, SYSARG_RESULT, (word_t) n); set_sysnum(tracee, PR_void); return true;
+		}
+		/* no request yet: PARK this read until fch_send delivers one. */
+		ch->dmn = tracee; ch->dbuf = a2; ch->dcnt = (int) cap; ch->parked = 1; ch->dvec = is_vec ? (int) a3 : -1;
+		g_fuse_park_pid = tracee->pid;
+		return true;
+	}
+	/* write: the daemon's reply — gather into ch->rep */
+	size_t total = 0;
+	if (is_vec) {
+		for (size_t i = 0; i < a3; i++) {
+			word_t iov[2];
+			if (read_data(tracee, iov, a2 + i * 2 * sizeof(word_t), 2 * sizeof(word_t)) < 0) break;
+			size_t chunk = (size_t) iov[1]; if (chunk > UK_FUSE_MSGCAP - total) chunk = UK_FUSE_MSGCAP - total;
+			if (chunk) read_data(tracee, ch->rep + total, iov[0], chunk);
+			total += chunk;
+		}
+	} else {
+		total = a3; if (total > UK_FUSE_MSGCAP) total = UK_FUSE_MSGCAP;
+		if (read_data(tracee, ch->rep, a2, total) < 0) { poke_reg(tracee, SYSARG_RESULT, (word_t)(long) -EFAULT); set_sysnum(tracee, PR_void); return true; }
+	}
+	ch->replen = (int) total; ch->rep_ready = 1;
+	/* return the count the daemon asked to write (its full reply) */
+	{ size_t reported = is_vec ? total : a3; poke_reg(tracee, SYSARG_RESULT, (word_t) reported); }
+	set_sysnum(tracee, PR_void); return true;
+}
+
+/* Register a FUSE-backed vmount (target -> the channel's fused engine). chanidx
+ * links the mount to its channel so unmount can free both. */
+static int ukm_register_fuse(const char *tgt, fused_t *eng, int chanidx)
 {
 	int slot = -1;
 	for (int i = 0; i < UK_MAXM; i++) if (g_m[i].used && strcmp(g_m[i].vmount, tgt) == 0) { slot = i; break; }
@@ -179,15 +285,14 @@ static int ukm_register_fuse(const char *tgt, fused_t *eng, int chan)
 	if (!g_m[slot].used) g_nm++;
 	memset(&g_m[slot], 0, sizeof g_m[slot]);
 	g_m[slot].used = 1; g_m[slot].sock = -1;
-	g_m[slot].fuse = eng; g_m[slot].fuse_chan = chan; g_m[slot].fuse_inited = 0;
+	g_m[slot].fuse = eng; g_m[slot].fuse_chan = chanidx; g_m[slot].fuse_inited = 0;
 	snprintf(g_m[slot].vmount, sizeof g_m[slot].vmount, "%s", tgt);
 	return slot;
 }
 
 /* mount(2) of a FUSE filesystem: fstype "fuse"/"fuse.*"/"fuseblk", options carry
- * "fd=N" (the daemon's /dev/fuse fd). Accept that channel, build a fused engine,
- * register the vmount. Returns true if handled. FUSE_INIT is deferred to first
- * access (the daemon is still inside mount(2) here and not yet reading). */
+ * "fd=N" (the daemon's /dev/fuse fd). Bind that channel's engine as the vmount.
+ * FUSE_INIT is deferred to first access (the daemon is still inside mount(2)). */
 static bool uknl_fuse_mount(Tracee *tracee)
 {
 	char fstype[64];
@@ -207,22 +312,12 @@ static bool uknl_fuse_mount(Tracee *tracee)
 	char tgt[PATH_MAX];
 	if (get_sysarg_path(tracee, tgt, SYSARG_2) < 0) return false;
 
-	int tg = ukfs_tgid(tracee->pid);
-	struct ukfch *ch = NULL;
-	for (int i = 0; i < UK_NFCH; i++) if (g_fch[i].used && g_fch[i].pid == tg && g_fch[i].fd == fdN) { ch = &g_fch[i]; break; }
-	if (!ch) { char l[160]; snprintf(l, sizeof l, "uk_fs: fuse mount fd=%d on '%s' but no channel\n", fdN, tgt); uk_dbg(tracee, l); return false; }
-
-	int C = accept(ch->lsock, NULL, NULL);
-	if (C < 0) { uk_dbg(tracee, "uk_fs: fuse accept failed\n"); return false; }
-	close(ch->lsock); ch->used = 0;
-
-	fused_t *eng = fused_new(C, 0, 0);
-	if (eng) fused_set_wait(eng, fuse_wait_hook, NULL);   /* pump the loop, not block */
-	if (!eng || ukm_register_fuse(tgt, eng, C) < 0) { if (eng) fused_destroy(eng); close(C); return false; }
-	{ char l[PATH_MAX + 64]; snprintf(l, sizeof l, "uk_fs: FUSE mount '%s' fd=%d chan=%d\n", tgt, fdN, C); uk_dbg(tracee, l); }
+	struct ukfch *ch = fch_by_fd(ukfs_tgid(tracee->pid), fdN);
+	if (!ch || !ch->eng) { char l[160]; snprintf(l, sizeof l, "uk_fs: fuse mount fd=%d '%s' no channel\n", fdN, tgt); uk_dbg(tracee, l); return false; }
+	if (ukm_register_fuse(tgt, ch->eng, (int)(ch - g_fch)) < 0) return false;
+	{ char l[PATH_MAX + 64]; snprintf(l, sizeof l, "uk_fs: FUSE mount '%s' fd=%d\n", tgt, fdN); uk_dbg(tracee, l); }
 	return true;
 }
-static int ukfs_tgid(int tid);   /* fwd (defined below) */
 
 /* Pool of ukfsd daemon sockets (FsBridge launches one ukfsd per name). ukfsd is
  * single-mount per process, so each live mount (a USB partition OR a loop image)
@@ -277,11 +372,15 @@ static void ukfs_sdrop(void)
 static void ukfs_unmount_slot(int i)
 {
 	if (i < 0 || i >= UK_MAXM || !g_m[i].used) return;
-	/* FUSE-backed mount: tear down the fused engine (sends DESTROY) + close the
-	 * channel; the daemon then sees EOF on /dev/fuse and exits. */
+	/* FUSE-backed mount: tear down the fused engine + free its in-proot channel
+	 * (req/rep buffers). The channel's guest fd is the daemon's; we don't own it. */
 	if (g_m[i].fuse) {
 		fused_destroy(g_m[i].fuse);
-		if (g_m[i].fuse_chan >= 0) close(g_m[i].fuse_chan);
+		int ci = g_m[i].fuse_chan;
+		if (ci >= 0 && ci < UK_NFCH && g_fch[ci].used && g_fch[ci].eng == g_m[i].fuse) {
+			free(g_fch[ci].req); free(g_fch[ci].rep);
+			memset(&g_fch[ci], 0, sizeof g_fch[ci]);
+		}
 		memset(&g_m[i], 0, sizeof g_m[i]); g_m[i].sock = -1;
 		if (g_nm > 0) g_nm--;
 		return;
@@ -1589,15 +1688,19 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 
 	if (!uk_fs_on()) return false;
 
-	/* open("/dev/fuse") by a guest libfuse daemon -> substitute socket()+connect()
-	 * so the daemon's channel is ours (phase 2). Before the g_nm guard: the daemon
-	 * opens /dev/fuse before any mount exists. */
+	/* The FUSE daemon's read()/write() on its /dev/fuse channel fd -> bridge to the
+	 * fused engine (before the g_nm guard: the channel exists from open, pre-mount). */
+	if (uknl_fuse_chan_io(tracee, nr)) return true;
+
+	/* open("/dev/fuse") by a guest libfuse daemon: note the thread so the exit hook
+	 * captures the returned fd as a FUSE channel. NO morph — the marker open just
+	 * proceeds. Before the g_nm guard: the daemon opens /dev/fuse before any mount. */
 	if (nr == PR_openat || nr == PR_openat2 || nr == PR_open || nr == PR_creat) {
 		int patharg = (nr == PR_open || nr == PR_creat) ? SYSARG_1 : SYSARG_2;
 		word_t pa = peek_reg(tracee, CURRENT, patharg);
 		char gp[PATH_MAX];
 		if (pa && read_string(tracee, gp, pa, sizeof gp) > 0 && strcmp(gp, "/dev/fuse") == 0)
-			return uknl_fuse_open_enter(tracee, nr);   /* returns false: socket() proceeds */
+			uknl_fuse_open_enter(tracee);   /* fall through: let the open proceed */
 	}
 
 	/* loop device ioctls (losetup / mount -o loop) — handled before the g_nm guard
@@ -2411,7 +2514,8 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 void uknl_fs_exit_final(Tracee *tracee, word_t nr);
 void uknl_fs_exit_final(Tracee *tracee, word_t nr)
 {
-	if (!uk_fs_on() || g_nm == 0) return;
+	if (!uk_fs_on()) return;
+	if (g_nm == 0) return;
 	long want;
 	if (pend_res_take(tracee->pid, nr, &want)) {
 		int cur = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT);

@@ -52,22 +52,43 @@ struct fused {
 	struct fnode *nodes;
 	size_t        nnodes, capnodes;
 	unsigned char *msg;       /* reusable I/O buffer (FUSED_MSGCAP) */
-	void (*wait_readable)(int fd, void *ctx);   /* pump-the-loop hook (proot), or NULL */
-	void  *wait_ctx;
+	int  (*io_send)(void *ctx, const void *buf, size_t len);   /* transport (proot), or NULL */
+	int  (*io_recv)(void *ctx, void *buf, size_t cap);
+	void  *io_ctx;
 };
 
-void fused_set_wait(fused_t *f, void (*wait_readable)(int fd, void *ctx), void *ctx)
+void fused_set_io(fused_t *f,
+                  int (*send)(void *ctx, const void *buf, size_t len),
+                  int (*recv)(void *ctx, void *buf, size_t cap),
+                  void *ctx)
 {
 	if (!f) return;
-	f->wait_readable = wait_readable;
-	f->wait_ctx = ctx;
+	f->io_send = send;
+	f->io_recv = recv;
+	f->io_ctx = ctx;
 }
 
-/* Block until the channel has a reply, pumping the proot event loop if a hook is
- * set so the (ptraced) daemon can actually run and produce it. */
-static void chan_wait(fused_t *f)
+/* Send one request message (header+body, already in buf). 0 on success, -errno. */
+static int tx_send(fused_t *f, const void *buf, size_t len)
 {
-	if (f->wait_readable) f->wait_readable(f->fd, f->wait_ctx);
+	if (f->io_send) { int r = f->io_send(f->io_ctx, buf, len); return r < 0 ? r : 0; }
+	for (;;) {
+		ssize_t w = write(f->fd, buf, len);
+		if (w < 0) { if (errno == EINTR) continue; return -errno; }
+		if ((size_t) w != len) return -EIO;
+		return 0;
+	}
+}
+
+/* Receive one reply message into buf (<= cap). Returns bytes, or -errno. */
+static ssize_t tx_recv(fused_t *f, void *buf, size_t cap)
+{
+	if (f->io_recv) return f->io_recv(f->io_ctx, buf, cap);
+	for (;;) {
+		ssize_t r = read(f->fd, buf, cap);
+		if (r < 0) { if (errno == EINTR) continue; return -errno; }
+		return r;
+	}
 }
 
 /* ---- low-level request/reply ---- */
@@ -96,20 +117,10 @@ static int xfer(fused_t *f, uint32_t opcode, uint64_t nodeid,
 	memcpy(f->msg, &h, sizeof h);
 	if (inlen) memcpy(f->msg + sizeof h, in, inlen);
 
-	for (;;) {
-		ssize_t w = write(f->fd, f->msg, total);
-		if (w < 0) { if (errno == EINTR) continue; return -errno; }
-		if ((size_t) w != total) return -EIO;
-		break;
-	}
-
-	chan_wait(f);
-	ssize_t r;
-	for (;;) {
-		r = read(f->fd, f->msg, FUSED_MSGCAP);
-		if (r < 0) { if (errno == EINTR) continue; return -errno; }
-		break;
-	}
+	int sr = tx_send(f, f->msg, total);
+	if (sr < 0) return sr;
+	ssize_t r = tx_recv(f, f->msg, FUSED_MSGCAP);
+	if (r < 0) return (int) r;
 	if ((size_t) r < sizeof(struct fuse_out_header)) return -EIO;
 
 	struct fuse_out_header oh;
@@ -144,11 +155,7 @@ static void xfer_noreply(fused_t *f, uint32_t opcode, uint64_t nodeid,
 	h.uid = f->uid; h.gid = f->gid; h.pid = f->pid;
 	memcpy(f->msg, &h, sizeof h);
 	if (inlen) memcpy(f->msg + sizeof h, in, inlen);
-	for (;;) {
-		ssize_t w = write(f->fd, f->msg, total);
-		if (w < 0 && errno == EINTR) continue;
-		break;
-	}
+	(void) tx_send(f, f->msg, total);
 }
 
 /* Variant that hands back a pointer INTO the reusable buffer (for variable-size
@@ -171,19 +178,10 @@ static int xfer_ref(fused_t *f, uint32_t opcode, uint64_t nodeid,
 	memcpy(f->msg, &h, sizeof h);
 	if (inlen) memcpy(f->msg + sizeof h, in, inlen);
 
-	for (;;) {
-		ssize_t w = write(f->fd, f->msg, total);
-		if (w < 0) { if (errno == EINTR) continue; return -errno; }
-		if ((size_t) w != total) return -EIO;
-		break;
-	}
-	chan_wait(f);
-	ssize_t r;
-	for (;;) {
-		r = read(f->fd, f->msg, FUSED_MSGCAP);
-		if (r < 0) { if (errno == EINTR) continue; return -errno; }
-		break;
-	}
+	int sr = tx_send(f, f->msg, total);
+	if (sr < 0) return sr;
+	ssize_t r = tx_recv(f, f->msg, FUSED_MSGCAP);
+	if (r < 0) return (int) r;
 	if ((size_t) r < sizeof(struct fuse_out_header)) return -EIO;
 	struct fuse_out_header oh;
 	memcpy(&oh, f->msg, sizeof oh);
@@ -228,6 +226,36 @@ static void cache_drop(fused_t *f, const char *path)
 		}
 }
 
+/* Canonicalize a mount-relative path: collapse "" / "." segments and resolve
+ * ".." lexically (like the kernel — a libfuse daemon never sees a LOOKUP for "."
+ * or "..", so we must never send one). Result is absolute, no trailing slash
+ * ("/" for the root). */
+static void normpath(const char *in, char *out, size_t cap)
+{
+	const char *seg[256];
+	int segn[256];
+	int n = 0;
+	const char *p = in;
+	while (*p) {
+		while (*p == '/') p++;
+		if (!*p) break;
+		const char *s = p;
+		while (*p && *p != '/') p++;
+		int len = (int)(p - s);
+		if (len == 1 && s[0] == '.') continue;
+		if (len == 2 && s[0] == '.' && s[1] == '.') { if (n > 0) n--; continue; }
+		if (n < 256) { seg[n] = s; segn[n] = len; n++; }
+	}
+	if (n == 0) { snprintf(out, cap, "/"); return; }
+	size_t o = 0;
+	for (int i = 0; i < n && o + 1 < cap; i++) {
+		out[o++] = '/';
+		int len = segn[i];
+		for (int k = 0; k < len && o + 1 < cap; k++) out[o++] = seg[i][k];
+	}
+	out[o] = '\0';
+}
+
 /* dir/base split: "/a/b" -> dir "/a", base "b"; "/a" -> dir "/", base "a". */
 static void split_path(const char *path, char *dir, size_t dcap, char *base, size_t bcap)
 {
@@ -266,8 +294,10 @@ static int do_lookup(fused_t *f, uint64_t parent, const char *name, struct fuse_
 }
 
 /* Resolve a mount-relative path to a nodeid (via cache + LOOKUP walk). */
-static int resolve(fused_t *f, const char *path, uint64_t *out)
+static int resolve(fused_t *f, const char *rawpath, uint64_t *out)
 {
+	char path[4096];
+	normpath(rawpath, path, sizeof path);     /* collapse . / .. — never LOOKUP them */
 	if (path[0] == '/' && path[1] == '\0') { *out = FUSE_ROOT_ID; return 0; }
 	uint64_t c = cache_get(f, path);
 	if (c) { *out = c; return 0; }
@@ -483,15 +513,10 @@ int fused_write(fused_t *f, const char *path, uint64_t fh, const void *buf, size
 	memcpy(f->msg, &h, sizeof h);
 	memcpy(f->msg + sizeof h, in, sizeof wi);
 	memcpy(f->msg + sizeof h + sizeof wi, buf, size);
-	for (;;) {
-		ssize_t w = write(f->fd, f->msg, h.len);
-		if (w < 0) { if (errno == EINTR) continue; return -errno; }
-		if ((size_t) w != h.len) return -EIO;
-		break;
-	}
-	chan_wait(f);
-	ssize_t r;
-	for (;;) { r = read(f->fd, f->msg, FUSED_MSGCAP); if (r < 0) { if (errno == EINTR) continue; return -errno; } break; }
+	int sr = tx_send(f, f->msg, h.len);
+	if (sr < 0) return sr;
+	ssize_t r = tx_recv(f, f->msg, FUSED_MSGCAP);
+	if (r < 0) return (int) r;
 	if ((size_t) r < sizeof(struct fuse_out_header)) return -EIO;
 	struct fuse_out_header oh; memcpy(&oh, f->msg, sizeof oh);
 	if (oh.error) return oh.error < 0 ? oh.error : -oh.error;

@@ -33,13 +33,20 @@ typedef struct fused fused_t;
  * daemon may use them; pass the guest's effective ids). Returns NULL on OOM. */
 fused_t *fused_new(int chan_fd, uint32_t uid, uint32_t gid);
 
-/* Install a "wait until the channel fd is readable" callback. Under proot the
- * FUSE daemon is a ptraced tracee whose channel read()/write() trap at sysexit,
- * so the single-threaded tracer must NOT block in read(channel) — it has to pump
- * the event loop (servicing the daemon's stops) until a reply lands. This hook
- * lets the redirect supply that pump; with no hook (e.g. the host test, where the
- * daemon is an ordinary process) fused just blocks in read(). */
-void fused_set_wait(fused_t *f, void (*wait_readable)(int fd, void *ctx), void *ctx);
+/* Transport override. By default fused does write()/read() on the channel fd it
+ * was created with (used by the host test, where the daemon is an ordinary
+ * process on the other end of a socketpair). Under proot the daemon is a ptraced
+ * tracee that opened /dev/fuse (a bound marker): its read()/write() on that fd
+ * are intercepted by the redirect, so there is no real socket. The redirect
+ * supplies send/recv that move one FUSE message through an in-proot channel,
+ * pumping the event loop so the daemon can run and produce the reply.
+ *   send(ctx, buf, len)   -> deliver one request to the daemon; >=0 ok / -errno
+ *   recv(ctx, buf, cap)   -> return one reply (bytes) / -errno
+ */
+void fused_set_io(fused_t *f,
+                  int (*send)(void *ctx, const void *buf, size_t len),
+                  int (*recv)(void *ctx, void *buf, size_t cap),
+                  void *ctx);
 
 /* FUSE_INIT handshake: negotiate version/flags with the daemon. Must be called
  * once before any op. Returns 0 on success, negative errno on failure. */

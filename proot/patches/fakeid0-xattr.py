@@ -966,34 +966,43 @@ if 'uknl_fs_dispatch' not in s:
 #      particular) until the reply lands on the channel. It mirrors event_loop()'s
 #      per-stop handling exactly. ----
 EV = ROOT + "/tracee/event.c"; s = rd(EV)
-if 'uknl_pump_until_readable' not in s:
+if 'uknl_pump_one' not in s:
     must('int event_loop()\n{' in s, "event.c event_loop anchor (fuse pump)")
     pump = (
-        '#include <poll.h>\n'
-        '/* NeoTerm FUSE: pump the tracer event loop until @fd is readable. Services\n'
-        ' * every other tracee stop (esp. the FUSE daemon producing the reply) exactly\n'
-        ' * like event_loop() does. The current tracee is mid-handling (not restarted),\n'
-        ' * so waitpid never returns it here. Returns 0 (readable) or -1 (no children). */\n'
-        'int uknl_pump_until_readable(int fd);\n'
-        'int uknl_pump_until_readable(int fd)\n{\n'
-        '\tstruct pollfd pfd;\n'
+        'extern int uknl_fuse_take_park(int pid);   /* FUSE: park a daemon read */\n'
+        '/* NeoTerm FUSE: handle ONE other tracee stop, exactly like the body of\n'
+        ' * event_loop(). The current tracee is mid-handling (not restarted), so\n'
+        ' * waitpid never returns it here. Used so an accessor waiting on a FUSE reply\n'
+        ' * lets the daemon run (and vice-versa). Returns 0, or -1 if no children. */\n'
+        'int uknl_pump_one(void);\n'
+        'int uknl_pump_one(void)\n{\n'
+        '\tint tracee_status;\n'
+        '\tpid_t pid;\n'
+        '\tfree_terminated_tracees();\n'
         '\tfor (;;) {\n'
-        '\t\tpfd.fd = fd; pfd.events = POLLIN; pfd.revents = 0;\n'
-        '\t\tif (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)))\n'
-        '\t\t\treturn 0;\n'
-        '\t\tint tracee_status;\n'
-        '\t\tpid_t pid = waitpid(-1, &tracee_status, __WALL);\n'
+        '\t\tpid = waitpid(-1, &tracee_status, __WALL);\n'
         '\t\tif (pid < 0) { if (errno == EINTR) continue; return -1; }\n'
-        '\t\tTracee *t = get_tracee(NULL, pid, true);\n'
-        '\t\tif (t == NULL) continue;\n'
-        '\t\tt->running = false;\n'
-        '\t\tif (notify_extensions(t, NEW_STATUS, tracee_status, 0) != 0) continue;\n'
-        '\t\tif (t->as_ptracee.ptracer != NULL) { if (handle_ptracee_event(t, tracee_status)) continue; }\n'
-        '\t\tint signal = handle_tracee_event(t, tracee_status);\n'
-        '\t\t(void) restart_tracee(t, signal);\n'
-        '\t}\n}\n\n'
+        '\t\tbreak;\n'
+        '\t}\n'
+        '\tTracee *t = get_tracee(NULL, pid, true);\n'
+        '\tif (t == NULL) return 0;\n'
+        '\tt->running = false;\n'
+        '\tif (notify_extensions(t, NEW_STATUS, tracee_status, 0) != 0) return 0;\n'
+        '\tif (t->as_ptracee.ptracer != NULL) { if (handle_ptracee_event(t, tracee_status)) return 0; }\n'
+        '\tint signal = handle_tracee_event(t, tracee_status);\n'
+        '\tif (uknl_fuse_take_park((int) pid)) return 0;   /* parked daemon read: leave stopped */\n'
+        '\t(void) restart_tracee(t, signal);\n'
+        '\treturn 0;\n}\n\n'
     )
     s = s.replace('int event_loop()\n{', pump + 'int event_loop()\n{', 1)
+    # Main loop: skip restart for a parked FUSE daemon read (resumed later by fch_send).
+    ml_anchor = ('\t\tsignal = handle_tracee_event(tracee, tracee_status);\n'
+                 '\t\t(void) restart_tracee(tracee, signal);')
+    must(ml_anchor in s, "event.c main-loop restart anchor (fuse park)")
+    s = s.replace(ml_anchor,
+                  '\t\tsignal = handle_tracee_event(tracee, tracee_status);\n'
+                  '\t\tif (uknl_fuse_take_park((int) pid)) continue;   /* parked FUSE daemon read */\n'
+                  '\t\t(void) restart_tracee(tracee, signal);', 1)
     wr(EV, s)
 
 # ---- syscall/exit.c: capture the fd returned by a redirected openat so reads/
@@ -1039,6 +1048,8 @@ if 'uk_fs_sysnums' not in s:
                   '\t\t\t{ PR_sendfile64,\tFILTER_SYSEXIT },\n'
                   '\t\t\t{ PR_read,\tFILTER_SYSEXIT },\n'
                   '\t\t\t{ PR_pread64,\tFILTER_SYSEXIT },\n'
+                  '\t\t\t{ PR_readv,\tFILTER_SYSEXIT },\t/* FUSE daemon channel I/O */\n'
+                  '\t\t\t{ PR_writev,\tFILTER_SYSEXIT },\t/* libfuse replies via writev */\n'
                   '\t\t\t{ PR_lseek,\tFILTER_SYSEXIT },\n'
                   '\t\t\t{ PR_close,\tFILTER_SYSEXIT },\n'
                   '\t\t\t{ PR_getdents64,\tFILTER_SYSEXIT },\n'
