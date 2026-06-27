@@ -293,35 +293,68 @@ static int do_lookup(fused_t *f, uint64_t parent, const char *name, struct fuse_
 	return 0;
 }
 
-/* Resolve a mount-relative path to a nodeid (via cache + LOOKUP walk). */
-static int resolve(fused_t *f, const char *rawpath, uint64_t *out)
+/* Resolve a mount-relative path to a nodeid, FOLLOWING symlinks like the kernel:
+ * the kernel FUSE driver resolves symlinks (READLINK + restart) before sending
+ * OPEN/GETATTR, so a libfuse daemon never gets an OPEN on a symlink node (it
+ * errors). follow_final controls whether the LAST component is dereferenced
+ * (1 for getattr/open/read..., 0 for readlink/lstat). 0/-errno. */
+static int resolve_x(fused_t *f, const char *rawpath, uint64_t *out, int follow_final)
 {
 	char path[4096];
-	normpath(rawpath, path, sizeof path);     /* collapse . / .. — never LOOKUP them */
+	normpath(rawpath, path, sizeof path);
+	int loops = 0;
+restart:
+	if (++loops > 40) return -ELOOP;
 	if (path[0] == '/' && path[1] == '\0') { *out = FUSE_ROOT_ID; return 0; }
-	uint64_t c = cache_get(f, path);
-	if (c) { *out = c; return 0; }
 
-	char dir[4096], base[256];
-	split_path(path, dir, sizeof dir, base, sizeof base);
-	uint64_t parent;
-	int rc = resolve(f, dir, &parent);
-	if (rc) return rc;
+	uint64_t cur = FUSE_ROOT_ID;
+	char curdir[4096]; curdir[0] = '/'; curdir[1] = '\0';   /* dir containing `cur`'s child */
+	const char *p = path + 1;                               /* skip leading '/' */
+	while (*p) {
+		char comp[256]; int ci = 0;
+		while (*p && *p != '/' && ci < (int) sizeof comp - 1) comp[ci++] = *p++;
+		comp[ci] = '\0';
+		int is_last = (*p == '\0');
+		while (*p == '/') p++;
 
-	struct fuse_entry_out eo;
-	rc = do_lookup(f, parent, base, &eo);
-	if (rc) return rc;
-	cache_put(f, path, eo.nodeid);
-	*out = eo.nodeid;
+		struct fuse_entry_out eo;
+		int rc = do_lookup(f, cur, comp, &eo);
+		if (rc) return rc;
+
+		/* cache the resolved child path -> nodeid (for FORGET at destroy) */
+		char child[4096];
+		if (curdir[1] == '\0') snprintf(child, sizeof child, "/%s", comp);
+		else snprintf(child, sizeof child, "%s/%s", curdir, comp);
+		cache_put(f, child, eo.nodeid);
+
+		if ((eo.attr.mode & 0170000) == 0120000 /*S_IFLNK*/ && (!is_last || follow_final)) {
+			const unsigned char *body; size_t bl;
+			rc = xfer_ref(f, FUSE_READLINK, eo.nodeid, NULL, 0, &body, &bl);
+			if (rc) return rc;
+			char tgt[4096]; size_t tl = bl < sizeof tgt - 1 ? bl : sizeof tgt - 1;
+			memcpy(tgt, body, tl); tgt[tl] = '\0';
+			char newp[8192];
+			if (tgt[0] == '/') snprintf(newp, sizeof newp, "%s/%s", tgt, p);
+			else snprintf(newp, sizeof newp, "%s/%s/%s", curdir, tgt, p);
+			normpath(newp, path, sizeof path);
+			goto restart;
+		}
+		cur = eo.nodeid;
+		snprintf(curdir, sizeof curdir, "%s", child);
+	}
+	*out = cur;
 	return 0;
 }
+
+static int resolve(fused_t *f, const char *path, uint64_t *out)
+{ return resolve_x(f, path, out, 1); }
 
 /* Resolve a path's PARENT nodeid + give back the basename (for create/unlink). */
 static int resolve_parent(fused_t *f, const char *path, uint64_t *parent, char *base, size_t bcap)
 {
 	char dir[4096];
 	split_path(path, dir, sizeof dir, base, bcap);
-	return resolve(f, dir, parent);
+	return resolve(f, dir, parent);   /* parent dir is followed (symlinked dirs ok) */
 }
 
 /* ---- lifecycle ---- */
@@ -402,7 +435,7 @@ int fused_getattr(fused_t *f, const char *path, struct stat *st)
 int fused_readlink(fused_t *f, const char *path, char *buf, size_t cap)
 {
 	uint64_t nid;
-	int rc = resolve(f, path, &nid);
+	int rc = resolve_x(f, path, &nid, 0);   /* don't deref the final symlink */
 	if (rc) return rc;
 	const unsigned char *body; size_t bl;
 	rc = xfer_ref(f, FUSE_READLINK, nid, NULL, 0, &body, &bl);
