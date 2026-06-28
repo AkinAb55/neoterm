@@ -301,6 +301,22 @@ object BlockBridge {
   private val wbBuf = java.io.ByteArrayOutputStream()
   private val WB_MAX = 4 * 1024 * 1024
 
+  /** Set when a write touched the partition-table region (first/last 1 MB: MBR +
+   *  GPT primary + GPT backup), so the /sys/block tree is re-read on the next
+   *  FLUSH — otherwise lsblk/rpi-imager show stale partitions after writing an
+   *  image, until the drive is physically re-plugged. */
+  @Volatile private var ptDirty = false
+  private val PT_WINDOW = 1L * 1024 * 1024
+  private fun notePtWrite(off: Long, len: Int) {
+    if (totalBytes <= 0L) return
+    if (off < PT_WINDOW || off + len > totalBytes - PT_WINDOW) ptDirty = true
+  }
+  private fun refreshSysfsIfPtChanged() {
+    if (!ptDirty) return
+    ptDirty = false
+    runCatching { BlockSysfsBridge.refresh(totalBytes, sectorSize) { o, l -> readAt(o, l) } }
+  }
+
   private fun wbFlush(): Boolean {
     if (wbStart < 0 || wbBuf.size() == 0) { wbStart = -1; wbBuf.reset(); return true }
     val data = wbBuf.toByteArray(); val at = wbStart
@@ -310,6 +326,7 @@ object BlockBridge {
 
   private fun writeAt(off: Long, data: ByteArray): Boolean {
     if (off < 0 || data.isEmpty() || off + data.size > totalBytes) return false
+    notePtWrite(off, data.size)
     if (wbStart >= 0 && off != wbStart + wbBuf.size()) { if (!wbFlush()) return false }
     if (wbStart < 0) wbStart = off
     wbBuf.write(data)
@@ -348,7 +365,7 @@ object BlockBridge {
               reply(out, if (data != null && writeAt(off, data)) "OK\n" else "ERR\n")
             }
           }
-          "FLUSH" -> { wbFlush(); runCatching { scsi(byteArrayOf(0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0), null, 0) }; reply(out, "OK\n") }
+          "FLUSH" -> { wbFlush(); runCatching { scsi(byteArrayOf(0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0), null, 0) }; reply(out, "OK\n"); refreshSysfsIfPtChanged() }
           else -> reply(out, "ERR\n")
         }
       }
