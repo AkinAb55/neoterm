@@ -972,6 +972,7 @@ if 'uknl_pump_one' not in s:
         'extern int uknl_fuse_take_park(int pid);   /* FUSE: park a daemon read */\n'
         'extern void uknl_fuse_drain_parked(void);  /* FUSE: EOF all parked daemons */\n'
         'extern void uknl_fuse_reap_signaled(void); /* FUSE: EOF signalled parked daemons */\n'
+        'extern void uknl_fuse_owner_gone(int pid);  /* FUSE: app exited -> drop its mount */\n'
         'extern int uknl_fuse_is_daemon(int pid);   /* FUSE: pid owns a channel? */\n'
         '\n'
         '/* Deferred tracee stops. While the re-entrant FUSE pump (uknl_pump_one) is\n'
@@ -1046,7 +1047,7 @@ if 'uknl_pump_one' not in s:
                   '\t\t * pending fatal signal, so its mount is torn down instead of leaking. */\n'
                   '\t\tif (WIFEXITED(tracee_status) || WIFSIGNALED(tracee_status)) {\n'
                   '\t\t\tif (tracee->vpid == 1) uknl_fuse_drain_parked();\n'
-                  '\t\t\telse uknl_fuse_reap_signaled();\n'
+                  '\t\t\telse { uknl_fuse_owner_gone((int) pid); uknl_fuse_reap_signaled(); }\n'
                   '\t\t}\n'
                   '\t\tif (uknl_fuse_take_park((int) pid)) continue;   /* parked FUSE daemon read */\n'
                   '\t\t(void) restart_tracee(tracee, signal);', 1)

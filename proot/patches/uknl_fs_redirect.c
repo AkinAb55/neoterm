@@ -28,6 +28,8 @@ static void uk_dbg_line(const char *line);
 static void uk_dbg(Tracee *tracee, const char *line);   /* fwd (defined below) */
 static int  ukfs_tgid(int tid);                          /* fwd (defined below) */
 static void ukfs_canon(const char *in, char *out, size_t osz);  /* fwd (defined below) */
+static void ukfs_unmount_slot(int i);                           /* fwd (defined below) */
+static void fch_forget_forks(int c);                            /* fwd (defined below) */
 
 /* ---- io.neoterm.fs connections — one MOUNT per connection, one connection per
  * mounted partition. A multi-partition device (e.g. a Raspberry Pi card: FAT boot
@@ -108,6 +110,8 @@ struct ukfch {
 	 * when an accessor enqueues a request. dvec = iovcnt for a parked readv(), -1
 	 * for a plain read(). */
 	Tracee *dmn; word_t dbuf; int dcnt; int dvec; int parked;
+	int owner;          /* pid that open()ed /dev/fuse (the AppImage runtime/app) */
+	int appexec;        /* owner exec()'d an app after mounting (vs just daemonizing) */
 	char marker[256];   /* host path the /dev/fuse fd resolves to (survives fork) */
 };
 static struct ukfch g_fch[UK_NFCH];
@@ -225,6 +229,42 @@ void uknl_fuse_drain_parked(void)
 	for (int i = 0; i < UK_NFCH; i++)
 		if (g_fch[i].used && g_fch[i].parked && g_fch[i].dmn)
 			fch_resume_eof(&g_fch[i]);
+}
+
+/* Note that `pid` (a /dev/fuse opener) has exec()'d an app after mounting. This
+ * marks the channel as belonging to a foreground app (AppImage runtime: open ->
+ * mount -> fork squashfuse -> exec AppRun), as opposed to a daemon that merely
+ * forks a worker and the opener exits (sshfs). Only app-owned mounts are torn
+ * down when their owner exits (see uknl_fuse_owner_gone). */
+void uknl_fuse_note_exec(int pid);
+void uknl_fuse_note_exec(int pid)
+{
+	for (int i = 0; i < UK_NFCH; i++)
+		if (g_fch[i].used && g_fch[i].owner == pid) g_fch[i].appexec = 1;
+}
+
+/* The app that owns a FUSE mount exited (e.g. rpi-imager ^C'd). Tear the mount
+ * down so its squashfuse daemon stops (freeing the squashfs it had mmap'd) instead
+ * of lingering parked and mounted — repeated interrupt+relaunch otherwise piles up
+ * mounts until memory pressure makes new launches fail ("file too short"). Only
+ * acts on app-owned channels (appexec) so a daemonizing FUSE (sshfs), whose opener
+ * exits by design, is left alone. */
+void uknl_fuse_owner_gone(int pid);
+void uknl_fuse_owner_gone(int pid)
+{
+	for (int i = 0; i < UK_NFCH; i++) {
+		if (!g_fch[i].used || !g_fch[i].appexec || g_fch[i].owner != pid) continue;
+		int found = 0;
+		for (int s = 0; s < UK_MAXM; s++)
+			if (g_m[s].used && g_m[s].fuse && g_m[s].fuse_chan == i) { ukfs_unmount_slot(s); found = 1; break; }
+		if (!found && g_fch[i].used) {           /* mount(2) hadn't run yet: free the channel */
+			fch_resume_eof(&g_fch[i]);
+			if (g_fch[i].eng) fused_destroy(g_fch[i].eng);
+			for (int k = 0; k < UK_FQ; k++) { free(g_fch[i].rq[k].buf); free(g_fch[i].rp[k].buf); }
+			fch_forget_forks(i);
+			memset(&g_fch[i], 0, sizeof g_fch[i]);
+		}
+	}
 }
 
 /* True if `pid` has an unblocked, pending fatal default signal (INT/TERM/HUP/
@@ -433,6 +473,7 @@ static void uknl_fuse_open_exit(Tracee *tracee)
 	if (!ch->eng) { memset(ch, 0, sizeof *ch); return; }
 	fused_set_io(ch->eng, fch_send, fch_recv, ch);
 	ch->used = 1; ch->pid = pid; ch->fd = (int) fd;
+	ch->owner = pid; ch->appexec = 0;   /* the app that owns this mount (see owner_gone) */
 	fch_fdpath(tracee->pid, (int) fd, ch->marker, sizeof ch->marker);   /* for fork adoption */
 	{ char l[80]; snprintf(l, sizeof l, "uk_fs: /dev/fuse open fd=%ld pid=%d\n", fd, pid); uk_dbg(tracee, l); }
 }
@@ -2039,6 +2080,10 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 	 * pid (overwritten on the pid's next exec — bounded, no unlink so scripts can read
 	 * it). Non-vmount execs are returned untouched. */
 	if (nr == PR_execve || nr == PR_execveat) {
+		/* A /dev/fuse opener that exec()s an app after mounting (AppImage runtime ->
+		 * AppRun) owns a foreground mount; mark it so its mount is torn down when it
+		 * exits (uknl_fuse_owner_gone). Daemonizing FUSE (sshfs) never exec()s here. */
+		uknl_fuse_note_exec(ukfs_tgid(tracee->pid));
 		int patharg = (nr == PR_execveat) ? SYSARG_2 : SYSARG_1;
 		int dirfd = (nr == PR_execveat) ? (int) peek_reg(tracee, CURRENT, SYSARG_1) : AT_FDCWD;
 		word_t pa = peek_reg(tracee, CURRENT, patharg);
