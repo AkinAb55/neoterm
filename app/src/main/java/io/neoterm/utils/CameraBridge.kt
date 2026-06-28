@@ -570,22 +570,29 @@ object CameraBridge {
     }.getOrNull()
   }
 
-  /** Post-rotation output sizes (what the guest will actually receive). */
+  /** Post-rotation output sizes (what the guest will actually receive). Capped to
+   *  ≤1080p: full-sensor YUV (e.g. 4080×3060) can't stream as a 30 fps preview and
+   *  makes the capture session fail — so we never offer/capture it. */
   private fun outputSizes(): List<Pair<Int, Int>> {
     val ch = chars() ?: return listOf(1280 to 720, 640 to 480)
     camRotation = ((ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0) % 360 + 360) % 360
     val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
     val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: return listOf(1280 to 720, 640 to 480)
     val swap = camRotation == 90 || camRotation == 270
-    // A few common sizes (largest + standard) so caps stay small and sane.
-    val wanted = listOf(1920 to 1080, 1280 to 720, 640 to 480, 320 to 240)
-    val have = sizes.map { (if (swap) it.height else it.width) to (if (swap) it.width else it.height) }.toSet()
-    val out = wanted.filter { have.contains(it) }.toMutableList()
-    if (out.isEmpty()) {
-      val big = sizes.maxByOrNull { it.width.toLong() * it.height }!!
-      out.add((if (swap) big.height else big.width) to (if (swap) big.width else big.height))
+    // Match common LANDSCAPE sizes against the sensor's native (landscape) sizes;
+    // 1280×720 first so it's the sane default. Report each post-rotation.
+    val wanted = listOf(1280 to 720, 640 to 480, 1920 to 1080, 320 to 240)
+    val raw = sizes.map { it.width to it.height }.toSet()
+    val picked = wanted.filter { raw.contains(it) }.toMutableList()
+    if (picked.isEmpty()) {
+      // Nearest available size to 1280×720 that streams (≤1920 wide).
+      val target = 1280L * 720
+      val best = sizes.filter { it.width <= 1920 && it.height <= 1920 }
+        .minByOrNull { Math.abs(it.width.toLong() * it.height - target) }
+        ?: sizes.minByOrNull { it.width.toLong() * it.height }!!
+      picked.add(best.width to best.height)
     }
-    return out
+    return picked.map { if (swap) it.second to it.first else it }
   }
 
   private fun capsReply(): String {
@@ -602,8 +609,9 @@ object CameraBridge {
   private fun ensureCaptureFor(w: Int, h: Int) {
     chars()?.get(CameraCharacteristics.SENSOR_ORIENTATION)?.let { camRotation = (it % 360 + 360) % 360 }
     val swap = camRotation == 90 || camRotation == 270
-    val cw = if (swap) h else w      // pre-rotation capture size
-    val chh = if (swap) w else h
+    // Clamp to ≤1080p — full-sensor YUV can't stream as a preview (capture fails).
+    val cw = (if (swap) h else w).coerceIn(2, 1920)      // pre-rotation capture size
+    val chh = (if (swap) w else h).coerceIn(2, 1920)
     synchronized(cameraLock) {
       if (cameraDevice != null && (openW != cw || openH != chh)) closeCamera()
     }
