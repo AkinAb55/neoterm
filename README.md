@@ -129,6 +129,9 @@ natively — `cv2.VideoCapture(0)`, `ffmpeg -f v4l2 -i /dev/video0`, GStreamer
   (`CONTROL_ZOOM_RATIO`, Android 11+).
 - A fake `/sys/dev/char/81:0/uevent` (`DEVNAME=video0`) lets `v4l2-ctl`/`libv4l`
   classify the node; `NEOTERM_CAMERA_V4L2=/dev/video0` is exported as a hint.
+- **Orientation:** delivered in native **landscape** by default (like a USB webcam);
+  toggle *Landscape /dev/video0* off under **Settings → General** to rotate it
+  upright to the phone's orientation instead.
 
 **2. MJPEG-over-HTTP** (unchanged). A tiny HTTP server serves
 `multipart/x-mixed-replace` JPEG frames on **`127.0.0.1:4715/video.mjpeg`** —

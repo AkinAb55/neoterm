@@ -146,6 +146,8 @@
   <string name="pref_general_camera_desc">Let apps in the Linux distro use the device camera as an MJPEG stream (NEOTERM_CAMERA_URL). Works with URL-aware apps (ffmpeg, OpenCV, mpv); not a /dev/video0 device.</string>
   <string name="pref_general_camera_resolution">Camera resolution</string>
   <string name="pref_general_camera_resolution_desc">Capture resolution for the camera stream. Lower means less latency and bandwidth; the closest size the camera supports is used.</string>
+  <string name="pref_general_camera_landscape">Landscape /dev/video0</string>
+  <string name="pref_general_camera_landscape_desc">Deliver the native V4L2 camera (/dev/video0) in landscape, like a USB webcam. Turn off to rotate it upright to the phone\'s orientation (matching the MJPEG stream).</string>
   <string name="pref_general_gps">GPS / Location</string>
   <string name="pref_general_gps_desc">Built-in gpsd: serves the device GPS to the Linux distro on 127.0.0.1:2947 (gpsd protocol). No gpsd needed — just run cgps / gpspipe / gpsmon.</string>
   <string name="pref_general_usb_serial">USB serial (/dev/ttyUSB)</string>

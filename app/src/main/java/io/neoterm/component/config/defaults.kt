@@ -19,6 +19,7 @@ object DefaultValues {
   const val enableMicrophone = false
   const val enableCamera = false
   const val cameraResolution = "1280x720"
+  const val cameraV4l2Landscape = true
   const val enableGps = false
   const val enableUsbSerial = false
   const val enableSensors = false

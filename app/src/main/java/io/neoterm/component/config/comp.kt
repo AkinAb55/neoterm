@@ -326,6 +326,13 @@ object NeoPreference {
     return loadString(R.string.key_general_camera_resolution, DefaultValues.cameraResolution)
   }
 
+  /** When on (default), the V4L2 /dev/video0 stream is delivered in the camera's
+   *  native landscape orientation (like a USB webcam). When off, frames are rotated
+   *  upright to the phone's orientation (matching the HTTP MJPEG stream). */
+  fun isCameraV4l2Landscape(): Boolean {
+    return loadBoolean(R.string.key_general_camera_landscape, DefaultValues.cameraV4l2Landscape)
+  }
+
   fun isGpsEnabled(): Boolean {
     return loadBoolean(
       R.string.key_general_gps,

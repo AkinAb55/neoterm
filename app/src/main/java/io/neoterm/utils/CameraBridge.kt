@@ -77,6 +77,11 @@ object CameraBridge {
   @Volatile private var latestNv21: ByteArray? = null
   @Volatile private var nv21W = 0
   @Volatile private var nv21H = 0
+  /** Latest frame as a RAW (pre-rotation, landscape) NV21 buffer — the default
+   *  V4L2 path delivers this so /dev/video0 behaves like a landscape USB webcam. */
+  @Volatile private var rawNv21: ByteArray? = null
+  @Volatile private var rawW = 0
+  @Volatile private var rawH = 0
   @Volatile private var frameSeq = 0
   /** Camera sensor mounting orientation in degrees; frames are rotated by this to be upright. */
   @Volatile private var sensorOrientation = 0
@@ -362,7 +367,10 @@ object CameraBridge {
   }
 
   private fun yuvToJpeg(image: Image): ByteArray? {
-    var nv21 = yuv420ToNv21(image)
+    val raw = yuv420ToNv21(image)
+    // Stash the RAW (landscape) frame for the default V4L2 path.
+    rawNv21 = raw; rawW = image.width; rawH = image.height
+    var nv21 = raw
     var w = image.width
     var h = image.height
     // Rotate to upright using the sensor mounting orientation (back cameras are usually 90°),
@@ -578,7 +586,8 @@ object CameraBridge {
     camRotation = ((ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0) % 360 + 360) % 360
     val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
     val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: return listOf(1280 to 720, 640 to 480)
-    val swap = camRotation == 90 || camRotation == 270
+    // Landscape (default) keeps the native sensor orientation; upright swaps for 90/270.
+    val swap = !NeoPreference.isCameraV4l2Landscape() && (camRotation == 90 || camRotation == 270)
     // Match common LANDSCAPE sizes against the sensor's native (landscape) sizes;
     // 1280×720 first so it's the sane default. Report each post-rotation.
     val wanted = listOf(1280 to 720, 640 to 480, 1920 to 1080, 320 to 240)
@@ -608,7 +617,7 @@ object CameraBridge {
   /** Ensure the camera is capturing at the post-rotation size (w,h); reopen if it changed. */
   private fun ensureCaptureFor(w: Int, h: Int) {
     chars()?.get(CameraCharacteristics.SENSOR_ORIENTATION)?.let { camRotation = (it % 360 + 360) % 360 }
-    val swap = camRotation == 90 || camRotation == 270
+    val swap = !NeoPreference.isCameraV4l2Landscape() && (camRotation == 90 || camRotation == 270)
     // Clamp to ≤1080p — full-sensor YUV can't stream as a preview (capture fails).
     val cw = (if (swap) h else w).coerceIn(2, 1920)      // pre-rotation capture size
     val chh = (if (swap) w else h).coerceIn(2, 1920)
@@ -630,12 +639,27 @@ object CameraBridge {
         runCatching { frameLock.wait(rem) }
       }
     }
-    val data: ByteArray? = if (v4lFourcc == "YUYV") {
-      latestNv21?.let { nv21ToYuyv(it, nv21W, nv21H) }
-    } else latestJpeg
+    val landscape = NeoPreference.isCameraV4l2Landscape()
+    // Landscape (default): deliver the raw sensor frame. Upright: the rotated one.
+    val src = if (landscape) rawNv21 else latestNv21
+    val sw = if (landscape) rawW else nv21W
+    val sh = if (landscape) rawH else nv21H
+    val data: ByteArray? = when {
+      src == null -> null
+      v4lFourcc == "YUYV" -> nv21ToYuyv(src, sw, sh)
+      landscape -> nv21ToJpeg(src, sw, sh)     // MJPG, native orientation
+      else -> latestJpeg                        // MJPG, already-rotated (HTTP-shared)
+    }
     if (data == null) { out.write("ERR\n".toByteArray()); return }
     out.write("OK ${data.size}\n".toByteArray())
     out.write(data)
+  }
+
+  /** Encode an NV21 buffer to JPEG (for the landscape MJPG path). */
+  private fun nv21ToJpeg(nv21: ByteArray, w: Int, h: Int): ByteArray? {
+    val out = ByteArrayOutputStream()
+    return if (android.graphics.YuvImage(nv21, ImageFormat.NV21, w, h, null)
+        .compressToJpeg(Rect(0, 0, w, h), JPEG_QUALITY, out)) out.toByteArray() else null
   }
 
   /** Pack an upright NV21 buffer into YUYV (YUY2): Y0 U Y1 V per pixel pair. */
