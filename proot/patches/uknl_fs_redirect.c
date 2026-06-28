@@ -1917,9 +1917,6 @@ static void ukfs_populate_fd(Tracee *tracee, int fd, const char *relpath)
 	unsigned mode, uid, gid, nlink; long size, mt, at; unsigned long ino, rdev, blocks;
 	if (ukfs_query_stat(relpath, &mode, &uid, &gid, &size, &ino, &mt, &at, &nlink, &rdev, &blocks) != 0)
 		return;
-	if (strstr(relpath, ".so")) {   /* shared libs: log the size getattr reported */
-		char l[PATH_MAX + 64]; snprintf(l, sizeof l, "uk_fs: mmap populate '%s' size=%ld mode=0%o\n", relpath, size, mode); uk_dbg_line(l);
-	}
 	char proc[64]; snprintf(proc, sizeof proc, "/proc/%d/fd/%d", tracee->pid, fd);
 	int bfd = open(proc, O_WRONLY | O_CLOEXEC);
 	if (bfd < 0) { char l[96]; snprintf(l, sizeof l, "uk_fs: mmap populate open(%s) errno=%d\n", proc, errno); uk_dbg_line(l); return; }
@@ -2331,11 +2328,24 @@ static bool uknl_fs_dispatch(Tracee *tracee, word_t nr)
 		 * legitimately return a short read at a block boundary; a regular file,
 		 * though, only short-reads at EOF, so naive readers (the dynamic loader ->
 		 * "file too short") break on a premature short return. Loop until len or EOF. */
-		long got = 0, n = 0;
+		long got = 0, n = 0, fsize = -1;
 		while ((size_t) got < len) {
 			n = ukfs_read_at(v->path, pos + got, (char *) tmp + got, len - (size_t) got);
 			if (n < 0) break;
-			if (n == 0) break;            /* EOF */
+			if (n == 0) {
+				/* A regular file only short-reads at real EOF; a premature 0 here
+				 * (a FUSE daemon momentarily returning nothing under load) makes the
+				 * dynamic loader fail with "file too short". Distinguish the two by
+				 * the file's real size (queried once) and retry a transient 0. */
+				if (fsize < 0) {
+					unsigned m, u, g_, nl; long sz, mt, at; unsigned long in, rd, bl;
+					fsize = (ukfs_query_stat(v->path, &m, &u, &g_, &sz, &in, &mt, &at, &nl, &rd, &bl) == 0) ? sz : (pos + got);
+				}
+				if (pos + got >= fsize) break;          /* genuine EOF */
+				for (int r = 0; r < 16 && n == 0; r++)
+					n = ukfs_read_at(v->path, pos + got, (char *) tmp + got, len - (size_t) got);
+				if (n <= 0) break;                      /* still nothing: return partial */
+			}
 			got += n;
 		}
 		if (got > 0) write_data(tracee, buf, tmp, (size_t) got);
