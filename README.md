@@ -140,7 +140,10 @@ natively — `cv2.VideoCapture(0)`, `ffmpeg -f v4l2 -i /dev/video0`, GStreamer
   classify the node; `NEOTERM_CAMERA_V4L2=/dev/video0` is exported as a hint.
 - **Orientation:** delivered in native **landscape** by default (like a USB webcam);
   toggle *Landscape /dev/video0* off under **Settings → General** to rotate it
-  upright to the phone's orientation instead.
+  upright to the phone's orientation instead. The change takes effect the next time
+  an app opens `/dev/video0` (the shim refreshes its cached capabilities on every
+  open) — no proot restart needed. Frames are always delivered at exactly the
+  negotiated resolution, so the stream never shears regardless of the toggle.
 
 **2. MJPEG-over-HTTP** (unchanged). A tiny HTTP server serves
 `multipart/x-mixed-replace` JPEG frames on **`127.0.0.1:4715/video.mjpeg`** —

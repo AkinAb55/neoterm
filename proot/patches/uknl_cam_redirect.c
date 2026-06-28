@@ -432,6 +432,11 @@ static bool uknl_cam_dispatch(Tracee *tracee, word_t nr)
 	word_t arg = peek_reg(tracee, CURRENT, SYSARG_3);
 
 	if (cmd == VIDIOC_QUERYCAP) {
+		/* QUERYCAP is the first ioctl on every device open, so refresh the cached
+		 * formats/controls here: that way a Settings change (e.g. the landscape
+		 * orientation toggle, which flips the advertised sizes) takes effect the
+		 * next time an app opens /dev/video0 — no proot restart needed. */
+		g_ncamfmt = -1; g_ncamctrl = -1;
 		struct v4l2_capability cap; memset(&cap, 0, sizeof cap);
 		snprintf((char *)cap.driver, sizeof cap.driver, "neoterm");
 		snprintf((char *)cap.card, sizeof cap.card, "NeoTerm Camera");
