@@ -105,13 +105,23 @@ object CameraBridge {
   private val httpClients = AtomicInteger(0) // MJPEG-over-HTTP consumers (need rotated JPEG)
   @Volatile private var ctrlWb = 1          // white balance (Camera2 AWB mode; 1 = auto)
   @Volatile private var ctrlAntibanding = 3 // anti-banding (0 off, 1 50Hz, 2 60Hz, 3 auto)
+  @Volatile private var ctrlFacing = 0      // selected camera: 0 = back, 1 = front
+  @Volatile private var ctrlFocusAbs = 0    // manual focus 0..100 (% near), used when AF off
+  @Volatile private var ctrlExpAuto = 0     // 0 = auto exposure, 1 = manual
+  @Volatile private var ctrlExpAbs = 0      // manual exposure (V4L2 100µs units), used when manual
+  @Volatile private var ctrlIso = 0         // manual ISO/gain (sensor sensitivity), used when manual
 
   // V4L2 control ids (real V4L2 CIDs so generic control UIs recognise them).
   private const val CID_BRIGHTNESS = 0x00980900   // -> AE exposure compensation
-  private const val CID_FOCUS_AUTO = 0x009A0901   // -> continuous AF on/off
-  private const val CID_ZOOM_ABS   = 0x009A090D   // -> zoom ratio (API 30+)
+  private const val CID_GAIN       = 0x00980913   // -> SENSOR_SENSITIVITY (ISO), manual
+  private const val CID_POWER_LINE = 0x00980918   // V4L2_CID_POWER_LINE_FREQUENCY (menu, anti-banding)
   private const val CID_WHITE_BALANCE = 0x0098091C // V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE (menu)
-  private const val CID_POWER_LINE = 0x00980918    // V4L2_CID_POWER_LINE_FREQUENCY (menu, anti-banding)
+  private const val CID_EXPOSURE_AUTO = 0x009A0901 // V4L2_CID_EXPOSURE_AUTO (menu: auto/manual)
+  private const val CID_EXPOSURE_ABS  = 0x009A0902 // V4L2_CID_EXPOSURE_ABSOLUTE (100µs units)
+  private const val CID_FOCUS_ABS  = 0x009A090A   // V4L2_CID_FOCUS_ABSOLUTE (manual focus)
+  private const val CID_FOCUS_AUTO = 0x009A090C   // V4L2_CID_FOCUS_AUTO (continuous AF on/off)
+  private const val CID_ZOOM_ABS   = 0x009A090D   // V4L2_CID_ZOOM_ABSOLUTE -> zoom ratio (API 30+)
+  private const val CID_CAMERA_SEL = 0x009A0950   // private: select back/front camera (menu)
 
   fun start(context: Context) {
     if (running) return
@@ -328,14 +338,52 @@ object CameraBridge {
   private fun pickCamera(cm: CameraManager): String? {
     return try {
       val ids = cm.cameraIdList
-      ids.firstOrNull {
-        cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
-          CameraCharacteristics.LENS_FACING_BACK
-      } ?: ids.firstOrNull()
+      val want = if (ctrlFacing == 1) CameraCharacteristics.LENS_FACING_FRONT
+                 else CameraCharacteristics.LENS_FACING_BACK
+      ids.firstOrNull { cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want }
+        ?: ids.firstOrNull { cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK }
+        ?: ids.firstOrNull()
     } catch (e: Exception) {
       null
     }
   }
+
+  /** Which camera facings exist → menu for camera selection (0 back, 1 front). */
+  private fun availableFacings(): Map<Int, String> {
+    val ctx = appContext ?: return mapOf(0 to "Back")
+    return runCatching {
+      val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+      val out = LinkedHashMap<Int, String>()
+      var back = false; var front = false
+      for (id in cm.cameraIdList) {
+        when (cm.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)) {
+          CameraCharacteristics.LENS_FACING_BACK -> back = true
+          CameraCharacteristics.LENS_FACING_FRONT -> front = true
+        }
+      }
+      if (back) out[0] = "Back"
+      if (front) out[1] = "Front"
+      if (out.isEmpty()) out[0] = "Back"
+      out
+    }.getOrDefault(mapOf(0 to "Back"))
+  }
+
+  private fun hasManualSensor(): Boolean {
+    val caps = chars()?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: return false
+    return caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
+  }
+  /** Minimum focus distance in diopters (0 = fixed-focus lens, no manual focus). */
+  private fun minFocusDist(): Float =
+    chars()?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+  /** Manual exposure range in V4L2 100µs units, capped to 1/5 s. */
+  private fun expRange100us(): Pair<Int, Int> {
+    val r = chars()?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: return 1 to 1000
+    val lo = (r.lower / 100_000L).coerceAtLeast(1L)
+    val hi = (minOf(r.upper, 200_000_000L) / 100_000L).coerceAtLeast(lo + 1)
+    return lo.toInt() to hi.toInt()
+  }
+  private fun isoRange(): Range<Int> =
+    chars()?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(100, 800)
 
   private fun chooseSize(cm: CameraManager, camId: String): Pair<Int, Int> {
     // A V4L2 client's requested size wins over the Settings default.
@@ -733,6 +781,18 @@ object CameraBridge {
     val wb = wbAvailable().keys.toList()
     if (wb.isNotEmpty()) lines.add("$CID_WHITE_BALANCE 3 ${wb.min()} ${wb.max()} 1 1 0 White Balance, Preset")
     lines.add("$CID_POWER_LINE 3 0 3 1 3 0 Power Line Frequency")
+    // Camera selection (when more than one facing is present).
+    val facings = availableFacings()
+    if (facings.size > 1) lines.add("$CID_CAMERA_SEL 3 ${facings.keys.min()} ${facings.keys.max()} 1 0 0 Camera Selection")
+    // Manual focus (only on autofocus lenses).
+    if (minFocusDist() > 0f) lines.add("$CID_FOCUS_ABS 1 0 100 1 0 0 Focus, Absolute")
+    // Manual exposure + ISO (only when the sensor supports manual control).
+    if (hasManualSensor()) {
+      val (elo, ehi) = expRange100us(); val iso = isoRange()
+      lines.add("$CID_EXPOSURE_AUTO 3 0 1 1 0 0 Exposure, Auto")
+      lines.add("$CID_EXPOSURE_ABS 1 $elo $ehi 1 $elo 0 Exposure, Absolute")
+      lines.add("$CID_GAIN 1 ${iso.lower} ${iso.upper} 1 ${iso.lower} 0 ISO/Gain")
+    }
     val sb = StringBuilder("OK ${lines.size}\n")
     for (l in lines) sb.append(l).append("\n")
     return sb.toString()
@@ -743,6 +803,8 @@ object CameraBridge {
     val items = when (id) {
       CID_WHITE_BALANCE -> wbAvailable()
       CID_POWER_LINE -> antibandModes
+      CID_CAMERA_SEL -> availableFacings()
+      CID_EXPOSURE_AUTO -> linkedMapOf(0 to "Auto Mode", 1 to "Manual Mode")
       else -> emptyMap()
     }
     val sb = StringBuilder("OK ${items.size}\n")
@@ -756,6 +818,11 @@ object CameraBridge {
     CID_ZOOM_ABS -> ctrlZoom
     CID_WHITE_BALANCE -> ctrlWb
     CID_POWER_LINE -> ctrlAntibanding
+    CID_CAMERA_SEL -> ctrlFacing
+    CID_FOCUS_ABS -> ctrlFocusAbs
+    CID_EXPOSURE_AUTO -> ctrlExpAuto
+    CID_EXPOSURE_ABS -> ctrlExpAbs
+    CID_GAIN -> ctrlIso
     else -> null
   }
 
@@ -766,6 +833,20 @@ object CameraBridge {
       CID_ZOOM_ABS -> ctrlZoom = value.coerceIn(100, maxZoomPercent())
       CID_WHITE_BALANCE -> ctrlWb = if (wbAvailable().containsKey(value)) value else ctrlWb
       CID_POWER_LINE -> ctrlAntibanding = value.coerceIn(0, 3)
+      CID_CAMERA_SEL -> {
+        val want = if (value == 1) 1 else 0
+        if (availableFacings().containsKey(want) && want != ctrlFacing) {
+          ctrlFacing = want
+          // Switch the physical camera: reopen with the other facing.
+          synchronized(cameraLock) { if (cameraDevice != null) closeCamera() }
+          if (v4lStreaming || httpClients.get() > 0) openCamera()
+          return true   // openCamera resubmits with controls; skip reapply on a dead session
+        }
+      }
+      CID_FOCUS_ABS -> ctrlFocusAbs = value.coerceIn(0, 100)
+      CID_EXPOSURE_AUTO -> ctrlExpAuto = if (value != 0) 1 else 0
+      CID_EXPOSURE_ABS -> { val (lo, hi) = expRange100us(); ctrlExpAbs = value.coerceIn(lo, hi) }
+      CID_GAIN -> { val r = isoRange(); ctrlIso = value.coerceIn(r.lower, r.upper) }
       else -> return false
     }
     reapplyControls()
@@ -773,14 +854,34 @@ object CameraBridge {
   }
 
   private fun applyControls(req: CaptureRequest.Builder) {
-    req.set(CaptureRequest.CONTROL_AF_MODE,
-      if (ctrlAf != 0) CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE else CaptureRequest.CONTROL_AF_MODE_OFF)
-    if ((evRange().upper - evRange().lower) != 0)
-      req.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ctrlEv)
+    // Focus: continuous AF, or OFF + manual focus distance.
+    if (ctrlAf != 0) {
+      req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+    } else {
+      req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+      val mfd = minFocusDist()
+      if (mfd > 0f) req.set(CaptureRequest.LENS_FOCUS_DISTANCE, (ctrlFocusAbs / 100f) * mfd)
+    }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && ctrlZoom > 100)
       req.set(CaptureRequest.CONTROL_ZOOM_RATIO, ctrlZoom / 100f)
     req.set(CaptureRequest.CONTROL_AWB_MODE, ctrlWb)
     req.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, ctrlAntibanding)
+    // Exposure: manual (AE off + sensor exposure/ISO) when requested + supported,
+    // else auto AE with the user's exposure-compensation bias.
+    if (ctrlExpAuto == 1 && hasManualSensor()) {
+      req.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+      // Fall back to mid-range exposure / lowest ISO if unset, so manual isn't black.
+      val (elo, ehi) = expRange100us(); val isr = isoRange()
+      val exp = if (ctrlExpAbs in elo..ehi) ctrlExpAbs else (elo + ehi) / 2
+      val iso = if (ctrlIso in isr.lower..isr.upper) ctrlIso else isr.lower
+      runCatching { req.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp.toLong() * 100_000L) }
+      runCatching { req.set(CaptureRequest.SENSOR_SENSITIVITY, iso) }
+      runCatching { req.set(CaptureRequest.SENSOR_FRAME_DURATION, 33_333_333L) } // ~30 fps
+    } else {
+      req.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+      if ((evRange().upper - evRange().lower) != 0)
+        req.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ctrlEv)
+    }
     // ── low-latency / smoothness tuning ──
     // Lock the frame-rate floor so auto-exposure can't drop to 15/7 fps in low
     // light (the usual cause of a laggy, stuttery preview).

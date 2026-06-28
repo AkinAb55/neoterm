@@ -125,9 +125,11 @@ natively — `cv2.VideoCapture(0)`, `ffmpeg -f v4l2 -i /dev/video0`, GStreamer
 - **I/O methods:** `MMAP` (the guest mmaps the marker file; frames are `pwrite()`n
   into it at the buffer offset — no mmap interception), `USERPTR`, and `read()`.
 - **Controls** are proxied to Camera2 and show up under `v4l2-ctl --list-ctrls-menus`:
-  brightness (→ AE exposure compensation), continuous autofocus, zoom
-  (`CONTROL_ZOOM_RATIO`, Android 11+), white-balance presets, and power-line
-  frequency / anti-banding.
+  brightness (→ AE exposure compensation), continuous autofocus + manual focus,
+  zoom (`CONTROL_ZOOM_RATIO`, Android 11+), white-balance presets, power-line
+  frequency / anti-banding, **back/front camera selection**, and **manual
+  exposure + ISO** (auto/manual mode, exposure time, sensitivity — on sensors
+  that advertise `MANUAL_SENSOR`).
 - **Low latency:** the capture locks a constant frame-rate floor (so auto-exposure
   can't drop to 15/7 fps in low light), disables video stabilisation and uses
   fast noise-reduction/edge processing. Per-frame work is also skipped when no
