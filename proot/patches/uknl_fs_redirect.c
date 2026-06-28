@@ -1917,21 +1917,38 @@ static void ukfs_populate_fd(Tracee *tracee, int fd, const char *relpath)
 	unsigned mode, uid, gid, nlink; long size, mt, at; unsigned long ino, rdev, blocks;
 	if (ukfs_query_stat(relpath, &mode, &uid, &gid, &size, &ino, &mt, &at, &nlink, &rdev, &blocks) != 0)
 		return;
+	if (strstr(relpath, ".so")) {   /* shared libs: log the size getattr reported */
+		char l[PATH_MAX + 64]; snprintf(l, sizeof l, "uk_fs: mmap populate '%s' size=%ld mode=0%o\n", relpath, size, mode); uk_dbg_line(l);
+	}
 	char proc[64]; snprintf(proc, sizeof proc, "/proc/%d/fd/%d", tracee->pid, fd);
 	int bfd = open(proc, O_WRONLY | O_CLOEXEC);
 	if (bfd < 0) { char l[96]; snprintf(l, sizeof l, "uk_fs: mmap populate open(%s) errno=%d\n", proc, errno); uk_dbg_line(l); return; }
 	char *buf = malloc(65536);
-	long long off = 0;
-	if (buf) {
-		while (off < size) {
-			long n = ukfs_read_at(relpath, off, buf, 65536);
-			if (n <= 0) break;
-			if (pwrite(bfd, buf, (size_t) n, (off_t) off) != (ssize_t) n) break;
-			off += n;
+	long long off = 0; int failed = !buf;
+	while (!failed && off < size) {
+		long n = ukfs_read_at(relpath, off, buf, 65536);
+		/* A FUSE backend can briefly return a short/empty read under load; retry a
+		 * few times before giving up so we never materialise a truncated library
+		 * (the dynamic loader would then fail with "file too short"). */
+		for (int r = 0; n == 0 && r < 16 && off < size; r++) n = ukfs_read_at(relpath, off, buf, 65536);
+		if (n <= 0) { failed = 1; break; }
+		long w = 0;
+		while (w < n) {
+			ssize_t k = pwrite(bfd, buf + w, (size_t)(n - w), (off_t)(off + w));
+			if (k <= 0) { failed = 1; break; }
+			w += k;
 		}
-		free(buf);
+		if (failed) break;
+		off += n;
 	}
-	(void) ftruncate(bfd, (off_t) size);
+	free(buf);
+	if (ftruncate(bfd, (off_t) size) != 0) failed = 1;
+	if (failed || off < size) {
+		char l[PATH_MAX + 128];
+		snprintf(l, sizeof l, "uk_fs: mmap populate INCOMPLETE '%s' off=%lld size=%ld mode=0%o errno=%d\n",
+		         relpath, off, size, mode, errno);
+		uk_dbg_line(l);
+	}
 	close(bfd);
 }
 
