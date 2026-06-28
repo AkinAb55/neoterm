@@ -110,8 +110,9 @@ struct ukfch {
 	 * when an accessor enqueues a request. dvec = iovcnt for a parked readv(), -1
 	 * for a plain read(). */
 	Tracee *dmn; word_t dbuf; int dcnt; int dvec; int parked;
-	int owner;          /* pid that open()ed /dev/fuse (the AppImage runtime/app) */
-	int appexec;        /* owner exec()'d an app after mounting (vs just daemonizing) */
+	int owner;          /* pid that open()ed /dev/fuse (squashfuse helper) */
+	int owner2;         /* its parent (the AppImage runtime that exec()s the app) */
+	int app_pid;        /* owner/owner2 that exec()'d the app; teardown when IT exits */
 	char marker[256];   /* host path the /dev/fuse fd resolves to (survives fork) */
 };
 static struct ukfch g_fch[UK_NFCH];
@@ -231,29 +232,35 @@ void uknl_fuse_drain_parked(void)
 			fch_resume_eof(&g_fch[i]);
 }
 
-/* Note that `pid` (a /dev/fuse opener) has exec()'d an app after mounting. This
- * marks the channel as belonging to a foreground app (AppImage runtime: open ->
- * mount -> fork squashfuse -> exec AppRun), as opposed to a daemon that merely
- * forks a worker and the opener exits (sshfs). Only app-owned mounts are torn
- * down when their owner exits (see uknl_fuse_owner_gone). */
+/* `pid` exec()'d an app. If pid is a channel's opener (squashfuse helper) or that
+ * opener's parent (the AppImage runtime), record pid as the channel's app: the
+ * AppImage flow is open(/dev/fuse) -> mount -> fork daemon -> exec AppRun, where
+ * the execer becomes the foreground app. Recording the EXECER (not just any owner)
+ * matters: the opener also exits when it merely daemonizes (sshfs), which must NOT
+ * trigger teardown — only the app's exit does (see uknl_fuse_owner_gone). */
 void uknl_fuse_note_exec(int pid);
 void uknl_fuse_note_exec(int pid)
 {
 	for (int i = 0; i < UK_NFCH; i++)
-		if (g_fch[i].used && g_fch[i].owner == pid) g_fch[i].appexec = 1;
+		if (g_fch[i].used && g_fch[i].app_pid == 0 &&
+		    (g_fch[i].owner == pid || g_fch[i].owner2 == pid)) {
+			g_fch[i].app_pid = pid;
+			char l[80]; snprintf(l, sizeof l, "uk_fs: fuse app=%d chan=%d\n", pid, i); uk_dbg_line(l);
+		}
 }
 
 /* The app that owns a FUSE mount exited (e.g. rpi-imager ^C'd). Tear the mount
  * down so its squashfuse daemon stops (freeing the squashfs it had mmap'd) instead
  * of lingering parked and mounted — repeated interrupt+relaunch otherwise piles up
- * mounts until memory pressure makes new launches fail ("file too short"). Only
- * acts on app-owned channels (appexec) so a daemonizing FUSE (sshfs), whose opener
- * exits by design, is left alone. */
+ * mounts until memory pressure makes new launches fail ("file too short"). Only the
+ * exec()ing app pid triggers teardown, so a daemonizing FUSE (sshfs), whose opener
+ * exits by design without exec()ing an app, is left alone. */
 void uknl_fuse_owner_gone(int pid);
 void uknl_fuse_owner_gone(int pid)
 {
 	for (int i = 0; i < UK_NFCH; i++) {
-		if (!g_fch[i].used || !g_fch[i].appexec || g_fch[i].owner != pid) continue;
+		if (!g_fch[i].used || g_fch[i].app_pid != pid) continue;
+		{ char l[80]; snprintf(l, sizeof l, "uk_fs: fuse owner gone pid=%d chan=%d -> teardown\n", pid, i); uk_dbg_line(l); }
 		int found = 0;
 		for (int s = 0; s < UK_MAXM; s++)
 			if (g_m[s].used && g_m[s].fuse && g_m[s].fuse_chan == i) { ukfs_unmount_slot(s); found = 1; break; }
@@ -361,6 +368,23 @@ int uknl_fuse_is_daemon(int pid)
 	if (tg != pid)
 		for (int i = 0; i < UK_NFCH; i++)
 			if (g_fch[i].used && g_fch[i].eng && g_fch[i].pid == tg) return 1;
+	return 0;
+}
+
+/* Parent pid (ppid) of `pid` from /proc/<pid>/stat (0 on failure). The comm
+ * field may contain spaces/parens, so parse after the last ')'. */
+static int fch_ppid(int pid)
+{
+	char p[64]; snprintf(p, sizeof p, "/proc/%d/stat", pid);
+	int fd = open(p, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return 0;
+	char b[512]; ssize_t n = read(fd, b, sizeof b - 1); close(fd);
+	if (n <= 0) return 0;
+	b[n] = '\0';
+	char *r = strrchr(b, ')');
+	if (!r) return 0;
+	char state; int ppid = 0;
+	if (sscanf(r + 1, " %c %d", &state, &ppid) == 2) return ppid;
 	return 0;
 }
 
@@ -473,9 +497,12 @@ static void uknl_fuse_open_exit(Tracee *tracee)
 	if (!ch->eng) { memset(ch, 0, sizeof *ch); return; }
 	fused_set_io(ch->eng, fch_send, fch_recv, ch);
 	ch->used = 1; ch->pid = pid; ch->fd = (int) fd;
-	ch->owner = pid; ch->appexec = 0;   /* the app that owns this mount (see owner_gone) */
+	/* The app that owns this mount (see owner_gone): the opener (squashfuse helper)
+	 * AND its parent (the AppImage runtime that exec()s the real app), so teardown
+	 * works whether the runtime mounts directly or via a forked helper. */
+	ch->owner = pid; ch->owner2 = fch_ppid(tracee->pid); ch->app_pid = 0;
 	fch_fdpath(tracee->pid, (int) fd, ch->marker, sizeof ch->marker);   /* for fork adoption */
-	{ char l[80]; snprintf(l, sizeof l, "uk_fs: /dev/fuse open fd=%ld pid=%d\n", fd, pid); uk_dbg(tracee, l); }
+	{ char l[96]; snprintf(l, sizeof l, "uk_fs: /dev/fuse open fd=%ld pid=%d ppid=%d\n", fd, pid, ch->owner2); uk_dbg(tracee, l); }
 }
 
 /* The daemon's read()/write() on a /dev/fuse channel fd (intercepted like the
