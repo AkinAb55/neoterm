@@ -7,8 +7,9 @@ NeoTerm
 A modern-designed Android terminal emulator — now a self-contained **Linux
 workstation in an app**: a full **proot Linux distro runtime**, an **embedded X11
 server**, **native audio (in & out)**, and a suite of **hardware bridges** that
-expose the phone's camera, GPS, sensors, USB-serial adapters and USB mass storage
-to the distro — all in a single APK, **no root and no companion app**.
+expose the phone's camera, GPS, sensors, USB-serial adapters, USB mass storage
+and arbitrary USB devices (libusb) to the distro — all in a single APK, **no root
+and no companion app**.
 
 ### Our Pledge
 
@@ -32,6 +33,10 @@ through standard Linux interfaces — without rooting the device.
 - **USB-serial** → hot-pluggable `/dev/ttyUSB*` (FTDI/CP210x/CH34x/PL2303/CDC-ACM).
 - **USB mass storage & disk images** → mount **vfat / exfat / ntfs3 / ext4** with
   partitions and **loop devices**, parsed entirely in userspace.
+- **USB host (any device)** → **unmodified libusb** works: `lsusb`, `lsusb -v/-t`,
+  **pyusb**, libftdi, rtl-sdr, … enumerate *and* drive USB devices over a faked
+  `/sys/bus/usb` plus a usbfs ioctl proxy — **no patched libusb, no preload,
+  nothing to install in the guest**.
 - **FUSE in proot** → a working **`/dev/fuse`**, so userspace filesystems
   (**sshfs, rclone**) and **AppImages** (e.g. **Raspberry Pi Imager**) run
   unmodified — no root.
@@ -229,6 +234,37 @@ syscall under it to that daemon.
   operate on them correctly.
 - Toggle under **Settings → General → USB storage**. See
   [`docs/USB_STORAGE_MOUNT.md`](docs/USB_STORAGE_MOUNT.md) for the architecture.
+
+## USB host — any device via libusb (no patched libusb)
+
+Beyond serial and storage, NeoTerm exposes **arbitrary USB devices** to the distro
+through **unmodified libusb** — so `lsusb`, `lsusb -v`, `lsusb -t`, **pyusb**,
+**libftdi**, **rtl-sdr** and friends work as on a desktop, with **no patched
+libusb, no `LD_PRELOAD`, and nothing installed in the guest**. It's always on (no
+toggle); just grant the Android USB permission when prompted.
+
+Two halves make it work, both no-root:
+
+- **Enumeration** — an app-side bridge builds a faithful `/sys/bus/usb` from
+  Android's `UsbManager` (device dirs, descriptors, per-interface nodes, a readable
+  `/sys/bus` overlay and a synthetic root hub), so the distro's **stock
+  libudev/libusb** discover devices and topology. `SYSTEMD_DEVICE_VERIFY_SYSFS=0`
+  makes systemd's libudev accept the faked sysfs, and a small proot shim
+  neutralises libusb's netlink hotplug monitor so `libusb_init()` succeeds.
+- **I/O** — opening `/dev/bus/usb/BBB/DDD` is redirected by proot to the **real
+  usbfs file descriptor** the app holds (`UsbDeviceConnection`), handed over via
+  `SCM_RIGHTS`. proot then proxies the `USBDEVFS_*` ioctls — **control, bulk and
+  interrupt transfers, sync and async URBs**, interface claim, set-config — natively
+  on that fd, with `poll()` driven through the guest's own timerfd via
+  `pidfd_getfd` so transfer timeouts behave correctly.
+
+> **Scope:** this is full **userspace** USB (libusb-level control and data
+> transfer). Loading an in-kernel driver — e.g. turning a Wi-Fi dongle into a
+> `wlan0` netdev — still isn't possible under proot, since that needs the real
+> kernel. Everything a libusb program does works.
+
+See [`usb/DESIGN-no-patch.md`](usb/DESIGN-no-patch.md) for the full design and the
+device-validation log.
 
 ## FUSE filesystems & AppImages
 
