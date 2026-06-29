@@ -60,6 +60,20 @@ static int uk_usb_on(void)
 #include <stddef.h>
 #include <poll.h>
 #include <time.h>
+#include <sys/syscall.h>
+
+/* pidfd_getfd lets the tracer borrow one of the guest's own kernel fds (its
+ * libusb timerfd / event pipe) so poll() can wait on them with the real timeout.
+ * proot already ptraces the guest, so PTRACE_MODE_ATTACH_REALCREDS is satisfied.
+ * Numbers are arch-generic (since 5.6 / 5.6). */
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_getfd
+#define __NR_pidfd_getfd 438
+#endif
+static int usb_pidfd_open(int pid)            { return (int) syscall(__NR_pidfd_open, pid, 0); }
+static int usb_pidfd_getfd(int pidfd, int fd) { return (int) syscall(__NR_pidfd_getfd, pidfd, fd, 0); }
 
 /* Connect to the app's abstract usb fd-server. */
 static int usb_conn(void)
@@ -431,38 +445,54 @@ static bool uknl_usb_dispatch(Tracee *tracee, word_t nr)
 		USB_RET(rc);
 	}
 
-	/* poll()/ppoll() over usbfs fds: the guest is polling EMPTY marker files (a
-	 * regular file is always "ready"), so libusb's event loop would busy-spin
-	 * REAPURBNDELAY. usbfs gates POLLOUT on a URB actually being reapable, so poll
-	 * the REAL fds instead — byte-for-byte what libusb expects on Linux. Any
-	 * non-usb fd in the same call (libusb's internal event pipe) is reported
-	 * not-ready and the timeout is capped at 100ms so it is rechecked promptly. */
+	/* poll()/ppoll() over usbfs fds: the guest polls EMPTY marker files (a regular
+	 * file is always "ready"), which would busy-spin libusb's event loop; usbfs
+	 * instead gates POLLOUT on a reapable URB. So poll the REAL fds. libusb also
+	 * mixes in its OWN fds (a timerfd for transfer timeouts, an event pipe) — those
+	 * are the guest's real kernel fds, so pull them into the tracer with
+	 * pidfd_getfd and poll them too. Missing the timerfd is what hangs a bulk
+	 * read with a timeout (the deadline event never reaches libusb). */
 	if (nr == PR_poll || nr == PR_ppoll) {
 		unsigned long nfds = (unsigned long) peek_reg(tracee, CURRENT, SYSARG_2);
 		if (nfds == 0 || nfds > 16) return false;
 		word_t fds_addr = peek_reg(tracee, CURRENT, SYSARG_1);
 		struct pollfd pfds[16];
 		if (read_data(tracee, pfds, fds_addr, nfds * sizeof(struct pollfd)) < 0) return false;
-		struct pollfd local[16]; int map[16]; int nl = 0, nusb = 0;
+		int nusb = 0;
+		for (unsigned i = 0; i < nfds; i++) { int b, d; if (usb_is_fd(tracee, pfds[i].fd, &b, &d)) nusb++; }
+		if (nusb == 0) return false;   /* nothing of ours -> let proot handle it */
+		int req = (int) peek_reg(tracee, CURRENT, SYSARG_3);   /* poll: timeout ms */
+		if (nr == PR_ppoll) {
+			word_t ts = peek_reg(tracee, CURRENT, SYSARG_3);
+			if (!ts) req = -1; else { struct timespec t; if (read_data(tracee, &t, ts, sizeof t) == 0) req = (int)(t.tv_sec * 1000 + t.tv_nsec / 1000000); else req = -1; }
+		}
+		struct pollfd local[16]; int map[16]; int copied[16]; int nl = 0, miss = 0;
+		int pidfd = usb_pidfd_open(ukfs_tgid(tracee->pid));
 		for (unsigned i = 0; i < nfds; i++) {
 			pfds[i].revents = 0;
 			int b, d;
 			if (usb_is_fd(tracee, pfds[i].fd, &b, &d)) {
-				nusb++;
 				int rfd = usb_real(tracee, pfds[i].fd, b, d);
-				if (rfd >= 0) { local[nl].fd = rfd; local[nl].events = pfds[i].events; local[nl].revents = 0; map[nl] = i; nl++; }
-			}
+				if (rfd < 0) { miss = 1; continue; }
+				local[nl].fd = rfd; local[nl].events = pfds[i].events; local[nl].revents = 0; map[nl] = i; copied[nl] = -1; nl++;
+			} else if (pidfd >= 0) {
+				int c = usb_pidfd_getfd(pidfd, pfds[i].fd);
+				if (c < 0) { miss = 1; continue; }
+				local[nl].fd = c; local[nl].events = pfds[i].events; local[nl].revents = 0; map[nl] = i; copied[nl] = c; nl++;
+			} else miss = 1;
 		}
-		if (nusb == 0) return false;   /* nothing of ours -> let proot handle it */
-		int req = (nr == PR_poll) ? (int) peek_reg(tracee, CURRENT, SYSARG_3) : 100;
-		if (nr == PR_ppoll) {
-			word_t ts = peek_reg(tracee, CURRENT, SYSARG_3);
-			if (!ts) req = -1; else { struct timespec t; if (read_data(tracee, &t, ts, sizeof t) == 0) req = (int)(t.tv_sec * 1000 + t.tv_nsec / 1000000); }
-		}
-		if (req < 0 || req > 100) req = 100;   /* cap so the event pipe is rechecked */
-		int ready = nl ? poll(local, (nfds_t) nl, req) : (nanosleep(&(struct timespec){0, (long)req * 1000000L}, NULL), 0);
+		/* If we couldn't mirror every fd, cap the wait so the guest re-polls and we
+		 * recheck the ones we missed — avoids hanging on an unwatched timerfd. */
+		int timeout = req;
+		if (miss && (timeout < 0 || timeout > 50)) timeout = 50;
+		int ready = nl ? poll(local, (nfds_t) nl, timeout)
+		               : (nanosleep(&(struct timespec){0, 20 * 1000 * 1000}, NULL), 0);
 		int n = 0;
-		for (int i = 0; i < nl; i++) if (local[i].revents) { pfds[map[i]].revents = local[i].revents; n++; }
+		for (int i = 0; i < nl; i++) {
+			if (local[i].revents) { pfds[map[i]].revents = local[i].revents; n++; }
+			if (copied[i] >= 0) close(copied[i]);
+		}
+		if (pidfd >= 0) close(pidfd);
 		(void) ready;
 		write_data(tracee, fds_addr, pfds, nfds * sizeof(struct pollfd));
 		USB_RET(n);
