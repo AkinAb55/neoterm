@@ -154,6 +154,26 @@ object UsbSysfsBridge {
       symlink(File(ddir, "subsystem"), "../../../bus/usb")
       // /sys/bus/usb/devices/<name> -> /sys/devices/neoterm-usb/<name>
       symlink(File(linksDir, name), "../../../devices/neoterm-usb/$name")
+      // Per-interface sub-dirs (<name>:<cfg>.<intf>, e.g. 2-2:1.0) parsed from the
+      // config descriptor, so lsusb -t / libusb show each interface's class+driver.
+      var off = co
+      while (off + 9 <= desc.size) {
+        val len = b(off); if (len <= 0) break
+        if (b(off + 1) == 4 && b(off + 3) == 0) {        // interface descriptor, altsetting 0
+          val ifNum = b(off + 2)
+          val iname = "$name:$cfgVal.$ifNum"
+          val idir = File(ddir, iname).apply { mkdirs() }
+          w(idir, "bInterfaceNumber", "%02d\n".format(ifNum))
+          w(idir, "bAlternateSetting", "%2d\n".format(b(off + 3)))
+          w(idir, "bNumEndpoints", "%02d\n".format(b(off + 4)))
+          w(idir, "bInterfaceClass", "%02x\n".format(b(off + 5)))
+          w(idir, "bInterfaceSubClass", "%02x\n".format(b(off + 6)))
+          w(idir, "bInterfaceProtocol", "%02x\n".format(b(off + 7)))
+          w(idir, "uevent", "DEVTYPE=usb_interface\nINTERFACE=%d/%d/%d\n".format(b(off + 5), b(off + 6), b(off + 7)))
+          symlink(File(linksDir, iname), "../../../devices/neoterm-usb/$name/$iname")
+        }
+        off += len
+      }
       // /dev/bus/usb/BBB/DDD marker (empty; the UK_USB shim proxies its ioctls)
       runCatching { File(devfsDir, "%03d/%03d".format(bus, dev)).apply { parentFile?.mkdirs() }.createNewFile() }
       n++
