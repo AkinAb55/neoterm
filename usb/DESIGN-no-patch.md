@@ -372,3 +372,35 @@ app already deconflicts ownership).
 - Does Android's usbfs fd accept `USBDEVFS_SUBMITURB` from a process that didn't
   open it (the tracer received it via SCM_RIGHTS)? (the patched libusb proves the
   *guest* can; the *tracer* doing it on behalf is the new bit to confirm)
+
+## Resolution — Phase 1 enumeration working (device-tested)
+
+The final blocker was **not** in libusb/libudev, the descriptors, or the
+`SYSTEMD_DEVICE_VERIFY_SYSFS` gate — all of those were correct. It was the
+parent directory `/sys/bus`:
+
+- libudev's enumerator (and libusb, which on this distro is built *against*
+  libudev — `linux_udev_event_thread_main`) `readdir()`s `/sys/bus` to discover
+  bus names, *then* scans `/sys/bus/<bus>/devices`.
+- On Android `/sys/bus` is real sysfs, mode `drwx------`, so `readdir(/sys/bus)`
+  fails with **EACCES** for the app uid. Binding `/sys/bus/usb` (the child) does
+  not help: proot does not add a bound child's name to the *parent*'s getdents,
+  and the parent read fails outright anyway.
+- A first attempt injected a synthetic `usb` dirent into the `/sys/bus`
+  getdents (like the `/dev` ttyUSB/video0 injection). It worked on the host
+  (where `/sys/bus` is world-readable) but is a no-op on device: the injection
+  appends to a *successful* getdents EOF, and here the read never succeeds. That
+  patch was reverted.
+
+**Fix:** bind a writable overlay dir over `/sys/bus` (`UsbSysfsBridge.busDir`)
+that physically contains `usb` and `iio` subdirs as mount points. `readdir`
+then hits our f2fs dir and lists the buses; the per-subsystem binds
+(`/sys/bus/usb` → USB tree, `/sys/bus/iio` → sensor tree) overlay their real
+content via proot's longest-prefix match. The real `/sys/bus` was EACCES for
+the app anyway, so overlaying it loses nothing. No proot patch, no `-H`
+dependency, no preload, no guest changes.
+
+Host repro (stock distro libudev, partial bind mirroring ProotManager):
+`SYSTEMD_DEVICE_VERIFY_SYSFS=0 proot -r / -0 -b busoverlay:/sys/bus
+-b usbsys3/bus/usb:/sys/bus/usb -b usbsys3/devices/neoterm-usb:/sys/devices/neoterm-usb
+udevdiag` → `udev enumerated 1 usb entries`.

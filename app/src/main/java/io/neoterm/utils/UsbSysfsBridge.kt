@@ -38,11 +38,24 @@ object UsbSysfsBridge {
   // intact). libudev requires a device's canonical path to be under /sys/devices.
   private val usbDir = File("${NeoTermPath.PROOT_ROOT_PATH}/sys-bus-usb")
   private val devDir = File("${NeoTermPath.PROOT_ROOT_PATH}/sys-devices-usb")
+  // A readable overlay for the PARENT /sys/bus. The real Android /sys/bus is
+  // `drwx------` (EACCES for the app uid), so `readdir(/sys/bus)` fails — and
+  // libudev's enumerator readdir()s /sys/bus to discover bus names BEFORE it ever
+  // looks at /sys/bus/usb/devices, so without this it finds 0 USB devices. We bind
+  // a writable dir over /sys/bus that physically contains the `usb` (and the
+  // sensor bridge's `iio`) subdirs as mount points; the per-subsystem binds map
+  // their real trees on top (proot longest-prefix match), so /sys/bus/usb and
+  // /sys/bus/iio still resolve while /sys/bus itself becomes listable.
+  private val busDir = File("${NeoTermPath.PROOT_ROOT_PATH}/sys-bus")
 
   /** Host dir → guest path binds. */
   fun sysfsBinds(): List<Pair<String, String>> {
     usbDir.mkdirs(); File(usbDir, "devices").mkdirs(); devDir.mkdirs()
+    // Placeholders so readdir(/sys/bus) lists the buses the per-subsystem binds
+    // overlay (proot doesn't add a bound child's name to the parent's getdents).
+    busDir.mkdirs(); File(busDir, "usb").mkdirs(); File(busDir, "iio").mkdirs()
     return listOf(
+      busDir.absolutePath to "/sys/bus",
       usbDir.absolutePath to "/sys/bus/usb",
       devDir.absolutePath to "/sys/devices/neoterm-usb"
     )

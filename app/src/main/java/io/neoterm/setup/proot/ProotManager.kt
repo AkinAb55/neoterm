@@ -285,11 +285,13 @@ object ProotManager {
     // (Android SELinux blocks the real /sys/dev/block). Empty until a drive attaches.
     io.neoterm.setup.usbserial.BlockSysfsBridge.sysfsBinds().forEach { (host, guest) -> bind(args, host, guest) }
 
-    // USB host: a fake /sys/bus/usb (populated by UsbSysfsBridge from the Android
-    // UsbManager) so the distro's UNMODIFIED libusb/libudev enumerate USB devices
-    // (lsusb, pyusb, …) — no patched libusb, no preload. The real /sys/bus/usb is
-    // EACCES for the app uid anyway, so overlaying it is strictly better. Paired
-    // with SYSTEMD_DEVICE_VERIFY_SYSFS=0 + UK_USB (see getEnvp).
+    // USB host: a readable /sys/bus overlay + a fake /sys/bus/usb (populated by
+    // UsbSysfsBridge from the Android UsbManager) so the distro's UNMODIFIED
+    // libusb/libudev enumerate USB devices (lsusb, pyusb, …) — no patched libusb,
+    // no preload. libudev readdir()s /sys/bus to find bus names before scanning
+    // /sys/bus/usb/devices, and the real /sys/bus is EACCES for the app uid, so
+    // the overlay (which also carries the sensor bridge's iio) is what makes the
+    // scan find anything. Paired with SYSTEMD_DEVICE_VERIFY_SYSFS=0 + UK_USB.
     io.neoterm.utils.UsbSysfsBridge.sysfsBinds().forEach { (host, guest) -> bind(args, host, guest) }
     runCatching { io.neoterm.utils.UsbBridge.refreshSysfs() }   // fill from current UsbManager state
 
