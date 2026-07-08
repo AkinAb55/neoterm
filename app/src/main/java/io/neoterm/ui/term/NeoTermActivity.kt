@@ -95,6 +95,7 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   private lateinit var fullScreenHelper: FullScreenHelper
   lateinit var toolbar: Toolbar
   private lateinit var tabDots: TabDotsIndicator
+  private lateinit var sessionLock: SessionLock
 
   var addSessionListener = createAddSessionListener()
   private var termService: NeoTermService? = null
@@ -141,6 +142,11 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     // Keep the screen on while the terminal is in front (on by default).
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+    // Terminal lock: apply FLAG_SECURE (screenshots/recents) before the window is
+    // shown; the opaque cover is drawn below once the content view exists.
+    sessionLock = SessionLock(this) { raiseKeyboardForSelectedTab() }
+    sessionLock.applyWindowSecurity()
+
     val fullscreen = NeoPreference.isFullScreenEnabled()
     // Full screen is applied via the window insets controller (see applyImmersiveMode), which
     // hides both the status AND navigation bars and is re-asserted in onWindowFocusChanged so it
@@ -151,6 +157,10 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
     toolbar = findViewById(R.id.terminal_toolbar)
     setSupportActionBar(toolbar)
+
+    // Draw the lock cover before the first frame if we start locked (cold start or
+    // a rotation before unlock). The auth prompt is launched from onResume.
+    sessionLock.coverIfLocked()
 
     fullScreenHelper = FullScreenHelper.injectActivity(this, fullscreen, peekRecreating())
     fullScreenHelper.setKeyBoardListener(object : FullScreenHelper.KeyBoardListener {
@@ -397,6 +407,20 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     return true
   }
 
+  override fun onPrepareOptionsMenu(menu: Menu?): Boolean {
+    // "Lock now" is only meaningful when the lock feature is enabled.
+    menu?.findItem(R.id.menu_item_lock_now)?.isVisible = sessionLock.isEnabled()
+    return super.onPrepareOptionsMenu(menu)
+  }
+
+  override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+    // While the terminal is locked/blurred, swallow ALL key events (hardware
+    // keyboard, volume-as-ctrl, etc.) so nothing reaches the hidden session. The
+    // system credential (PIN) screen is a separate window and is unaffected.
+    if (::sessionLock.isInitialized && sessionLock.isCovering()) return true
+    return super.dispatchKeyEvent(event)
+  }
+
   override fun onOptionsItemSelected(item: MenuItem): Boolean {
     return when (item.itemId) {
       R.id.menu_item_settings -> {
@@ -409,6 +433,10 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
       }
       R.id.menu_item_new_session -> {
         addNewSession()
+        true
+      }
+      R.id.menu_item_lock_now -> {
+        sessionLock.lock()
         true
       }
       R.id.menu_item_close_session -> {
@@ -474,6 +502,10 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
     super.onResume()
     PreferenceManager.getDefaultSharedPreferences(this)
       .registerOnSharedPreferenceChangeListener(this)
+    // Re-assert FLAG_SECURE (the setting may have changed) and, if locked, cover
+    // the terminal and prompt for biometric / device-credential unlock.
+    sessionLock.applyWindowSecurity()
+    sessionLock.onForeground()
     selectedTab?.onResume()
     // Match the title bar + system bars to the terminal background on every
     // resume (incl. the very first launch), so it applies without having to
@@ -530,6 +562,8 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
 
   override fun onStop() {
     super.onStop()
+    // Leaving the app: re-lock (if auto-lock is on) so returning needs re-auth.
+    sessionLock.onBackground()
     // After stopped, window locations may changed
     // Rebind it at next time.
     forEachTab<TermTab> { it.resetAutoCompleteStatus() }
@@ -609,6 +643,9 @@ class NeoTermActivity : AppCompatActivity(), ServiceConnection, SharedPreference
   }
 
   private fun raiseKeyboardForSelectedTab() {
+    // Never raise the keyboard while the terminal is locked/blurred, or input
+    // would target the hidden session behind the cover.
+    if (::sessionLock.isInitialized && sessionLock.isCovering()) return
     val tab = selectedTab as? TermTab ?: return
     val view = tab.termData.termView ?: return
     raiseKeyboard(view)

@@ -105,6 +105,9 @@ dependencies {
   implementation 'androidx.cardview:cardview:1.0.0'
   implementation 'androidx.appcompat:appcompat:1.2.0'
   implementation 'androidx.appcompat:appcompat-resources:1.2.0'
+  // Terminal lock: system biometric / device-credential prompt (fingerprint, face,
+  // PIN/pattern/password) for the per-app session lock.
+  implementation 'androidx.biometric:biometric:1.1.0'
   // Real swipeable pager for live terminal tabs: adjacent tabs are laid out and
   // live during a horizontal drag (peek + snap-back). 1.0.0 is compatible with
   // appcompat 1.2.0 / the rest of the androidx stack used here.

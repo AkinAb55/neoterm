@@ -156,6 +156,15 @@
   <string name="pref_general_sensors_desc">Expose the device battery and motion/environment sensors to the distro as a fake /sys/class/power_supply and /sys/bus/iio/devices tree. No root — upower, acpi, iio_info, cat and IIO-aware tools work. Takes effect on the next session.</string>
   <string name="pref_general_usb_storage">USB storage (/dev/uksd0)</string>
   <string name="pref_general_usb_storage_desc">Expose a connected USB pendrive as a raw block device /dev/uksd0 (SCSI Bulk-Only-Transport app-side). No root — dd, fdisk, parted, mkfs.*, fsck.*, mtools and any filesystem work. Takes effect on the next plug-in.</string>
+  <string name="pref_general_session_lock">Lock terminal (biometric)</string>
+  <string name="pref_general_session_lock_desc">Require your fingerprint / face or the device PIN to view the terminal. Blurs it and hides it from screenshots and the recent-apps preview. The shell keeps running behind the cover — this hides it from onlookers, it is not encryption.</string>
+  <string name="pref_general_session_lock_on_bg">Auto-lock when leaving the app</string>
+  <string name="pref_general_session_lock_on_bg_desc">Re-lock automatically whenever NeoTerm goes to the background, so returning needs re-authentication.</string>
+  <string name="session_lock_locked_title">Terminal locked</string>
+  <string name="session_lock_hint">Tap to unlock</string>
+  <string name="session_lock_prompt_title">Unlock NeoTerm</string>
+  <string name="session_lock_prompt_subtitle">Authenticate to view the terminal</string>
+  <string name="session_lock_now">Lock now</string>
   <string-array name="pref_general_camera_resolution_entries" translatable="false">
     <item>320x240</item>
     <item>640x480</item>

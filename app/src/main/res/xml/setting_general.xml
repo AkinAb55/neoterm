@@ -99,6 +99,19 @@
 
   <CheckBoxPreference
     android:defaultValue="false"
+    android:key="@string/key_general_session_lock"
+    android:summary="@string/pref_general_session_lock_desc"
+    android:title="@string/pref_general_session_lock"/>
+
+  <CheckBoxPreference
+    android:defaultValue="true"
+    android:dependency="@string/key_general_session_lock"
+    android:key="@string/key_general_session_lock_on_bg"
+    android:summary="@string/pref_general_session_lock_on_bg_desc"
+    android:title="@string/pref_general_session_lock_on_bg"/>
+
+  <CheckBoxPreference
+    android:defaultValue="false"
     android:key="@string/key_general_enable_word_based_ime"
     android:summary="@string/pref_general_enable_word_based_ime_desc"
     android:title="@string/pref_general_enable_word_based_ime"/>
