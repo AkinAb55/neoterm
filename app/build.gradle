@@ -49,9 +49,9 @@ android {
       signingConfig signingConfigs.neoTermShared
     }
     release {
-      minifyEnabled true
+      minifyEnabled false      // Измените на false
       zipAlignEnabled true
-      shrinkResources true
+      shrinkResources false    // Измените на false
       signingConfig signingConfigs.neoTermShared
     }
   }
