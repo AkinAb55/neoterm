@@ -1,17 +1,17 @@
 name: Build NeoTerm
 
-# Manuálisan indítható build + release. A GitHub UI-on: Actions →
-# "Build NeoTerm" → Run workflow. Lefordítja a proot binárist, beágyazva
-# (libproot.so) lebuildeli az APK-t, legyártja a disztró-rootfs-eket, majd
-# mindezt egyetlen GitHub Release-be tölti fel — innen tölti a setup-képernyő
-# a kiválasztott rootfs-t.
+# Автоматический запуск при коммитах в основную ветку + ручной запуск с выбором параметров
 on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
   workflow_dispatch:
     inputs:
       build_type:
         description: "APK build típus"
         type: choice
-        default: debug
+        default: release
         options:
           - debug
           - release
@@ -32,14 +32,17 @@ env:
   NDK_VERSION: "26.1.10909125"
   CMAKE_VERSION: "3.22.1"
 
+permissions:
+  contents: write
+
 jobs:
   # ── 1) proot bináris — ebből függ az APK ────────────────────────────────
   build-proot:
     name: proot binary (aarch64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install host build tools
         run: |
@@ -47,12 +50,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             binutils-aarch64-linux-gnu xxd make curl xz-utils zstd file
 
-      # A modern Android cmdline-tools JDK 17-et igényel a sdkmanagerhez.
-      - name: Set up JDK 17 (Android SDK tooling)
-        uses: actions/setup-java@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -68,150 +70,19 @@ jobs:
           ./proot/build-proot.sh "${GITHUB_WORKSPACE}/out/proot/aarch64"
 
       - name: Upload proot binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: proot-aarch64
           path: out/proot/aarch64/proot
           if-no-files-found: error
 
-  # ── 2) NeoTerm APK (a proot binárist beágyazva) ─────────────────────────
-  build-apk:
-    name: APK (${{ inputs.build_type }})
-    needs: [build-proot, build-pulseaudio]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Clone repository
-        uses: actions/checkout@v4
-        with:
-          # The embedded Termux:X11 X server (:x11 module) lives in the
-          # third_party/termux-x11 submodule, whose own native deps (xorgproto,
-          # pixman, xserver, libxcb…) are nested submodules — recurse, or the
-          # CMake configure fails (e.g. missing xorgproto/include/X11/Xpoll.h.in).
-          submodules: recursive
-
-      # A natív Xorg-build (xserver/pixman/…) host-oldali eszközei.
-      - name: Install native X11 build host tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bison python3 patch
-
-      # JDK 17 az Android SDK/NDK telepítő eszközökhöz (sdkmanager)…
-      - name: Set up JDK 17 (Android SDK tooling)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK + CMake
-        run: |
-          sdkmanager "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" \
-                     "platforms;android-34" "build-tools;34.0.0"
-          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
-
-      # AGP 8 / Gradle 8 a tényleges Gradle buildhez JDK 17-et igényel.
-      - name: Set up JDK 17 (Gradle build)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
-
-      - name: Fetch proot binary
-        uses: actions/download-artifact@v4
-        with:
-          name: proot-aarch64
-          path: ${{ github.workspace }}/proot-bin
-
-      - name: Bundle proot into APK (libproot.so)
-        run: |
-          mkdir -p app/src/main/jniLibs/arm64-v8a
-          cp "${GITHUB_WORKSPACE}/proot-bin/proot" \
-             app/src/main/jniLibs/arm64-v8a/libproot.so
-          chmod +x app/src/main/jniLibs/arm64-v8a/libproot.so
-          ls -l app/src/main/jniLibs/arm64-v8a/
-
-      - name: Fetch PulseAudio build
-        uses: actions/download-artifact@v4
-        with:
-          name: pulseaudio-aarch64
-          path: ${{ github.workspace }}/pulseaudio-bin
-
-      - name: Bundle PulseAudio into APK (assets)
-        run: |
-          # Android-side PulseAudio server (binary + libs + modules), extracted
-          # and run by PulseAudioBridge at runtime. Plain .tar (AGP would
-          # decompress a .gz and rename it).
-          mkdir -p app/src/main/assets
-          cp "${GITHUB_WORKSPACE}/pulseaudio-bin/pulseaudio-aarch64.tar" \
-             app/src/main/assets/pulseaudio-aarch64.tar
-          ls -lh app/src/main/assets/pulseaudio-aarch64.tar
-
-      - name: Bump version automatically (per build)
-        run: |
-          # Append the workflow run number to versionName and add it to
-          # versionCode, so every build produces a strictly newer version that
-          # the in-app updater will pick up. Patched in CI only (not committed).
-          RUN="${{ github.run_number }}"
-          BASE_NAME="$(sed -nE 's/.*versionName[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle | head -n1)"
-          BASE_CODE="$(sed -nE 's/.*versionCode[[:space:]]+([0-9]+).*/\1/p' app/build.gradle | head -n1)"
-          NEW_NAME="${BASE_NAME}.${RUN}"
-          NEW_CODE="$(( BASE_CODE + RUN ))"
-          sed -i -E "s/(versionName[[:space:]]*\")[^\"]+(\")/\1${NEW_NAME}\2/" app/build.gradle
-          sed -i -E "s/(versionCode[[:space:]]+)[0-9]+/\1${NEW_CODE}/" app/build.gradle
-          echo "App version: ${NEW_NAME} (versionCode ${NEW_CODE})"
-          grep -E "versionName|versionCode" app/build.gradle
-
-      - name: Gradle assemble
-        run: |
-          chmod +x ./gradlew
-          if [ "${{ inputs.build_type }}" = "release" ]; then
-            ./gradlew :app:assembleRelease --stacktrace
-          else
-            ./gradlew :app:assembleDebug --stacktrace
-          fi
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: neoterm-${{ inputs.build_type }}-apk
-          path: app/build/outputs/apk/**/*.apk
-          if-no-files-found: error
-
-  # ── 3) disztró-rootfs-ek ────────────────────────────────────────────────
-  fetch-rootfs:
-    name: rootfs tarballs
-    runs-on: ubuntu-latest
-    steps:
-      - name: Clone repository
-        uses: actions/checkout@v4
-
-      - name: Install host tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends curl xz-utils zstd tar coreutils
-
-      - name: Fetch + repack rootfs
-        run: |
-          chmod +x proot/fetch-rootfs.sh
-          ./proot/fetch-rootfs.sh "${GITHUB_WORKSPACE}/out" ${{ inputs.distros }} --arch aarch64
-
-      - name: Upload rootfs
-        uses: actions/upload-artifact@v4
-        with:
-          name: rootfs-aarch64
-          path: out/rootfs/**
-          if-no-files-found: error
-
-  # ── 3b) PulseAudio natív cross-build (Android-oldali hang, opcionális) ───
+  # ── 2) PulseAudio natív cross-build (Android-oldali hang) ───────────
   build-pulseaudio:
     name: PulseAudio (aarch64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install host build tools
         run: |
@@ -220,11 +91,11 @@ jobs:
             meson ninja-build pkg-config cmake gettext m4 gperf \
             autoconf automake libtool curl xz-utils file
 
-      - name: Set up JDK 17 (Android SDK tooling)
-        uses: actions/setup-java@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -242,48 +113,162 @@ jobs:
       - name: Package
         run: |
           cd "${GITHUB_WORKSPACE}/out/pulseaudio"
-          # Plain tar (no gzip): AGP decompresses .gz assets and renames them,
-          # so we ship an uncompressed .tar and read it directly at runtime.
           tar -cf "${GITHUB_WORKSPACE}/out/pulseaudio-aarch64.tar" .
           ls -lh "${GITHUB_WORKSPACE}/out/pulseaudio-aarch64.tar"
 
       - name: Upload PulseAudio
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pulseaudio-aarch64
           path: out/pulseaudio-aarch64.tar
           if-no-files-found: error
 
-  # ── 4) GitHub Release: APK (X11 beágyazva) + proot + rootfs-ek ──────────
+  # ── 3) NeoTerm APK (a proot binárist beágyazva) ─────────────────────────
+  build-apk:
+    name: APK (${{ github.event.inputs.build_type || 'release' }})
+    needs: [build-proot, build-pulseaudio]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install native X11 build host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bison python3 patch
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK + CMake
+        run: |
+          sdkmanager "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" \
+                     "platforms;android-34" "build-tools;34.0.0"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Decode Keystore File
+        shell: bash
+        run: |
+          # Декодируем ваш Termux-ключ напрямую в модуль app, как настроено в build.gradle
+          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > app/testkey_untrusted.jks
+
+      - name: Fetch proot binary
+        uses: actions/download-artifact@v7
+        with:
+          name: proot-aarch64
+          path: ${{ github.workspace }}/proot-bin
+
+      - name: Bundle proot into APK (libproot.so)
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp "${GITHUB_WORKSPACE}/proot-bin/proot" \
+             app/src/main/jniLibs/arm64-v8a/libproot.so
+          chmod +x app/src/main/jniLibs/arm64-v8a/libproot.so
+          ls -l app/src/main/jniLibs/arm64-v8a/
+
+      - name: Fetch PulseAudio build
+        uses: actions/download-artifact@v7
+        with:
+          name: pulseaudio-aarch64
+          path: ${{ github.workspace }}/pulseaudio-bin
+
+      - name: Bundle PulseAudio into APK (assets)
+        run: |
+          mkdir -p app/src/main/assets
+          cp "${GITHUB_WORKSPACE}/pulseaudio-bin/pulseaudio-aarch64.tar" \
+             app/src/main/assets/pulseaudio-aarch64.tar
+          ls -lh app/src/main/assets/pulseaudio-aarch64.tar
+
+      - name: Bump version automatically (per build)
+        run: |
+          RUN="${{ github.run_number }}"
+          BASE_NAME="$(sed -nE 's/.*versionName[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle | head -n1)"
+          BASE_CODE="$(sed -nE 's/.*versionCode[[:space:]]+([0-9]+).*/\1/p' app/build.gradle | head -n1)"
+          NEW_NAME="${BASE_NAME}.${RUN}"
+          NEW_CODE="$(( BASE_CODE + RUN ))"
+          sed -i -E "s/(versionName[[:space:]]*\")[^\"]+(\")/\1${NEW_NAME}\2/" app/build.gradle
+          sed -i -E "s/(versionCode[[:space:]]+)[0-9]+/\1${NEW_CODE}/" app/build.gradle
+          echo "App version: ${NEW_NAME} (versionCode ${NEW_CODE})"
+          grep -E "versionName|versionCode" app/build.gradle
+
+      - name: Gradle assemble
+        run: |
+          chmod +x ./gradlew
+          if [ "${{ github.event.inputs.build_type || 'release' }}" = "release" ]; then
+            ./gradlew :app:assembleRelease --stacktrace
+          else
+            ./gradlew :app:assembleDebug --stacktrace
+          fi
+        env:
+          # Передаем параметры подписи в Gradle из секретов
+          RELEASE_STORE_FILE: "testkey_untrusted.jks"
+          RELEASE_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.SIGNING_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: neoterm-${{ github.event.inputs.build_type || 'release' }}-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+  # ── 4) disztró-rootfs-ek ────────────────────────────────────────────────
+  fetch-rootfs:
+    name: rootfs tarballs
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v7
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl xz-utils zstd tar coreutils
+
+      - name: Fetch + repack rootfs
+        run: |
+          chmod +x proot/fetch-rootfs.sh
+          ./proot/fetch-rootfs.sh "${GITHUB_WORKSPACE}/out" ${{ github.event.inputs.distros || 'ubuntu alpine kali arch' }} --arch aarch64
+
+      - name: Upload rootfs
+        uses: actions/upload-artifact@v7
+        with:
+          name: rootfs-aarch64
+          path: out/rootfs/**
+          if-no-files-found: error
+
+  # ── 5) GitHub Release: APK (X11 beágyazva) + proot + rootfs-ek ──────────
   release:
     name: Publish GitHub Release
-    # Akkor is fusson, ha a fetch-rootfs elbukott — a release-be ekkor legalább
-    # az APK + proot bekerül, a rootfs-ek pedig amik elkészültek. Csak az
-    # APK/proot sikere kötelező.
-    if: ${{ always() && inputs.publish_release && needs.build-apk.result == 'success' && needs.build-proot.result == 'success' }}
+    if: ${{ always() && (github.event.inputs.publish_release == 'true' || github.event_name == 'push') && needs.build-apk.result == 'success' && needs.build-proot.result == 'success' }}
     needs: [build-apk, build-proot, fetch-rootfs]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
 
-      - name: Stage release assets (flat names the app expects)
+      - name: Stage release assets
         run: |
           mkdir -p assets
-          # proot bináris → proot-aarch64
           cp artifacts/proot-aarch64/proot assets/proot-aarch64
-          # APK(ok)
           find artifacts -name '*.apk' -exec cp {} assets/ \;
-          # rootfs (upstream-tükör, disztrónként eltérő tömörítés):
-          #   artifacts/rootfs-aarch64/<distro>/aarch64.<ext>[.sha256]
-          #     → rootfs-<distro>-aarch64.<ext>[.sha256]
           if [ -d artifacts/rootfs-aarch64 ]; then
             for dir in artifacts/rootfs-aarch64/*/; do
               distro="$(basename "${dir}")"
@@ -299,9 +284,8 @@ jobs:
       - name: Determine release tag
         id: tag
         run: |
-          TAG="${{ inputs.release_tag }}"
+          TAG="${{ github.event.inputs.release_tag }}"
           if [ -z "$TAG" ]; then
-            # Match the auto-bumped APK version: <versionName>.<run_number>.
             VERSION="$(sed -nE 's/.*versionName[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle | head -n1)"
             if [ -z "$VERSION" ]; then
               echo "Could not read versionName from app/build.gradle" >&2
@@ -320,7 +304,7 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --title "NeoTerm proot ($TAG)" \
-              --notes "proot-alapú NeoTerm. Tartalom: APK, proot bináris (aarch64) és a disztró-rootfs-ek (Ubuntu/Alpine/Kali/Arch). A setup-képernyő ezekből tölti a kiválasztott rootfs-t." \
+              --notes "proot-alapú NeoTerm. APK, proot bináris (aarch64) és disztró-rootfs-ek." \
               --latest
           fi
           gh release upload "$TAG" assets/* --clobber
